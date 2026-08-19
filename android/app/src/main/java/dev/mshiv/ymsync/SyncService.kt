@@ -53,9 +53,8 @@ class SyncService : MediaSessionService() {
         when (intent?.action) {
             ACTION_START -> {
                 val config = intent.getStringExtra(EXTRA_CONFIG)
-                val role = intent.getStringExtra(EXTRA_ROLE)
-                if (config != null && role != null) {
-                    startSync(config, role)
+                if (config != null) {
+                    startSync(config)
                 }
             }
             ACTION_STOP -> stopSync()
@@ -72,11 +71,11 @@ class SyncService : MediaSessionService() {
         super.onDestroy()
     }
 
-    private fun startSync(configJson: String, role: String) {
+    private fun startSync(configJson: String) {
         if (SyncHolder.handle != 0L) return
         scope.launch {
             SyncHolder.say("подключаюсь…")
-            val reply = withContext(Dispatchers.IO) { parseReply(Native.start(configJson, role)) }
+            val reply = withContext(Dispatchers.IO) { parseReply(Native.start(configJson)) }
             when (reply) {
                 is NativeResult.Failed -> {
                     SyncHolder.say(reply.message)
@@ -172,8 +171,8 @@ class SyncService : MediaSessionService() {
             .setMediaMetadata(metadata)
             .build()
         player.setMediaItem(item)
-        // `playWhenReady` stays false: the engine decides when to start, so a
-        // slave lands on the master's position instead of playing from zero.
+        // `playWhenReady` stays false: the engine decides when to start, so this
+        // device lands on the room's position instead of playing from zero.
         player.prepare()
     }
 
@@ -182,13 +181,11 @@ class SyncService : MediaSessionService() {
         private const val ACTION_START = "dev.mshiv.ymsync.START"
         private const val ACTION_STOP = "dev.mshiv.ymsync.STOP"
         private const val EXTRA_CONFIG = "config"
-        private const val EXTRA_ROLE = "role"
 
-        fun start(context: Context, configJson: String, role: String) {
+        fun start(context: Context, configJson: String) {
             val intent = Intent(context, SyncService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_CONFIG, configJson)
-                putExtra(EXTRA_ROLE, role)
             }
             context.startService(intent)
         }

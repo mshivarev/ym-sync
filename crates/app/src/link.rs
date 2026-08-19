@@ -18,8 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 use ymsync_proto::{
-    ClientMsg, ClockSampler, Event, PROTOCOL_VERSION, PlaybackState, Role, ServerMsg, TrackRef,
-    sample_from_roundtrip, unix_ms,
+    ClientMsg, ClockSampler, Command, Event, PROTOCOL_VERSION, ServerMsg, sample_from_roundtrip,
+    unix_ms,
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -90,7 +90,6 @@ impl Link {
         relay: &str,
         room: &str,
         room_token: &str,
-        role: Role,
         probe_every: Duration,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let (ws, _response) = tokio_tungstenite::connect_async(relay)
@@ -110,7 +109,6 @@ impl Link {
                 protocol: PROTOCOL_VERSION,
                 room: room.to_string(),
                 token: room_token.to_string(),
-                role,
                 client: client_name(),
             },
         )
@@ -213,18 +211,13 @@ impl Link {
         self.peers_at_join
     }
 
-    /// Queues a state snapshot. `false` means the connection is gone.
+    /// Asks the relay to mutate the room. `false` means the connection is gone.
+    ///
+    /// Nothing is applied locally: the relay is what decides, and its answer
+    /// comes back as [`Event::State`] like any other peer's would.
     #[must_use]
-    pub fn publish(&self, state: PlaybackState) -> bool {
-        self.out.send(ClientMsg::State { state }).is_ok()
-    }
-
-    /// Queues the full track list. `false` means the connection is gone.
-    #[must_use]
-    pub fn publish_queue(&self, revision: u64, tracks: Vec<TrackRef>) -> bool {
-        self.out
-            .send(ClientMsg::Queue { revision, tracks })
-            .is_ok()
+    pub fn send_command(&self, command: Command) -> bool {
+        self.out.send(ClientMsg::Do { command }).is_ok()
     }
 
     pub fn say_goodbye(&self) {
@@ -276,8 +269,13 @@ async fn read_loop(
                     break;
                 }
             }
-            Ok(ServerMsg::Peer { role, joined, peers }) => {
-                if events.send(Event::Peer { role, joined, peers }).is_err() {
+            Ok(ServerMsg::Peer { joined, peers }) => {
+                if events.send(Event::Peer { joined, peers }).is_err() {
+                    break;
+                }
+            }
+            Ok(ServerMsg::Station { id, yours }) => {
+                if events.send(Event::Station { id, yours }).is_err() {
                     break;
                 }
             }

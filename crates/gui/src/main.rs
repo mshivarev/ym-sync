@@ -16,7 +16,7 @@ use ymsync::api::{self, Track, YandexMusic};
 use ymsync::config::Config;
 use ymsync::engine::{self, Command, Handle, Snapshot};
 use ymsync::player::Player;
-use ymsync_proto::{Role, TrackRef};
+use ymsync_proto::TrackRef;
 
 struct AppState {
     config: Config,
@@ -66,17 +66,7 @@ fn settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-async fn connect(
-    role: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<Snapshot, String> {
-    let role = match role.as_str() {
-        "master" => Role::Master,
-        "slave" => Role::Slave,
-        other => return Err(format!("неизвестная роль: {other}")),
-    };
-
+async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot, String> {
     let mut slot = state.engine.lock().await;
     if slot.is_some() {
         return Err("уже подключено".to_string());
@@ -90,7 +80,7 @@ async fn connect(
         .map_err(fail)?
         .map_err(fail)?;
 
-    let handle = engine::spawn(&state.config, role, api, Arc::new(player))
+    let handle = engine::spawn(&state.config, api, Arc::new(player))
         .await
         .map_err(fail)?;
     let snapshot = handle.snapshot();
@@ -232,6 +222,7 @@ async fn control(
         "seek_by" => Command::SeekBy(number as i64),
         "volume" => Command::SetVolume(number as f32),
         "index" => Command::PlayIndex(number.max(0.0) as usize),
+        "stop_wave" => Command::StopStation,
         other => return Err(format!("неизвестное действие: {other}")),
     };
     send(&state, command).await

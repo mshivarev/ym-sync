@@ -9,7 +9,7 @@ object Native {
         System.loadLibrary("ymsync_android")
     }
 
-    external fun start(configJson: String, role: String): String
+    external fun start(configJson: String): String
     external fun poll(handle: Long, playerStateJson: String): String
     external fun send(handle: Long, requestJson: String): String
     external fun search(handle: Long, query: String, limit: Int): String

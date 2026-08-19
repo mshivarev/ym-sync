@@ -5,7 +5,7 @@
 //! ```kotlin
 //! object Native {
 //!     init { System.loadLibrary("ymsync_android") }
-//!     external fun start(configJson: String, role: String): String
+//!     external fun start(configJson: String): String
 //!     external fun poll(handle: Long, playerStateJson: String): String
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
@@ -68,17 +68,16 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_start(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
-    role: JString,
 ) -> jstring {
-    let text = match (read(&mut env, &config_json), read(&mut env, &role)) {
-        (Ok(config), Ok(role)) => match Session::start(&config, &role) {
+    let text = match read(&mut env, &config_json) {
+        Ok(config) => match Session::start(&config) {
             Ok(session) => {
                 let handle = Box::into_raw(Box::new(session)) as jlong;
                 ok(serde_json::json!({ "handle": handle }))
             }
             Err(err) => failed(err),
         },
-        (Err(err), _) | (_, Err(err)) => failed(err),
+        Err(err) => failed(err),
     };
     reply(&mut env, &text)
 }

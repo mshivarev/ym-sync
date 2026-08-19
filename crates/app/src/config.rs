@@ -41,15 +41,13 @@ impl Default for Config {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
-    /// Re-align the slave once it is off by more than this.
+    /// Re-align this peer once it is off the room by more than this.
     pub seek_threshold_ms: i64,
     /// Aim this far ahead when seeking, to cover the seek's own cost.
     pub seek_lead_ms: i64,
     /// Skip corrections while the relay round trip is worse than this.
     pub max_rtt_ms: i64,
-    /// How often the master publishes its playhead.
-    pub heartbeat_ms: u64,
-    /// How often the slave compares itself against the master.
+    /// How often this peer compares itself against the room.
     pub correction_interval_ms: u64,
     /// Clock probe interval, in seconds.
     pub clock_probe_secs: u64,
@@ -73,7 +71,6 @@ impl Default for SyncConfig {
             seek_threshold_ms: 300,
             seek_lead_ms: 40,
             max_rtt_ms: 400,
-            heartbeat_ms: 1_000,
             correction_interval_ms: 250,
             clock_probe_secs: 5,
             position_bias_ms: 0,
@@ -197,7 +194,7 @@ mod tests {
         let parsed: Config = toml::from_str("room = \"kitchen\"\n").unwrap();
         assert_eq!(parsed.room, "kitchen");
         assert_eq!(parsed.relay, DEFAULT_RELAY);
-        assert_eq!(parsed.sync.heartbeat_ms, 1_000);
+        assert_eq!(parsed.sync.correction_interval_ms, 250);
     }
 
     #[test]
@@ -243,6 +240,6 @@ mod tests {
         assert_eq!(config.sync.position_bias_ms, 400);
         // Everything the client left out keeps its default.
         assert_eq!(config.sync.seek_threshold_ms, 300);
-        assert_eq!(config.sync.heartbeat_ms, 1_000);
+        assert_eq!(config.sync.correction_interval_ms, 250);
     }
 }

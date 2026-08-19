@@ -5,13 +5,13 @@ const { listen } = window.__TAURI__.event;
 
 const el = (id) => document.getElementById(id);
 const ui = {
-  role: el("role"),
   connect: el("connect"),
   status: el("status"),
   kind: el("kind"),
   source: el("source"),
   load: el("load"),
   play: el("play"),
+  wave: el("wave"),
   query: el("query"),
   find: el("find"),
   results: el("results"),
@@ -41,7 +41,6 @@ const PLACEHOLDERS = {
 const SELF_CONTAINED = new Set(["wave", "likes"]);
 
 let connected = false;
-let role = "master";
 let latest = null;
 let results = [];
 let queueKey = "";
@@ -76,12 +75,10 @@ function setConnected(value) {
   connected = value;
   ui.connect.textContent = value ? "Отключиться" : "Подключиться";
   ui.connect.classList.toggle("primary", !value);
-  ui.role.disabled = value;
 
-  // A slave takes its orders from the master, so its transport is inert.
-  const canDrive = value && role === "master";
+  // Protocol 3 has no roles: everyone in the room may drive it.
   for (const node of [ui.kind, ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek]) {
-    node.disabled = !canDrive;
+    node.disabled = !value;
   }
 
   if (!value) {
@@ -90,6 +87,7 @@ function setConnected(value) {
     ui.status.className = "status";
     ui.status.textContent = "не подключено";
     ui.drift.classList.add("hidden");
+    ui.wave.classList.add("hidden");
     ui.queue.replaceChildren();
     ui.queueCount.textContent = "";
     ui.title.textContent = "—";
@@ -157,7 +155,6 @@ function renderResults() {
 
 function render(snapshot) {
   latest = snapshot;
-  role = snapshot.role;
 
   const track = snapshot.track;
   ui.title.textContent = track ? `${track.artist} — ${track.title}` : "—";
@@ -178,9 +175,18 @@ function render(snapshot) {
   const rtt = snapshot.rtt_ms === null ? "?" : snapshot.rtt_ms;
   const offset = snapshot.offset_ms === null ? "?" : snapshot.offset_ms;
   ui.status.textContent =
-    `${snapshot.role === "master" ? "ведущий" : "ведомый"} · ` +
     `участников ${snapshot.peers} · rtt ${rtt} мс · смещение ${offset} мс`;
   ui.status.className = `status ${snapshot.connected ? "live" : "broken"}`;
+
+  // The station is a room-wide setting, but only its feeder can refill it, so
+  // say which of the two we are looking at.
+  if (snapshot.station) {
+    ui.wave.classList.remove("hidden");
+    ui.wave.textContent = snapshot.feeding ? "Волна · выключить" : "Волна (ведёт другой)";
+    ui.wave.disabled = !snapshot.feeding;
+  } else {
+    ui.wave.classList.add("hidden");
+  }
 
   const drift = snapshot.drift_ms;
   if (drift === null || drift === undefined) {
@@ -207,9 +213,8 @@ ui.connect.addEventListener("click", async () => {
       setConnected(false);
       return;
     }
-    role = ui.role.value;
     ui.connect.textContent = "Подключаюсь…";
-    const snapshot = await call("connect", { role });
+    const snapshot = await call("connect");
     if (snapshot) {
       setConnected(true);
       render(snapshot);
@@ -251,6 +256,7 @@ async function loadSource(button, replace) {
 
 ui.load.addEventListener("click", () => loadSource(ui.load, false));
 ui.play.addEventListener("click", () => loadSource(ui.play, true));
+ui.wave.addEventListener("click", () => call("control", { action: "stop_wave" }));
 
 ui.find.addEventListener("click", async () => {
   const query = ui.query.value.trim();

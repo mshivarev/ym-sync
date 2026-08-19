@@ -6,32 +6,17 @@ use serde::{Deserialize, Serialize};
 /// clients that do not match.
 ///
 /// * 1 — single track per state snapshot.
-/// * 2 — queues: [`ClientMsg::Queue`] plus `index`/`queue_revision` in
+/// * 2 — queues: `ClientMsg::Queue` plus `index`/`queue_revision` in
 ///   [`PlaybackState`].
-pub const PROTOCOL_VERSION: u16 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    /// Plays whatever the user asks for and broadcasts its playback state.
-    Master,
-    /// Follows the master's state.
-    Slave,
-}
-
-impl std::fmt::Display for Role {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Role::Master => f.write_str("master"),
-            Role::Slave => f.write_str("slave"),
-        }
-    }
-}
+/// * 3 — the relay owns the queue and the playhead. Clients no longer publish
+///   state; they send [`Command`]s and follow what comes back. Roles are gone:
+///   every peer plays and every peer may command.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Identifies a track well enough for another account to resolve it.
 ///
 /// `track_id` is the authoritative key: it is the same numeric id on every
-/// account, so the slave does not have to match on artist/title strings. The
+/// account, so a peer does not have to match on artist/title strings. The
 /// human-readable fields are for logging and for the unavailable-track message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackRef {
@@ -49,29 +34,67 @@ impl std::fmt::Display for TrackRef {
     }
 }
 
-/// A snapshot of the master's playhead.
+/// The room's playhead, as the relay sees it.
 ///
-/// The current track is repeated here rather than only referenced by `index`,
-/// so a slave that has not yet received the queue can still play along; the
-/// queue itself arrives separately (see [`ClientMsg::Queue`]) because resending
-/// a hundred tracks every second would be pure waste.
+/// This is an *anchor*, not a running clock: `position_ms` is where the playhead
+/// stood at `at_server_ms`, and a playing room advances from there on its own.
+/// So the relay only has to speak when something changes, and every peer can
+/// work out where it ought to be at any instant (see
+/// [`crate::sync::target_position_ms`]).
+///
+/// The current track is repeated here rather than only referenced by `index`, so
+/// a peer whose queue copy is stale still knows what to load; the queue itself
+/// arrives separately (see [`ServerMsg::Queue`]) because resending a hundred
+/// tracks on every pause would be pure waste.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackState {
-    /// Monotonically increasing per master session; lets the slave drop
-    /// reordered or stale snapshots.
+    /// Assigned by the relay, one higher on every accepted mutation. Lets a peer
+    /// drop snapshots that arrive out of order.
     pub seq: u64,
     pub track: Option<TrackRef>,
-    /// Position of `track` within the master's queue.
+    /// Position of `track` within the room's queue.
     pub index: usize,
-    /// Which queue `index` refers to. A slave whose stored queue has a
-    /// different revision knows its copy is stale.
+    /// Which queue `index` refers to. A peer whose stored queue has a different
+    /// revision knows its copy is stale.
     pub queue_revision: u64,
     pub position_ms: u64,
     pub playing: bool,
-    /// The master's estimate of the *relay's* clock at the instant
-    /// `position_ms` was sampled. Both sides convert to relay time, so neither
-    /// needs the other's clock to be correct.
+    /// The relay's own clock at the instant this anchor was set. Unlike protocol
+    /// 2, where a master estimated relay time, this is read directly — so the
+    /// anchor carries no clock-estimation error at all.
     pub at_server_ms: i64,
+    /// Set while some peer is feeding an endless station into the queue. Carried
+    /// so a joining peer can show that the wave is on; the id is the station's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station: Option<String>,
+}
+
+/// A mutation any peer may ask the relay to make.
+///
+/// Deliberately explicit rather than convenient: there is no `toggle_pause`,
+/// because with several peers commanding at once a toggle races — two people
+/// pressing pause together would cancel each other out. The caller decides from
+/// the last snapshot whether it means [`Command::Pause`] or [`Command::Resume`].
+///
+/// Volume is absent on purpose: it is a property of a listener's own speakers,
+/// never of the room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "c", rename_all = "snake_case")]
+pub enum Command {
+    /// Throws the current queue away and starts at `start`.
+    SetQueue { tracks: Vec<TrackRef>, start: usize },
+    /// Adds to the end of the queue, leaving what is playing alone.
+    Enqueue { tracks: Vec<TrackRef> },
+    PlayIndex { index: usize },
+    Next,
+    Prev,
+    Pause,
+    Resume,
+    Seek { position_ms: u64 },
+    /// Claims or releases the endless station. The claiming peer becomes its
+    /// feeder: only it can resolve more tracks, since the relay holds no Yandex
+    /// credentials. `None` releases the claim.
+    SetStation { id: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +104,6 @@ pub enum ClientMsg {
         protocol: u16,
         room: String,
         token: String,
-        role: Role,
         client: String,
     },
     /// Clock probe. `c0` is the client's wall clock at send time and is echoed
@@ -89,14 +111,8 @@ pub enum ClientMsg {
     TimeReq {
         c0: i64,
     },
-    State {
-        state: PlaybackState,
-    },
-    /// The master's full queue. Sent when it changes and whenever a peer joins,
-    /// since the relay keeps no state to replay.
-    Queue {
-        revision: u64,
-        tracks: Vec<TrackRef>,
+    Do {
+        command: Command,
     },
     Bye,
 }
@@ -123,9 +139,14 @@ pub enum ServerMsg {
         tracks: Vec<TrackRef>,
     },
     Peer {
-        role: Role,
         joined: bool,
         peers: usize,
+    },
+    /// Sent to the peer that asked, not broadcast: it answers "are you the one
+    /// feeding the station?". A peer that loses the claim stops feeding.
+    Station {
+        id: Option<String>,
+        yours: bool,
     },
     Error {
         code: String,
@@ -138,9 +159,22 @@ pub enum ServerMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     State(PlaybackState),
-    Queue { revision: u64, tracks: Vec<TrackRef> },
-    Peer { role: Role, joined: bool, peers: usize },
-    Error { code: String, message: String },
+    Queue {
+        revision: u64,
+        tracks: Vec<TrackRef>,
+    },
+    Peer {
+        joined: bool,
+        peers: usize,
+    },
+    Station {
+        id: Option<String>,
+        yours: bool,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -166,22 +200,59 @@ mod tests {
             position_ms: 12_345,
             playing: true,
             at_server_ms: 1_700_000_000_000,
+            station: None,
         }
     }
 
     #[test]
     fn state_roundtrips_through_json() {
-        let msg = ClientMsg::State {
+        let msg = ServerMsg::State {
             state: sample_state(),
         };
         let text = serde_json::to_string(&msg).unwrap();
-        assert_eq!(msg, serde_json::from_str::<ClientMsg>(&text).unwrap());
+        assert_eq!(msg, serde_json::from_str::<ServerMsg>(&text).unwrap());
     }
 
     #[test]
     fn messages_are_internally_tagged() {
         let text = serde_json::to_string(&ClientMsg::TimeReq { c0: 5 }).unwrap();
         assert_eq!(text, r#"{"t":"time_req","c0":5}"#);
+    }
+
+    #[test]
+    fn commands_carry_their_own_tag() {
+        let text = serde_json::to_string(&ClientMsg::Do {
+            command: Command::Seek { position_ms: 9_000 },
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"t":"do","command":{"c":"seek","position_ms":9000}}"#);
+    }
+
+    #[test]
+    fn every_command_roundtrips() {
+        let commands = [
+            Command::SetQueue {
+                tracks: vec![sample_track("1")],
+                start: 0,
+            },
+            Command::Enqueue {
+                tracks: vec![sample_track("2")],
+            },
+            Command::PlayIndex { index: 3 },
+            Command::Next,
+            Command::Prev,
+            Command::Pause,
+            Command::Resume,
+            Command::Seek { position_ms: 1 },
+            Command::SetStation {
+                id: Some("wave".into()),
+            },
+            Command::SetStation { id: None },
+        ];
+        for command in commands {
+            let text = serde_json::to_string(&command).unwrap();
+            assert_eq!(command, serde_json::from_str::<Command>(&text).unwrap(), "{text}");
+        }
     }
 
     #[test]
@@ -194,13 +265,24 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_station_is_omitted_but_a_live_one_survives() {
+        let text = serde_json::to_string(&sample_state()).unwrap();
+        assert!(!text.contains("station"), "{text}");
+
+        let mut state = sample_state();
+        state.station = Some("wave".into());
+        let text = serde_json::to_string(&state).unwrap();
+        assert_eq!(state, serde_json::from_str::<PlaybackState>(&text).unwrap());
+    }
+
+    #[test]
     fn queue_roundtrips_through_json() {
-        let msg = ClientMsg::Queue {
+        let msg = ServerMsg::Queue {
             revision: 5,
             tracks: vec![sample_track("1"), sample_track("2")],
         };
         let text = serde_json::to_string(&msg).unwrap();
-        assert_eq!(msg, serde_json::from_str::<ClientMsg>(&text).unwrap());
+        assert_eq!(msg, serde_json::from_str::<ServerMsg>(&text).unwrap());
     }
 
     #[test]

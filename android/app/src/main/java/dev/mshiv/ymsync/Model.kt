@@ -13,7 +13,6 @@ data class TrackInfo(
 
 /** Mirrors `ymsync::engine::Snapshot`. */
 data class Snapshot(
-    val role: String,
     val connected: Boolean,
     val peers: Int,
     val queue: List<TrackInfo>,
@@ -23,12 +22,14 @@ data class Snapshot(
     val durationMs: Long,
     val playing: Boolean,
     val loading: Boolean,
+    /** The station feeding the room, if any. */
+    val station: String?,
+    /** Whether this device is the one feeding that station. */
+    val feeding: Boolean,
     val driftMs: Long?,
     val rttMs: Long?,
     val notice: String?,
-) {
-    val isMaster: Boolean get() = role == "master"
-}
+)
 
 /** Either the `ok` payload or the `error` text from a native call. */
 sealed interface NativeResult {
@@ -69,7 +70,6 @@ fun JSONArray.toTrackList(): List<TrackInfo> =
  */
 fun JSONObject.toSnapshot(previous: Snapshot? = null) =
     Snapshot(
-        role = optString("role"),
         connected = optBoolean("connected"),
         peers = optInt("peers"),
         queue = optJSONArray("queue")?.toTrackList() ?: previous?.queue ?: emptyList(),
@@ -79,6 +79,8 @@ fun JSONObject.toSnapshot(previous: Snapshot? = null) =
         durationMs = optLong("duration_ms"),
         playing = optBoolean("playing"),
         loading = optBoolean("loading"),
+        station = if (isNull("station")) null else optString("station"),
+        feeding = optBoolean("feeding"),
         // `optLong` would turn a missing drift into a misleading zero.
         driftMs = if (isNull("drift_ms")) null else optLong("drift_ms"),
         rttMs = if (isNull("rtt_ms")) null else optLong("rtt_ms"),

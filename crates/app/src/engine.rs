@@ -4,6 +4,16 @@
 //! commands go in through a channel, and state comes out as snapshots on a
 //! `watch` channel. Nothing here reads stdin or prints, so the loop is reusable
 //! and the UI never blocks on a download.
+//!
+//! Since protocol 3 there is only one kind of peer. The relay owns the queue and
+//! the playhead, so this loop does exactly two things: it asks the relay for
+//! changes, and it pulls the local player onto whatever the relay says the room
+//! is doing. Nothing here decides anything about the room on its own — which is
+//! what lets several people command it at once without fighting.
+//!
+//! The one asymmetry left is the station. The relay has no Yandex credentials,
+//! so an endless station needs a peer to resolve batches and push them in; the
+//! peer that switched the wave on becomes that feeder.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,8 +24,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use ymsync_proto::{
-    Correction, Event, PlaybackState, Role, SyncParams, TrackRef, decide, target_position_ms,
-    trust_clock, unix_ms,
+    Correction, Event, PlaybackState, SyncParams, TrackRef, decide, target_position_ms, trust_clock,
 };
 
 use crate::api::{Track, YandexMusic};
@@ -23,8 +32,8 @@ use crate::config::Config;
 use crate::link::Link;
 use crate::playback::{AudioSource, Playback};
 
-/// A snapshot whose seq is this far below the last one means the master
-/// restarted and began a fresh counter, rather than a frame arriving late.
+/// A snapshot whose seq is this far below the last one means the relay restarted
+/// and began a fresh counter, rather than a frame arriving late.
 const SEQ_RESTART_GAP: u64 = 64;
 
 /// A load can fail for transient reasons — Yandex rate-limits concurrent stream
@@ -44,8 +53,8 @@ const SEEK_COOLDOWN: Duration = Duration::from_secs(2);
 /// How long a notice stays in the snapshot.
 ///
 /// Notices report events — a peer joining, a track skipped. Without an expiry
-/// "slave подключился" would sit in every later snapshot and read as the current
-/// state long after that peer left.
+/// "участник подключился" would sit in every later snapshot and read as the
+/// current state long after that peer left.
 const NOTICE_TTL: Duration = Duration::from_secs(8);
 
 /// How close to the end of the queue a station is topped up.
@@ -55,20 +64,26 @@ const NOTICE_TTL: Duration = Duration::from_secs(8);
 /// the request takes.
 const STATION_LEAD: usize = 2;
 
-/// What a front end can ask the engine to do. A slave accepts only
-/// [`Command::SetVolume`]; everything else is the master's to decide.
+/// What a front end can ask the engine to do.
+///
+/// Everything except volume becomes a request to the relay: this peer does not
+/// change the room by itself, it asks, and then follows the answer along with
+/// everybody else. Volume never leaves the machine — it belongs to these
+/// speakers, not to the room.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Replaces the queue and starts playing at `start`. Any station is dropped.
+    /// Replaces the room's queue and starts playing at `start`.
     SetQueue { tracks: Vec<TrackRef>, start: usize },
-    /// Adds tracks to the end of the queue.
+    /// Adds tracks to the end of the room's queue.
     ///
     /// Never interrupts what is playing — that is the whole point of a queue —
     /// but a queue that is empty or has run dry starts on the new tracks.
     Enqueue { tracks: Vec<TrackRef> },
-    /// Follows an endless station, topping the queue up as it runs down.
-    /// [`crate::api::WAVE_STATION`] is «Моя волна».
+    /// Follows an endless station, topping the room's queue up as it runs down.
+    /// [`crate::api::WAVE_STATION`] is «Моя волна». This peer becomes the feeder.
     PlayStation { id: String, replace: bool },
+    /// Stops feeding a station. What is already queued still plays.
+    StopStation,
     PlayIndex(usize),
     TogglePause,
     SeekTo(u64),
@@ -82,7 +97,6 @@ pub enum Command {
 /// Everything a UI needs to draw itself. Published after every loop iteration.
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
-    pub role: Role,
     pub connected: bool,
     pub peers: usize,
     pub queue: Vec<TrackRef>,
@@ -96,7 +110,11 @@ pub struct Snapshot {
     /// A track is being fetched; the playhead is meaningless until it clears.
     pub loading: bool,
     pub volume: f32,
-    /// Slave only: how far ahead (+) or behind (-) the master we are.
+    /// The station feeding the room, if any.
+    pub station: Option<String>,
+    /// Whether *this* peer is the one feeding that station.
+    pub feeding: bool,
+    /// How far ahead (+) or behind (-) the room this peer is.
     pub drift_ms: Option<i64>,
     pub rtt_ms: Option<i64>,
     pub offset_ms: Option<i64>,
@@ -136,7 +154,6 @@ impl Handle {
 /// Connects to the relay and starts the loop.
 pub async fn spawn(
     cfg: &Config,
-    role: Role,
     api: Arc<YandexMusic>,
     player: Arc<dyn Playback>,
 ) -> Result<Handle> {
@@ -145,14 +162,12 @@ pub async fn spawn(
         &cfg.relay,
         &cfg.room,
         room_token,
-        role,
         Duration::from_secs(cfg.sync.clock_probe_secs),
     )
     .await?;
 
     let peers = link.peers_at_join();
     let (snapshots, snapshot_rx) = watch::channel(Snapshot {
-        role,
         connected: true,
         peers,
         queue: Vec::new(),
@@ -164,6 +179,8 @@ pub async fn spawn(
         playing: false,
         loading: false,
         volume: player.volume(),
+        station: None,
+        feeding: false,
         drift_ms: None,
         rtt_ms: link.clock().rtt_ms(),
         offset_ms: link.clock().offset_ms(),
@@ -171,22 +188,18 @@ pub async fn spawn(
     });
 
     let engine = Engine {
-        role,
         api,
         player,
         link,
         params: cfg.sync.params(),
         queue: Vec::new(),
         revision: 0,
-        index: 0,
         station: None,
         refilling: false,
-        seq: 0,
         remote: None,
         unavailable: HashSet::new(),
         attempts: HashMap::new(),
         loading: None,
-        want_play: false,
         drift_ms: None,
         position_bias_ms: cfg.sync.position_bias_ms,
         last_seek: None,
@@ -198,10 +211,9 @@ pub async fn spawn(
         snapshots,
     };
 
-    let heartbeat = Duration::from_millis(cfg.sync.heartbeat_ms);
     let tick = Duration::from_millis(cfg.sync.correction_interval_ms);
     let (commands, command_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(engine.run(command_rx, events, heartbeat, tick));
+    let task = tokio::spawn(engine.run(command_rx, events, tick));
 
     Ok(Handle {
         commands,
@@ -227,33 +239,36 @@ enum Internal {
     },
 }
 
-/// An endless station the master is following.
+/// An endless station this peer is feeding into the room.
 struct Station {
     id: String,
     /// The last track it handed out, so the next request continues from there
     /// instead of replaying the same batch.
     after: Option<String>,
+    /// Whether the relay has confirmed this peer as the feeder. Until it has, we
+    /// resolve batches but may still lose the claim to someone quicker.
+    claimed: bool,
+    /// The first batch replaces the room's queue rather than joining it.
+    replace_first: bool,
 }
 
 struct Engine {
-    role: Role,
     api: Arc<YandexMusic>,
     player: Arc<dyn Playback>,
     link: Link,
     params: SyncParams,
 
+    /// Mirror of the room's queue, as last sent by the relay.
     queue: Vec<TrackRef>,
     revision: u64,
-    index: usize,
 
-    /// Master: the station feeding the queue, when one is playing.
+    /// Set only while *this* peer feeds a station.
     station: Option<Station>,
     /// A request for more station tracks is in flight.
     refilling: bool,
 
-    /// Master: outgoing snapshot counter.
-    seq: u64,
-    /// Slave: the master's last known state.
+    /// The room's state, as the relay last described it. This is the only
+    /// authority on what should be playing.
     remote: Option<PlaybackState>,
     /// Tracks this account cannot play, so we stop retrying them.
     unavailable: HashSet<String>,
@@ -261,9 +276,8 @@ struct Engine {
     attempts: HashMap<String, u8>,
 
     loading: Option<String>,
-    want_play: bool,
     drift_ms: Option<i64>,
-    /// Cancels a backend's constant reporting lag; see [`SyncConfig`].
+    /// Cancels a backend's constant reporting lag; see [`crate::config::SyncConfig`].
     position_bias_ms: i64,
     /// When the last hard seek happened, for [`SEEK_COOLDOWN`].
     last_seek: Option<std::time::Instant>,
@@ -282,13 +296,10 @@ impl Engine {
         mut self,
         mut commands: mpsc::UnboundedReceiver<Command>,
         mut events: mpsc::UnboundedReceiver<Event>,
-        heartbeat: Duration,
         tick: Duration,
     ) -> Result<()> {
         let (internal, mut internal_rx) = mpsc::unbounded_channel::<Internal>();
 
-        let mut heartbeat = tokio::time::interval(heartbeat);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut tick = tokio::time::interval(tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -317,16 +328,7 @@ impl Engine {
                     Some(event) => self.handle_event(event, &internal),
                 },
 
-                _ = tick.tick() => match self.role {
-                    Role::Master => self.master_tick(&internal),
-                    Role::Slave => self.slave_tick(),
-                },
-
-                _ = heartbeat.tick() => {
-                    if self.role == Role::Master {
-                        self.publish_state();
-                    }
-                }
+                _ = tick.tick() => self.tick(&internal),
             }
 
             self.publish();
@@ -339,148 +341,96 @@ impl Engine {
         Ok(())
     }
 
-    fn handle_command(&mut self, command: Command, internal: &mpsc::UnboundedSender<Internal>) {
-        // Volume is a local matter even on a slave; everything else would just
-        // be undone by the next correction.
-        if self.role == Role::Slave {
-            match command {
-                Command::SetVolume(volume) => self.player.set_volume(volume),
-                _ => {
-                    self.notice =
-                        Some("ведомый следует за ведущим — команда проигнорирована".to_string());
-                }
-            }
-            return;
+    /// Sends a request to the relay, noting a dead link.
+    fn ask(&mut self, command: ymsync_proto::Command) {
+        if !self.link.send_command(command) {
+            self.connected = false;
         }
+    }
 
+    /// Where the room's playhead is right now, in track time. `None` when the
+    /// clock is not established yet.
+    fn room_position_ms(&self) -> Option<i64> {
+        let remote = self.remote.as_ref()?;
+        let now = self.link.clock().now_server_ms()?;
+        Some(target_position_ms(remote, now))
+    }
+
+    fn handle_command(&mut self, command: Command, internal: &mpsc::UnboundedSender<Internal>) {
         match command {
             Command::SetQueue { tracks, start } => {
                 if tracks.is_empty() {
                     self.notice = Some("пустая очередь".to_string());
                     return;
                 }
+                // Asking for particular tracks ends any wave we were feeding;
+                // the relay drops the claim on its side for the same reason.
                 self.station = None;
-                self.queue = tracks;
-                self.revision += 1;
-                self.unavailable.clear();
-                self.attempts.clear();
-                self.publish_queue();
-                self.play_index(start.min(self.queue.len() - 1), internal);
+                self.ask(ymsync_proto::Command::SetQueue { tracks, start });
             }
-            Command::Enqueue { tracks } => self.absorb(tracks, internal),
-            Command::PlayStation { id, replace } => {
-                if replace {
-                    self.queue.clear();
-                    self.index = 0;
-                    self.want_play = false;
-                    self.player.pause();
-                    self.unavailable.clear();
-                    self.attempts.clear();
-                    self.revision += 1;
-                    self.publish_queue();
-                    // The queue is empty until the first batch lands, and the
-                    // slave has to be told to stop with us rather than play on.
-                    self.publish_state();
+
+            Command::Enqueue { tracks } => {
+                if tracks.is_empty() {
+                    self.notice = Some("нечего добавить в очередь".to_string());
+                    return;
                 }
+                self.ask(ymsync_proto::Command::Enqueue { tracks });
+            }
+
+            Command::PlayStation { id, replace } => {
                 self.notice = Some("настраиваю волну…".to_string());
-                self.station = Some(Station { id, after: None });
+                self.station = Some(Station {
+                    id,
+                    after: None,
+                    claimed: false,
+                    replace_first: replace,
+                });
+                self.refilling = false;
                 self.request_station_tracks(internal);
             }
-            Command::PlayIndex(index) => self.play_index(index, internal),
-            Command::TogglePause => {
-                if self.player.is_playing() {
-                    self.player.pause();
-                    self.want_play = false;
-                } else {
-                    self.player.play();
-                    self.want_play = true;
+
+            Command::StopStation => {
+                if self.station.take().is_some() {
+                    self.ask(ymsync_proto::Command::SetStation { id: None });
                 }
-                self.publish_state();
             }
-            Command::SeekTo(ms) => self.seek(ms),
+
+            Command::PlayIndex(index) => self.ask(ymsync_proto::Command::PlayIndex { index }),
+            Command::Next => self.ask(ymsync_proto::Command::Next),
+            Command::Prev => self.ask(ymsync_proto::Command::Prev),
+
+            Command::TogglePause => {
+                // Derived from the room, not from this player: a toggle computed
+                // locally would flip the wrong way on a peer that is still
+                // loading, and two peers toggling at once would cancel out.
+                let playing = self.remote.as_ref().is_some_and(|state| state.playing);
+                self.ask(if playing {
+                    ymsync_proto::Command::Pause
+                } else {
+                    ymsync_proto::Command::Resume
+                });
+            }
+
+            Command::SeekTo(ms) => self.ask(ymsync_proto::Command::Seek { position_ms: ms }),
+
             Command::SeekBy(delta_ms) => {
-                let target = (self.player.position_ms() as i64 + delta_ms).max(0) as u64;
-                self.seek(target);
+                // Relative to where the *room* is, so that two peers nudging at
+                // once both move from the same place.
+                let Some(from) = self.room_position_ms() else {
+                    self.notice = Some("часы ещё не сверены — подождите секунду".to_string());
+                    return;
+                };
+                let target = (from + delta_ms).max(0) as u64;
+                self.ask(ymsync_proto::Command::Seek {
+                    position_ms: target,
+                });
             }
-            Command::Next => self.step(1, internal),
-            Command::Prev => self.step(-1, internal),
+
+            // The only command that never leaves this machine.
             Command::SetVolume(volume) => self.player.set_volume(volume),
+
             // Handled by the loop.
             Command::Shutdown => {}
-        }
-    }
-
-    fn seek(&mut self, ms: u64) {
-        // Dragging past the end means "this track is done": clamping lets the
-        // auto-advance pick it up instead of leaving a bogus playhead behind.
-        let target = match self.wanted_track().map(|t| t.duration_ms) {
-            Some(duration) if duration > 0 => ms.min(duration),
-            _ => ms,
-        };
-        match self.player.seek_ms(target) {
-            Ok(()) => self.publish_state(),
-            Err(err) => self.notice = Some(format!("переход не удался: {err:#}")),
-        }
-    }
-
-    fn step(&mut self, delta: i64, internal: &mpsc::UnboundedSender<Internal>) {
-        if self.queue.is_empty() {
-            return;
-        }
-        let target = self.index as i64 + delta;
-        if target < 0 || target as usize >= self.queue.len() {
-            self.notice = Some(
-                if delta > 0 {
-                    "конец очереди"
-                } else {
-                    "начало очереди"
-                }
-                .to_string(),
-            );
-            return;
-        }
-        self.play_index(target as usize, internal);
-    }
-
-    fn play_index(&mut self, index: usize, internal: &mpsc::UnboundedSender<Internal>) {
-        let Some(track) = self.queue.get(index).cloned() else {
-            self.notice = Some("в очереди нет такого трека".to_string());
-            return;
-        };
-        self.index = index;
-        self.want_play = true;
-        self.start_load(&track, internal);
-        self.publish_state();
-    }
-
-    /// Adds tracks to the end of the queue.
-    ///
-    /// The queue only starts playing when there is nothing to interrupt: adding
-    /// to a queue that is already going must leave the current track alone.
-    fn absorb(&mut self, tracks: Vec<TrackRef>, internal: &mpsc::UnboundedSender<Internal>) {
-        if tracks.is_empty() {
-            self.notice = Some("нечего добавить в очередь".to_string());
-            return;
-        }
-        let added = tracks.len();
-        let start = self.queue.len();
-        let take_over = idle(
-            start,
-            self.want_play,
-            self.player.is_finished(),
-            self.loading.is_some(),
-        );
-
-        self.queue.extend(tracks);
-        self.revision += 1;
-        self.publish_queue();
-
-        if take_over {
-            self.play_index(start, internal);
-        } else {
-            self.notice = Some(format!("добавлено в очередь: {added}"));
-            // Carries the new revision, so a slave knows its queue is stale.
-            self.publish_state();
         }
     }
 
@@ -514,12 +464,6 @@ impl Engine {
         });
     }
 
-    fn publish_queue(&mut self) {
-        if !self.link.publish_queue(self.revision, self.queue.clone()) {
-            self.connected = false;
-        }
-    }
-
     /// Fetches a track in the background. The playhead is not touched until the
     /// download lands, so the loop keeps answering commands meanwhile.
     fn start_load(&mut self, track: &TrackRef, internal: &mpsc::UnboundedSender<Internal>) {
@@ -545,21 +489,40 @@ impl Engine {
         match message {
             Internal::Station { tracks, error } => {
                 self.refilling = false;
-                // The queue was replaced while the request was out.
-                if self.station.is_none() {
+                // The wave was switched off while the request was out.
+                let Some(station) = self.station.as_mut() else {
                     return;
-                }
+                };
                 if let Some(error) = error {
                     // Retrying on a tick would hammer a broken endpoint four
                     // times a second, so the station stops here.
                     self.station = None;
                     self.notice = Some(format!("волна замолчала: {error}"));
+                    self.ask(ymsync_proto::Command::SetStation { id: None });
                     return;
                 }
-                if let Some(station) = self.station.as_mut() {
-                    station.after = tracks.last().map(|t| t.track_id.clone());
+                if tracks.is_empty() {
+                    return;
                 }
-                self.absorb(tracks, internal);
+
+                station.after = tracks.last().map(|t| t.track_id.clone());
+                let replace = std::mem::take(&mut station.replace_first);
+                let claim = if station.claimed {
+                    None
+                } else {
+                    Some(station.id.clone())
+                };
+
+                // Tracks first, then the claim: a replacing queue clears the
+                // relay's station, so claiming before it would lose the claim.
+                if replace {
+                    self.ask(ymsync_proto::Command::SetQueue { tracks, start: 0 });
+                } else {
+                    self.ask(ymsync_proto::Command::Enqueue { tracks });
+                }
+                if let Some(id) = claim {
+                    self.ask(ymsync_proto::Command::SetStation { id: Some(id) });
+                }
             }
 
             Internal::Retry { track_id } => {
@@ -596,48 +559,42 @@ impl Engine {
                         return;
                     }
 
-                    // Accounts differ in what they may play, so giving up on one
-                    // track is expected rather than fatal.
+                    // Accounts differ in what they may play. This peer sits the
+                    // track out in silence rather than skipping it for everyone:
+                    // the others can hear it perfectly well, and the relay will
+                    // move the room on when the track's time is up.
                     self.unavailable.insert(track_id);
-                    self.notice = Some(format!("пропускаю — {error}"));
+                    self.notice = Some(format!("пропускаю на этом аккаунте — {error}"));
                     self.player.pause();
-                    if self.role == Role::Master && self.index + 1 < self.queue.len() {
-                        self.play_index(self.index + 1, internal);
-                    }
                     return;
                 }
 
                 self.attempts.remove(&track_id);
                 self.notice = None;
-                if self.role == Role::Master {
-                    if self.want_play {
-                        self.player.play();
-                    }
-                    self.publish_state();
-                }
-                // A slave is positioned by the next correction tick.
+                // The next correction tick puts the playhead where the room is.
             }
         }
     }
 
-    /// The track this engine should currently have staged.
+    /// The track this engine should currently have staged: whatever the room is
+    /// on.
     fn wanted_track(&self) -> Option<TrackRef> {
-        match self.role {
-            Role::Master => self.queue.get(self.index).cloned(),
-            Role::Slave => self.remote.as_ref().and_then(|s| s.track.clone()),
-        }
+        self.remote.as_ref().and_then(|state| state.track.clone())
     }
 
     fn handle_event(&mut self, event: Event, internal: &mpsc::UnboundedSender<Internal>) {
         match event {
             Event::State(state) => {
-                if self.role != Role::Slave {
-                    return;
-                }
                 if !accept_seq(self.remote.as_ref().map(|s| s.seq), state.seq) {
                     return;
                 }
-                self.index = state.index;
+
+                // Someone replaced the queue outright, which ends any station —
+                // including one we were feeding.
+                if state.station.is_none() && self.station.is_some() {
+                    self.station = None;
+                    self.notice = Some("волна выключена".to_string());
+                }
 
                 if let Some(track) = state.track.clone() {
                     let staged = self.player.current_track_id();
@@ -652,31 +609,37 @@ impl Engine {
             }
 
             Event::Queue { revision, tracks } => {
-                if self.role == Role::Slave {
-                    self.revision = revision;
-                    self.queue = tracks;
-                }
+                // Taken as-is, with no monotonicity check of the kind `seq` gets
+                // in `accept_seq`. That is safe for one reason only: the relay is
+                // the sole author and sends `Queue` before the `State` that
+                // refers to it, over one ordered connection. If a queue ever
+                // gains a second author, this needs the same guard.
+                self.revision = revision;
+                self.queue = tracks;
             }
 
-            Event::Peer {
-                role,
-                joined,
-                peers,
-            } => {
+            Event::Peer { joined, peers } => {
                 self.peers = peers;
-                self.notice = Some(format!(
-                    "{role} {}",
+                self.notice = Some(
                     if joined {
-                        "подключился"
+                        "участник подключился"
                     } else {
-                        "отключился"
+                        "участник отключился"
                     }
-                ));
-                // The relay stores nothing, so a fresh peer has no queue until
-                // the master repeats it.
-                if joined && self.role == Role::Master && !self.queue.is_empty() {
-                    self.publish_queue();
-                    self.publish_state();
+                    .to_string(),
+                );
+            }
+
+            Event::Station { id, yours } => {
+                if yours {
+                    if let Some(station) = self.station.as_mut() {
+                        station.claimed = true;
+                    }
+                } else if self.station.take().is_some() {
+                    self.notice = Some(match id {
+                        Some(_) => "волну в этой комнате уже ведёт другой участник".to_string(),
+                        None => "волна выключена".to_string(),
+                    });
                 }
             }
 
@@ -686,33 +649,28 @@ impl Engine {
         }
     }
 
-    /// Master: move to the next track once the current one plays out.
-    fn master_tick(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
-        // Ahead of the other guards: a station has to be topped up even while a
-        // track is loading, and especially once the queue has run dry.
-        if self.station.is_some() && self.index + STATION_LEAD >= self.queue.len() {
+    /// One pass: keep a station fed, then pull the playhead onto the room's.
+    fn tick(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        self.feed_station(internal);
+        self.correct();
+    }
+
+    /// Tops the room's queue up while this peer is feeding a station.
+    ///
+    /// Ahead of every playback guard on purpose: a station has to be refilled
+    /// even while a track is loading, and especially once the queue has run out.
+    fn feed_station(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        if self.station.is_none() {
+            return;
+        }
+        let index = self.remote.as_ref().map_or(0, |state| state.index);
+        if index + STATION_LEAD >= self.queue.len() {
             self.request_station_tracks(internal);
-        }
-        if self.loading.is_some() || !self.want_play || self.queue.is_empty() {
-            return;
-        }
-        if !self.player.is_finished() {
-            return;
-        }
-        if self.index + 1 < self.queue.len() {
-            self.play_index(self.index + 1, internal);
-        } else {
-            self.want_play = false;
-            // A station refills itself, so its queue is not really over.
-            if self.station.is_none() {
-                self.notice = Some("очередь закончилась".to_string());
-            }
-            self.publish_state();
         }
     }
 
-    /// Slave: pull our playhead back onto the master's.
-    fn slave_tick(&mut self) {
+    /// Pulls the local playhead onto the room's.
+    fn correct(&mut self) {
         // A download is in flight, so the sink still holds the previous track:
         // both the playhead and any drift figure would be meaningless.
         if self.loading.is_some() {
@@ -726,7 +684,8 @@ impl Engine {
             self.player.pause();
             return;
         };
-        // Still fetching, or sitting this track out.
+        // Still fetching, or sitting this track out because this account cannot
+        // play it.
         if self.player.current_track_id().as_deref() != Some(track.track_id.as_str()) {
             self.drift_ms = None;
             return;
@@ -739,8 +698,8 @@ impl Engine {
         };
 
         let target_ms = target_position_ms(&remote, now_server_ms);
-        // Past the end: the master has finished this track, so stop rather than
-        // chase a position that does not exist.
+        // Past the end: the room has finished this track and the relay is about
+        // to move on, so stop rather than chase a position that does not exist.
         if track.duration_ms > 0 && target_ms >= track.duration_ms as i64 {
             self.player.pause();
             self.drift_ms = None;
@@ -803,38 +762,6 @@ impl Engine {
         }
     }
 
-    /// Master: tell the room where the playhead is.
-    fn publish_state(&mut self) {
-        if self.role != Role::Master {
-            return;
-        }
-        self.seq += 1;
-
-        let track = self.queue.get(self.index).cloned();
-        // While a download is in flight the sink still holds the previous track,
-        // so reporting its position would send the slave chasing a ghost.
-        let loading = self.loading.is_some();
-        let finished = !loading && self.player.is_finished();
-        let position_ms = match (loading, finished) {
-            (true, _) => 0,
-            (_, true) => track.as_ref().map_or(0, |t| t.duration_ms),
-            _ => self.player.position_ms(),
-        };
-
-        let state = PlaybackState {
-            seq: self.seq,
-            track,
-            index: self.index,
-            queue_revision: self.revision,
-            position_ms,
-            playing: !loading && self.player.is_playing(),
-            at_server_ms: self.link.clock().now_server_ms().unwrap_or_else(unix_ms),
-        };
-        if !self.link.publish(state) {
-            self.connected = false;
-        }
-    }
-
     fn publish(&mut self) {
         self.expire_notice();
 
@@ -848,18 +775,25 @@ impl Engine {
         };
 
         let _ = self.snapshots.send(Snapshot {
-            role: self.role,
             connected: self.connected,
             peers: self.peers,
             queue: self.queue.clone(),
             queue_revision: self.revision,
-            index: self.index,
+            index: self.remote.as_ref().map_or(0, |state| state.index),
             track,
             position_ms,
             duration_ms,
             playing: self.player.is_playing(),
             loading: self.loading.is_some(),
             volume: self.player.volume(),
+            station: self
+                .remote
+                .as_ref()
+                .and_then(|state| state.station.clone()),
+            // Only once the relay has confirmed the claim: between asking and
+            // being answered the station may still go to a quicker peer, and the
+            // front ends hang their "switch the wave off" control on this.
+            feeding: self.station.as_ref().is_some_and(|station| station.claimed),
             drift_ms: self.drift_ms,
             rtt_ms: self.link.clock().rtt_ms(),
             offset_ms: self.link.clock().offset_ms(),
@@ -869,11 +803,7 @@ impl Engine {
 }
 
 /// Resolves, downloads and stages one track.
-async fn load_track(
-    api: &YandexMusic,
-    player: &Arc<dyn Playback>,
-    track_id: &str,
-) -> Result<()> {
+async fn load_track(api: &YandexMusic, player: &Arc<dyn Playback>, track_id: &str) -> Result<()> {
     let track = api.track(track_id).await?;
     if !track.available {
         bail!("недоступен на этом аккаунте");
@@ -894,7 +824,7 @@ async fn load_track(
         .context("задача загрузки звука упала")?
 }
 
-/// Snapshots can arrive out of order, and a master restart resets the counter.
+/// Snapshots can arrive out of order, and a relay restart resets the counter.
 fn accept_seq(previous: Option<u64>, incoming: u64) -> bool {
     match previous {
         None => true,
@@ -918,18 +848,6 @@ fn requested_position(audible_ms: u64, bias_ms: i64) -> u64 {
     (audible_ms as i64 - bias_ms).max(0) as u64
 }
 
-/// Whether tracks appended to the queue should start playing at once.
-///
-/// Adding to a queue must never cut off what is playing. It should, though, pick
-/// up a queue that is empty or has played itself out — otherwise a station's next
-/// batch would arrive to silence.
-fn idle(queued: usize, want_play: bool, finished: bool, loading: bool) -> bool {
-    if loading || want_play {
-        return false;
-    }
-    queued == 0 || finished
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restarted_master_is_followed_again() {
+    fn a_restarted_relay_is_followed_again() {
         assert!(accept_seq(Some(5_000), 1));
         assert!(!accept_seq(Some(5_000), 4_990));
     }
@@ -971,7 +889,7 @@ mod tests {
     }
 
     /// A player reading 400 ms behind has to be asked for 400 ms less, so the
-    /// audio lands where the master actually is.
+    /// audio lands where the room actually is.
     #[test]
     fn the_reporting_bias_is_undone_when_seeking() {
         assert_eq!(requested_position(10_000, 400), 9_600);
@@ -979,22 +897,5 @@ mod tests {
         assert_eq!(requested_position(10_000, -400), 10_400);
         // Never before the start of the track.
         assert_eq!(requested_position(100, 400), 0);
-    }
-
-    /// The whole point of «В очередь»: a track added while something is playing
-    /// waits its turn instead of taking over.
-    #[test]
-    fn adding_to_a_playing_queue_does_not_interrupt_it() {
-        assert!(!idle(5, true, false, false), "playing");
-        assert!(!idle(5, true, true, false), "between tracks");
-        assert!(!idle(5, false, false, false), "paused mid-track");
-        assert!(!idle(0, true, false, true), "a load is in flight");
-    }
-
-    #[test]
-    fn an_empty_or_finished_queue_picks_up_the_new_tracks() {
-        assert!(idle(0, false, true, false), "nothing queued yet");
-        assert!(idle(0, false, false, false), "nothing queued, nothing staged");
-        assert!(idle(5, false, true, false), "the queue played itself out");
     }
 }

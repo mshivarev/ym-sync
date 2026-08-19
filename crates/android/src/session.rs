@@ -12,7 +12,7 @@ use ymsync::api::{self, Track, YandexMusic};
 use ymsync::config::Config;
 use ymsync::engine::{self, Command, Handle};
 use ymsync::playback::Playback;
-use ymsync_proto::{Role, TrackRef};
+use ymsync_proto::TrackRef;
 
 use crate::{ExternalPlayback, PlayerState};
 
@@ -28,6 +28,8 @@ pub enum Request {
     SeekBy { delta_ms: i64 },
     Volume { value: f32 },
     Index { index: usize },
+    /// Stops feeding the wave. What is already queued still plays.
+    StopWave,
 }
 
 impl From<Request> for Command {
@@ -40,6 +42,7 @@ impl From<Request> for Command {
             Request::SeekBy { delta_ms } => Command::SeekBy(delta_ms),
             Request::Volume { value } => Command::SetVolume(value),
             Request::Index { index } => Command::PlayIndex(index),
+            Request::StopWave => Command::StopStation,
         }
     }
 }
@@ -54,13 +57,8 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn start(config_json: &str, role: &str) -> Result<Self> {
+    pub fn start(config_json: &str) -> Result<Self> {
         let cfg: Config = serde_json::from_str(config_json).context("разбор настроек")?;
-        let role = match role {
-            "master" => Role::Master,
-            "slave" => Role::Slave,
-            other => bail!("неизвестная роль: {other}"),
-        };
 
         // `rustls` has no default provider in this build, and the WebSocket
         // client picks one from the process, so this has to happen first.
@@ -77,7 +75,6 @@ impl Session {
         let playback = Arc::new(ExternalPlayback::new(cfg.volume));
         let engine = runtime.block_on(engine::spawn(
             &cfg,
-            role,
             Arc::clone(&api),
             Arc::clone(&playback) as Arc<dyn Playback>,
         ))?;
@@ -208,6 +205,7 @@ mod tests {
                 Command::SeekBy(-10_000),
             ),
             (r#"{"action":"index","index":3}"#, Command::PlayIndex(3)),
+            (r#"{"action":"stop_wave"}"#, Command::StopStation),
         ];
         for (json, expected) in cases {
             let request: Request = serde_json::from_str(json).expect(json);

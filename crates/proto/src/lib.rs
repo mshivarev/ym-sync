@@ -10,7 +10,9 @@ pub mod message;
 pub mod sync;
 
 pub use clock::{ClockSample, ClockSampler, sample_from_roundtrip};
-pub use message::{ClientMsg, Event, PROTOCOL_VERSION, PlaybackState, Role, ServerMsg, TrackRef};
+pub use message::{
+    ClientMsg, Command, Event, PROTOCOL_VERSION, PlaybackState, ServerMsg, TrackRef,
+};
 pub use sync::{Correction, SyncParams, decide, target_position_ms, trust_clock};
 
 /// Wall-clock milliseconds since the Unix epoch.

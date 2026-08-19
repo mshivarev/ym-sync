@@ -86,7 +86,6 @@ private fun App(settings: Settings) {
     val running by SyncHolder.running.collectAsStateWithLifecycle()
     val message by SyncHolder.message.collectAsStateWithLifecycle()
 
-    var role by remember { mutableStateOf("master") }
     var showSettings by remember { mutableStateOf(settings.missing.isNotEmpty()) }
     var kind by remember { mutableStateOf("search") }
     var source by remember { mutableStateOf("") }
@@ -103,7 +102,8 @@ private fun App(settings: Settings) {
         }
     }
 
-    val canDrive = running && (snapshot?.isMaster ?: (role == "master"))
+    // Protocol 3 has no roles: anyone connected to the room may drive it.
+    val canDrive = running
 
     Scaffold(
         bottomBar = { PlayerBar(snapshot, canDrive) },
@@ -118,20 +118,22 @@ private fun App(settings: Settings) {
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("ym-sync", color = Accent, style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.width(12.dp))
-                    FilterChip(
-                        selected = role == "master",
-                        onClick = { role = "master" },
-                        enabled = !running,
-                        label = { Text("ведущий") },
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip(
-                        selected = role == "slave",
-                        onClick = { role = "slave" },
-                        enabled = !running,
-                        label = { Text("ведомый") },
-                    )
+                    val station = snapshot?.station
+                    if (station != null) {
+                        Spacer(Modifier.width(12.dp))
+                        // The wave is room-wide, but only its feeder can refill
+                        // it — so only the feeder is offered the off switch.
+                        FilterChip(
+                            selected = true,
+                            onClick = {
+                                scope.launch { Commands.send("stop_wave") }
+                            },
+                            enabled = snapshot?.feeding == true,
+                            label = {
+                                Text(if (snapshot?.feeding == true) "волна · выключить" else "волна")
+                            },
+                        )
+                    }
                 }
             }
 
@@ -144,7 +146,7 @@ private fun App(settings: Settings) {
                             } else {
                                 val absent = settings.missing
                                 if (absent.isEmpty()) {
-                                    SyncService.start(context, settings.configJson(), role)
+                                    SyncService.start(context, settings.configJson())
                                 } else {
                                     SyncHolder.say("не заполнено: ${absent.joinToString(", ")}")
                                     showSettings = true
@@ -259,8 +261,7 @@ private fun StatusLine(snapshot: Snapshot?, message: String?) {
         val text = when {
             snapshot == null -> "не подключено"
             else -> buildString {
-                append(if (snapshot.isMaster) "ведущий" else "ведомый")
-                append(" · участников ${snapshot.peers}")
+                append("участников ${snapshot.peers}")
                 snapshot.rttMs?.let { append(" · rtt $it мс") }
             }
         }

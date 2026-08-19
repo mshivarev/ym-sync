@@ -1,9 +1,10 @@
 //! Command-line front end for ym-sync.
 //!
-//! One machine runs `master` and publishes its playhead to a relay room; others
-//! run `slave` and follow. Each machine uses its own Yandex account, so
-//! simultaneous playback is never blocked; tracks are identified by their
-//! numeric id, which is the same on every account.
+//! Every machine runs `play` and joins a relay room; the relay holds the queue
+//! and the playhead, so any of them may skip, pause or add tracks and the rest
+//! follow. Each machine uses its own Yandex account, so simultaneous playback is
+//! never blocked; tracks are identified by their numeric id, which is the same on
+//! every account.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use ymsync::config::Config;
 use ymsync::engine::{self, Command as EngineCommand, Snapshot};
 use ymsync::fmt_ms;
 use ymsync::player::Player;
-use ymsync_proto::{Role, TrackRef};
+use ymsync_proto::TrackRef;
 
 /// How often the status line is refreshed when nothing notable changes.
 const STATUS_EVERY: Duration = Duration::from_secs(2);
@@ -65,19 +66,22 @@ enum Command {
         limit: usize,
     },
 
-    /// Играть и раздавать состояние ведомым
-    Master {
+    /// Подключиться к комнате и играть вместе с остальными
+    ///
+    /// Источник необязателен: без него подключаемся к тому, что уже играет.
+    /// Псевдонимы master и slave остались от протокола 2, когда роли ещё были
+    /// разными.
+    #[command(alias = "master", alias = "slave")]
+    Play {
         #[command(flatten)]
         source: SourceArgs,
     },
-
-    /// Следовать за ведущим в комнате
-    Slave,
 }
 
-/// What to fill the queue with. Exactly one is required.
+/// What to fill the queue with. At most one; none means "join whatever is
+/// already playing".
 #[derive(Args, Debug)]
-#[group(required = true, multiple = false)]
+#[group(required = false, multiple = false)]
 struct SourceArgs {
     /// id трека или ссылка music.yandex.ru/album/<a>/track/<id>
     #[arg(long, value_name = "ID")]
@@ -115,27 +119,28 @@ enum Source {
 }
 
 impl SourceArgs {
-    fn parse(&self) -> Result<Source> {
+    /// `None` means no source was asked for: join the room as it is.
+    fn parse(&self) -> Result<Option<Source>> {
         if let Some(raw) = &self.track {
-            return Ok(Source::Track(api::parse_track_id(raw)?));
+            return Ok(Some(Source::Track(api::parse_track_id(raw)?)));
         }
         if let Some(query) = &self.search {
-            return Ok(Source::Search(query.clone()));
+            return Ok(Some(Source::Search(query.clone())));
         }
         if let Some(raw) = &self.album {
-            return Ok(Source::Album(api::parse_album_id(raw)?));
+            return Ok(Some(Source::Album(api::parse_album_id(raw)?)));
         }
         if let Some(raw) = &self.playlist {
             let (owner, kind) = api::parse_playlist_ref(raw)?;
-            return Ok(Source::Playlist(owner, kind));
+            return Ok(Some(Source::Playlist(owner, kind)));
         }
         if self.likes {
-            return Ok(Source::Likes);
+            return Ok(Some(Source::Likes));
         }
         if self.wave {
-            return Ok(Source::Wave);
+            return Ok(Some(Source::Wave));
         }
-        bail!("нужен один из: --track, --search, --album, --playlist, --likes, --wave");
+        Ok(None)
     }
 }
 
@@ -163,16 +168,15 @@ async fn main() -> Result<()> {
         Command::Config => show_config(&cfg, &config_path),
         Command::Probe { query } => probe(&cfg, &query).await,
         Command::Search { query, limit } => search(&cfg, &query.join(" "), limit).await,
-        Command::Master { source } => {
+        Command::Play { source } => {
             // Validate arguments before opening the audio device or the network.
             let source = source.parse()?;
-            run(&cfg, Role::Master, Some(source)).await
+            run(&cfg, source).await
         }
-        Command::Slave => run(&cfg, Role::Slave, None).await,
     }
 }
 
-async fn run(cfg: &Config, role: Role, source: Option<Source>) -> Result<()> {
+async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
     let api = Arc::new(YandexMusic::new(cfg.require_yandex_token()?)?);
 
     // Resolve the queue before touching audio or the relay, so a bad query fails
@@ -183,11 +187,11 @@ async fn run(cfg: &Config, role: Role, source: Option<Source>) -> Result<()> {
     };
 
     let player = Arc::new(Player::new(cfg.volume)?);
-    let handle = engine::spawn(cfg, role, Arc::clone(&api), player).await?;
+    let handle = engine::spawn(cfg, Arc::clone(&api), player).await?;
 
     let start = handle.snapshot();
     println!(
-        "⇄ {role} в комнате «{}» на {} (участников: {}, смещение часов {:+} мс, rtt {} мс)",
+        "⇄ комната «{}» на {} (участников: {}, смещение часов {:+} мс, rtt {} мс)",
         cfg.room,
         cfg.relay,
         start.peers,
@@ -203,7 +207,7 @@ async fn run(cfg: &Config, role: Role, source: Option<Source>) -> Result<()> {
                 replace: true,
             });
         } else {
-            println!("… ожидание ведущего");
+            println!("… играем то, что в комнате; командовать может любой участник");
         }
     } else {
         println!("очередь: {} трек(ов)", queue.len());
@@ -443,7 +447,7 @@ fn show_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
     );
     println!();
     println!("порог коррекции: {} мс", cfg.sync.seek_threshold_ms);
-    println!("heartbeat      : {} мс", cfg.sync.heartbeat_ms);
+    println!("сверка позиции : каждые {} мс", cfg.sync.correction_interval_ms);
     Ok(())
 }
 
@@ -553,7 +557,7 @@ async fn search(cfg: &Config, query: &str, limit: usize) -> Result<()> {
         );
     }
     println!();
-    println!("запуск: ymsync master --track <id>  ·  весь альбом: ymsync master --album <id>");
+    println!("запуск: ymsync play --track <id>  ·  весь альбом: ymsync play --album <id>");
     Ok(())
 }
 

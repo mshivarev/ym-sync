@@ -1,4 +1,4 @@
-//! Drift correction: what the slave should do to line up with the master.
+//! Drift correction: what a peer should do to line up with the room.
 //!
 //! Correction is seek-only, deliberately. Nudging playback rate would drift the
 //! pitch, and `rodio`'s reported position is scaled by playback speed, which
@@ -42,10 +42,11 @@ pub enum Correction {
     Resume { to_ms: u64 },
 }
 
-/// Where the master's playhead is *now*, extrapolated from its last snapshot.
+/// Where the room's playhead is *now*, extrapolated from the relay's last
+/// snapshot.
 ///
 /// `now_server_ms` must be in relay time (local clock plus the estimated
-/// offset). A paused master does not move, so its snapshot is used as-is.
+/// offset). A paused room does not move, so its anchor is used as-is.
 pub fn target_position_ms(state: &PlaybackState, now_server_ms: i64) -> i64 {
     if state.playing {
         let elapsed = (now_server_ms - state.at_server_ms).max(0);
@@ -64,15 +65,15 @@ pub fn trust_clock(rtt_ms: Option<i64>, params: &SyncParams) -> bool {
 pub fn decide(
     target_ms: i64,
     local_ms: i64,
-    master_playing: bool,
+    room_playing: bool,
     local_playing: bool,
     params: &SyncParams,
 ) -> Correction {
     let drift_ms = local_ms - target_ms;
     let off_target = drift_ms.abs() > params.seek_threshold_ms;
 
-    match (master_playing, local_playing) {
-        // Master stopped: stop too, and only then line the playhead up, since a
+    match (room_playing, local_playing) {
+        // Room stopped: stop too, and only then line the playhead up, since a
         // paused playhead does not run away from us.
         (false, true) => Correction::Pause,
         (false, false) if off_target => Correction::Seek {
@@ -112,6 +113,7 @@ mod tests {
             position_ms,
             playing,
             at_server_ms,
+            station: None,
         }
     }
 
@@ -156,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn master_pause_pauses_us_before_aligning() {
+    fn a_paused_room_pauses_us_before_aligning() {
         let p = SyncParams::default();
         assert_eq!(decide(10_000, 90_000, false, true, &p), Correction::Pause);
     }
@@ -172,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn master_resume_resumes_us() {
+    fn a_resumed_room_resumes_us() {
         let p = SyncParams::default();
         assert_eq!(
             decide(10_000, 0, true, false, &p),
