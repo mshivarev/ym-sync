@@ -151,6 +151,14 @@ fn set_queue(ids: &[&str]) -> Command {
     }
 }
 
+/// Short enough that the relay's advance ticker would move past it within a test.
+fn short_track(id: &str) -> TrackRef {
+    TrackRef {
+        duration_ms: 150,
+        ..track(id)
+    }
+}
+
 #[tokio::test]
 async fn a_valid_client_is_welcomed() {
     let relay = Relay::start().await;
@@ -355,6 +363,78 @@ async fn an_empty_room_tells_a_newcomer_nothing_to_play() {
     let mut ws = relay.join().await;
     // No queue has ever been set, so there is nothing to replay.
     assert_quiet(&mut ws, 3).await;
+}
+
+/// The whole point of keeping room state: queue something, walk away, come back
+/// to it. Protocol 3 deleted the room with its last peer at first, which lost
+/// the queue exactly when a single-listener room was closed and reopened.
+#[tokio::test]
+async fn a_room_keeps_its_queue_after_the_last_peer_leaves() {
+    let relay = Relay::start().await;
+
+    {
+        let mut only = relay.join().await;
+        command(&mut only, set_queue(&["1", "2", "3"])).await;
+        let _queue = recv_ignoring_peers(&mut only).await;
+        let _state = recv_ignoring_peers(&mut only).await;
+        // Dropping the socket empties the room.
+    }
+
+    // Give the relay a moment to notice the socket closed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut back = relay.join().await;
+    match recv(&mut back).await {
+        ServerMsg::Queue { tracks, .. } => {
+            assert_eq!(tracks.len(), 3, "the queue should have outlived the peer");
+            assert_eq!(tracks[2].track_id, "3");
+        }
+        other => panic!("expected the kept queue, got {other:?}"),
+    }
+    match recv(&mut back).await {
+        ServerMsg::State { state } => {
+            assert_eq!(state.track.expect("track").track_id, "1");
+            assert!(
+                !state.playing,
+                "an empty room must freeze, or it plays itself out unheard"
+            );
+        }
+        other => panic!("expected the kept state, got {other:?}"),
+    }
+}
+
+/// A frozen room must not have advanced while nobody was listening.
+#[tokio::test]
+async fn an_empty_room_does_not_run_its_queue_down() {
+    let relay = Relay::start().await;
+
+    {
+        let mut only = relay.join().await;
+        // Two very short tracks: were the room still ticking, both would end
+        // well inside the wait below.
+        command(
+            &mut only,
+            Command::SetQueue {
+                tracks: vec![short_track("1"), short_track("2")],
+                start: 0,
+            },
+        )
+        .await;
+        let _queue = recv_ignoring_peers(&mut only).await;
+        let _state = recv_ignoring_peers(&mut only).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let mut back = relay.join().await;
+    let _queue = recv(&mut back).await;
+    match recv(&mut back).await {
+        ServerMsg::State { state } => {
+            assert_eq!(state.index, 0, "the room advanced with nobody listening");
+            assert!(!state.playing);
+        }
+        other => panic!("expected state, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -292,6 +292,7 @@ private fun SettingsCard(settings: Settings) {
     var roomToken by remember { mutableStateOf(settings.roomToken) }
     var yandexToken by remember { mutableStateOf(settings.yandexToken) }
     var bias by remember { mutableStateOf(settings.positionBiasMs.toString()) }
+    val scope = rememberCoroutineScope()
 
     Card {
         Column(
@@ -330,7 +331,13 @@ private fun SettingsCard(settings: Settings) {
                 value = bias,
                 onValueChange = { typed ->
                     bias = typed.filter { it.isDigit() || it == '-' }
-                    settings.positionBiasMs = bias.toIntOrNull() ?: 0
+                    val ms = bias.toIntOrNull() ?: 0
+                    settings.positionBiasMs = ms
+                    // Also pushed into a running session: the core reads the
+                    // config only when it starts, so without this the figure
+                    // could only be calibrated through a reconnect — which is
+                    // exactly when you want to watch the drift react.
+                    scope.launch { Commands.send("bias") { put("ms", ms) } }
                 },
                 label = { Text("поправка позиции, мс") },
                 singleLine = true,

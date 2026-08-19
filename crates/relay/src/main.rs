@@ -58,6 +58,12 @@ const MAX_QUEUE: usize = 5_000;
 /// every peer, since they all take the new anchor from the same snapshot.
 const ADVANCE_TICK: Duration = Duration::from_millis(100);
 
+/// How long a room with nobody in it keeps its queue.
+///
+/// Long enough that stepping out and coming back finds the music where you left
+/// it, short enough that abandoned rooms cannot pile up in memory for ever.
+const EMPTY_ROOM_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
 type WsStream = tokio_tungstenite::WebSocketStream<TcpStream>;
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 
@@ -317,6 +323,10 @@ impl RoomState {
 struct Room {
     peers: HashMap<u64, Peer>,
     state: RoomState,
+    /// Set while nobody is connected. The room and its queue are kept so a
+    /// listener who steps out can come back to them, but not for ever — see
+    /// [`EMPTY_ROOM_TTL`].
+    empty_since: Option<std::time::Instant>,
 }
 
 impl Room {
@@ -406,20 +416,37 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Moves every room on when its current track has played out. See
-/// [`ADVANCE_TICK`] for why this is one shared ticker.
+/// Moves every room on when its current track has played out, and forgets rooms
+/// that have stood empty for too long. See [`ADVANCE_TICK`] for why this is one
+/// shared ticker.
 async fn advance_ended_tracks(rooms: Rooms) {
     let mut ticker = tokio::time::interval(ADVANCE_TICK);
     loop {
         ticker.tick().await;
         let now = unix_ms();
         let mut guard = rooms.lock().await;
+
         for (name, room) in guard.iter_mut() {
+            // An empty room is frozen on purpose; never run its queue down with
+            // nobody listening.
+            if room.peers.is_empty() {
+                continue;
+            }
             if room.state.advance_if_ended(now) {
                 debug!(room = %name, index = room.state.index, playing = room.state.playing, "track ended");
                 room.publish(Changed::STATE);
             }
         }
+
+        guard.retain(|name, room| {
+            let expired = room
+                .empty_since
+                .is_some_and(|since| since.elapsed() >= EMPTY_ROOM_TTL);
+            if expired {
+                info!(room = %name, "empty for too long; forgetting its queue");
+            }
+            !expired
+        });
     }
 }
 
@@ -513,6 +540,8 @@ async fn session(
         let mut guard = rooms.lock().await;
         let room = guard.entry(room_name.clone()).or_default();
         room.peers.insert(id, Peer { tx: tx.clone() });
+        // Someone is listening again, so the room is no longer up for reaping.
+        room.empty_since = None;
         let peers = room.peers.len();
 
         for (other_id, peer) in &room.peers {
@@ -569,8 +598,24 @@ async fn session(
         if dropped_station {
             room.publish(Changed::STATE);
         }
+
+        // The room outlives its last listener: someone who queued «Мне
+        // нравится», closed the app and came back would otherwise find an empty
+        // room. Protocol 2 could delete it here because the relay held nothing;
+        // now the queue lives here and is worth keeping.
+        //
+        // The playhead is frozen on the way out, or the ticker below would run
+        // the whole queue down while nobody is listening, and the room would be
+        // somewhere else entirely by the time anyone returns.
         if room.peers.is_empty() {
-            guard.remove(&room_name);
+            if room.state.playing {
+                room.state.position_ms = room.state.derived_position_ms(unix_ms());
+                room.state.playing = false;
+                room.state.at_server_ms = unix_ms();
+                room.state.seq += 1;
+            }
+            room.empty_since = Some(std::time::Instant::now());
+            info!(room = %room_name, "room is empty; queue kept, playhead frozen");
         }
     }
     info!(peer = id, room = %room_name, "left");

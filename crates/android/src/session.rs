@@ -30,6 +30,8 @@ pub enum Request {
     Index { index: usize },
     /// Stops feeding the wave. What is already queued still plays.
     StopWave,
+    /// Recalibrates ExoPlayer's reporting lag without a reconnect.
+    Bias { ms: i64 },
 }
 
 impl From<Request> for Command {
@@ -43,6 +45,7 @@ impl From<Request> for Command {
             Request::Volume { value } => Command::SetVolume(value),
             Request::Index { index } => Command::PlayIndex(index),
             Request::StopWave => Command::StopStation,
+            Request::Bias { ms } => Command::SetPositionBias(ms),
         }
     }
 }
@@ -206,6 +209,7 @@ mod tests {
             ),
             (r#"{"action":"index","index":3}"#, Command::PlayIndex(3)),
             (r#"{"action":"stop_wave"}"#, Command::StopStation),
+            (r#"{"action":"bias","ms":400}"#, Command::SetPositionBias(400)),
         ];
         for (json, expected) in cases {
             let request: Request = serde_json::from_str(json).expect(json);

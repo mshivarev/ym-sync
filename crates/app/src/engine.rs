@@ -91,6 +91,9 @@ pub enum Command {
     Next,
     Prev,
     SetVolume(f32),
+    /// Recalibrates this device's reporting lag while it plays, so the figure can
+    /// be dialled in against the drift on screen instead of through a reconnect.
+    SetPositionBias(i64),
     Shutdown,
 }
 
@@ -200,6 +203,8 @@ pub async fn spawn(
         unavailable: HashSet::new(),
         attempts: HashMap::new(),
         loading: None,
+        prefetched: None,
+        prefetching: None,
         drift_ms: None,
         position_bias_ms: cfg.sync.position_bias_ms,
         last_seek: None,
@@ -237,6 +242,22 @@ enum Internal {
         tracks: Vec<TrackRef>,
         error: Option<String>,
     },
+    /// The next track, fetched before the room got to it. `None` means the fetch
+    /// failed; nothing is reported, since the ordinary load will try again and
+    /// speak up then.
+    Prefetched {
+        track_id: String,
+        ready: Option<(TrackRef, AudioSource)>,
+    },
+}
+
+/// A track fetched ahead of time, waiting for the room to reach it.
+struct Prefetched {
+    /// The queue's id for it, which is what the arriving track is matched on.
+    track_id: String,
+    /// As the API resolved it, which is what gets staged.
+    track: TrackRef,
+    source: AudioSource,
 }
 
 /// An endless station this peer is feeding into the room.
@@ -276,6 +297,10 @@ struct Engine {
     attempts: HashMap<String, u8>,
 
     loading: Option<String>,
+    /// The next track, already in hand. See [`Engine::prefetch_next`].
+    prefetched: Option<Prefetched>,
+    /// Which track a prefetch is in flight for.
+    prefetching: Option<String>,
     drift_ms: Option<i64>,
     /// Cancels a backend's constant reporting lag; see [`crate::config::SyncConfig`].
     position_bias_ms: i64,
@@ -426,8 +451,17 @@ impl Engine {
                 });
             }
 
-            // The only command that never leaves this machine.
+            // The only commands that never leave this machine: both describe this
+            // device, not the room.
             Command::SetVolume(volume) => self.player.set_volume(volume),
+            Command::SetPositionBias(ms) => {
+                self.position_bias_ms = ms;
+                // The old figure produced the drift on screen; drop it so the
+                // next tick reports against the new one rather than the stale
+                // reading the user is trying to correct.
+                self.drift_ms = None;
+                self.notice = Some(format!("поправка позиции: {ms} мс"));
+            }
 
             // Handled by the loop.
             Command::Shutdown => {}
@@ -470,18 +504,91 @@ impl Engine {
         self.loading = Some(track.track_id.clone());
         self.drift_ms = None;
 
-        let api = Arc::clone(&self.api);
         let player = Arc::clone(&self.player);
-        let internal = internal.clone();
+        let internal_tx = internal.clone();
         let track_id = track.track_id.clone();
         let label = track.to_string();
 
+        // Already in hand from the prefetch: no API calls, no download, just the
+        // decoder. This is what makes a track change quiet.
+        if let Some(ready) = self
+            .prefetched
+            .take_if(|ready| ready.track_id == track.track_id)
+        {
+            let Prefetched { track, source, .. } = ready;
+            tokio::spawn(async move {
+                let error = stage_track(&player, track, source)
+                    .await
+                    .err()
+                    .map(|err| format!("{label}: {err:#}"));
+                let _ = internal_tx.send(Internal::Loaded { track_id, error });
+            });
+            return;
+        }
+
+        let api = Arc::clone(&self.api);
         tokio::spawn(async move {
             let error = load_track(&api, &player, &track_id)
                 .await
                 .err()
                 .map(|err| format!("{label}: {err:#}"));
-            let _ = internal.send(Internal::Loaded { track_id, error });
+            let _ = internal_tx.send(Internal::Loaded { track_id, error });
+        });
+    }
+
+    /// The queue entry after the one the room is on.
+    fn next_track(&self) -> Option<TrackRef> {
+        let index = self.remote.as_ref()?.index;
+        self.queue.get(index + 1).cloned()
+    }
+
+    /// Fetches the next queue entry while the current one plays, so the change of
+    /// track costs no network.
+    ///
+    /// Strictly one fetch at a time. Yandex answers HTTP 429 «Concurrency limit
+    /// exceeded» when one account pulls two streams at once, so this waits for the
+    /// current track to finish loading rather than racing it.
+    fn prefetch_next(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        if self.loading.is_some() || self.prefetching.is_some() {
+            return;
+        }
+        let Some(next) = self.next_track() else {
+            return;
+        };
+
+        // Let go of a buffer the room has moved past, rather than holding a
+        // track's worth of memory that nothing will ask for again.
+        let current_id = self
+            .remote
+            .as_ref()
+            .and_then(|state| state.track.as_ref())
+            .map(|track| track.track_id.clone());
+        if let Some(held) = self.prefetched.as_ref() {
+            let wanted =
+                held.track_id == next.track_id || Some(&held.track_id) == current_id.as_ref();
+            if !wanted {
+                self.prefetched = None;
+            }
+        }
+
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|held| held.track_id == next.track_id)
+            || self.unavailable.contains(&next.track_id)
+        {
+            return;
+        }
+
+        self.prefetching = Some(next.track_id.clone());
+        let api = Arc::clone(&self.api);
+        let player = Arc::clone(&self.player);
+        let internal = internal.clone();
+        let track_id = next.track_id.clone();
+
+        tokio::spawn(async move {
+            let ready = fetch_source(&api, &player, &track_id).await.ok();
+            let _ = internal.send(Internal::Prefetched { track_id, ready });
         });
     }
 
@@ -522,6 +629,22 @@ impl Engine {
                 }
                 if let Some(id) = claim {
                     self.ask(ymsync_proto::Command::SetStation { id: Some(id) });
+                }
+            }
+
+            Internal::Prefetched { track_id, ready } => {
+                if self.prefetching.as_deref() != Some(track_id.as_str()) {
+                    return;
+                }
+                self.prefetching = None;
+                // A failure stays quiet on purpose: this track may never be
+                // reached, and the ordinary load will report it if it is.
+                if let Some((track, source)) = ready {
+                    self.prefetched = Some(Prefetched {
+                        track_id,
+                        track,
+                        source,
+                    });
                 }
             }
 
@@ -589,9 +712,16 @@ impl Engine {
                     return;
                 }
 
-                // Someone replaced the queue outright, which ends any station —
-                // including one we were feeding.
-                if state.station.is_none() && self.station.is_some() {
+                // A room with no station means someone replaced the queue
+                // outright, which ends the wave — but only once our own claim
+                // has been confirmed. Switching the wave on sends `SetQueue`
+                // first and the claim second, and that `SetQueue` comes back
+                // with `station: None`; reading our own echo as "the wave was
+                // turned off" made the feeder forget it was feeding, so the
+                // station stopped dead after its first batch.
+                if state.station.is_none()
+                    && self.station.as_ref().is_some_and(|station| station.claimed)
+                {
                     self.station = None;
                     self.notice = Some("волна выключена".to_string());
                 }
@@ -649,9 +779,11 @@ impl Engine {
         }
     }
 
-    /// One pass: keep a station fed, then pull the playhead onto the room's.
+    /// One pass: keep a station fed, fetch the next track, then pull the playhead
+    /// onto the room's.
     fn tick(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
         self.feed_station(internal);
+        self.prefetch_next(internal);
         self.correct();
     }
 
@@ -802,8 +934,15 @@ impl Engine {
     }
 }
 
-/// Resolves, downloads and stages one track.
-async fn load_track(api: &YandexMusic, player: &Arc<dyn Playback>, track_id: &str) -> Result<()> {
+/// Resolves a track and produces whatever this backend wants to be handed.
+///
+/// Split out from [`load_track`] so the same work can be done ahead of time for
+/// the next track in the queue.
+async fn fetch_source(
+    api: &YandexMusic,
+    player: &Arc<dyn Playback>,
+    track_id: &str,
+) -> Result<(TrackRef, AudioSource)> {
     let track = api.track(track_id).await?;
     if !track.available {
         bail!("недоступен на этом аккаунте");
@@ -813,15 +952,34 @@ async fn load_track(api: &YandexMusic, player: &Arc<dyn Playback>, track_id: &st
 
     if !player.needs_bytes() {
         // A streaming backend (ExoPlayer) fetches the signed URL itself.
-        return player.load(track_ref, AudioSource::Url(url));
+        return Ok((track_ref, AudioSource::Url(url)));
     }
-
     let data = api.fetch_track(&url).await?;
-    let player = Arc::clone(player);
-    // Decoding probes the container; keep it off the runtime's worker threads.
-    tokio::task::spawn_blocking(move || player.load(track_ref, AudioSource::Bytes(data)))
-        .await
-        .context("задача загрузки звука упала")?
+    Ok((track_ref, AudioSource::Bytes(data)))
+}
+
+/// Hands a resolved track to the backend.
+async fn stage_track(
+    player: &Arc<dyn Playback>,
+    track: TrackRef,
+    source: AudioSource,
+) -> Result<()> {
+    match source {
+        AudioSource::Url(_) => player.load(track, source),
+        AudioSource::Bytes(_) => {
+            let player = Arc::clone(player);
+            // Decoding probes the container; keep it off the runtime's workers.
+            tokio::task::spawn_blocking(move || player.load(track, source))
+                .await
+                .context("задача загрузки звука упала")?
+        }
+    }
+}
+
+/// Resolves, downloads and stages one track.
+async fn load_track(api: &YandexMusic, player: &Arc<dyn Playback>, track_id: &str) -> Result<()> {
+    let (track, source) = fetch_source(api, player, track_id).await?;
+    stage_track(player, track, source).await
 }
 
 /// Snapshots can arrive out of order, and a relay restart resets the counter.
