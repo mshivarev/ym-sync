@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core permissions for the ym-sync window. Without this the page cannot call core:event:listen, so engine snapshots never reach the UI — custom commands work regardless, which makes the failure look like a UI bug.","local":true,"windows":["main"],"permissions":["core:default"]}}

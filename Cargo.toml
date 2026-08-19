@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/relay", "crates/app", "crates/gui", "crates/android"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Debug symbols dominate the Android shared object — over 100 MB per ABI without
+# this.
+strip = "symbols"

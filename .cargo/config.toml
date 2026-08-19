@@ -1,0 +1,5 @@
+# Link the MSVC C runtime statically so a release binary can be copied to
+# another Windows machine and run without the Visual C++ redistributable.
+# Nothing in the dependency tree compiles C code, so this is safe here.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

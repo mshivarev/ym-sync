@@ -1,0 +1,54 @@
+[package]
+name = "ymsync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["audio-rodio", "tls-native", "cli"]
+
+# Desktop audio. Android plays through ExoPlayer, so `rodio`/`cpal` are left out
+# of that build entirely.
+audio-rodio = ["dep:rodio"]
+
+# Command-line front end. Off for library-only builds such as the Android
+# shared object, which needs neither clap nor a terminal.
+cli = ["dep:clap", "tokio/io-std", "tokio/io-util", "tokio/signal"]
+
+# TLS backends. schannel on Windows; rustls with the ring provider where the
+# platform stack is not available.
+tls-native = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
+tls-rustls = [
+    "reqwest/rustls-no-provider",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
+
+[[bin]]
+name = "ymsync"
+path = "src/main.rs"
+required-features = ["cli", "audio-rodio"]
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"], optional = true }
+directories = "6.0.0"
+futures-util = "0.3.34"
+hex = "0.4.3"
+md-5 = "0.11.0"
+quick-xml = { version = "0.41.0", features = ["serialize"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "charset", "system-proxy", "query"] }
+rodio = { version = "0.21.1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-roots = { version = "1", optional = true }
+ymsync-proto = { version = "0.1.0", path = "../proto" }

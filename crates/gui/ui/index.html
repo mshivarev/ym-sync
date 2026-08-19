@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ym-sync</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <header>
+    <div class="brand">ym&#8209;sync</div>
+    <div class="connect">
+      <select id="role" title="Роль этого компьютера">
+        <option value="master">ведущий</option>
+        <option value="slave">ведомый</option>
+      </select>
+      <button id="connect" class="primary">Подключиться</button>
+    </div>
+    <div id="status" class="status">не подключено</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Что играть</h2>
+
+      <div class="row">
+        <select id="kind" title="Источник очереди">
+          <option value="search">поиск</option>
+          <option value="album">альбом</option>
+          <option value="playlist">плейлист</option>
+          <option value="track">трек</option>
+          <option value="wave">моя волна</option>
+          <option value="likes">мне нравится</option>
+        </select>
+        <input id="source" placeholder="кино группа крови" />
+        <button id="load">В очередь</button>
+        <button id="play">Играть</button>
+      </div>
+
+      <div class="row">
+        <input id="query" placeholder="найти треки…" />
+        <button id="find">Найти</button>
+      </div>
+
+      <ul id="results" class="list"></ul>
+      <p id="results-hint" class="hint">Клик по результату добавит трек в конец очереди.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Очередь <span id="queue-count" class="dim"></span></h2>
+      <ul id="queue" class="list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="now">
+      <div id="title" class="title">—</div>
+      <div id="subtitle" class="dim"></div>
+    </div>
+
+    <div class="transport">
+      <button id="prev" title="предыдущий">&#9198;</button>
+      <button id="toggle" class="primary" title="пауза / продолжить">&#9654;</button>
+      <button id="next" title="следующий">&#9197;</button>
+    </div>
+
+    <div class="progress">
+      <input id="seek" type="range" min="0" max="1000" value="0" title="позиция" />
+      <div class="times">
+        <span id="position">0:00</span>
+        <span id="duration">0:00</span>
+      </div>
+    </div>
+
+    <div class="meters">
+      <label class="volume">
+        <span class="dim">громкость</span>
+        <input id="volume" type="range" min="0" max="100" value="80" />
+      </label>
+      <div id="drift" class="drift hidden"></div>
+    </div>
+  </footer>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

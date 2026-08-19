@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# cargo-ndk output, rebuilt from source
+/crates/android/jniLibs
+
+# Gradle build state and the local SDK path
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+
+# Release signing. Losing these means the app can never be updated in place,
+# so keep a backup outside the repository.
+/android/ymsync-release.jks
+/android/keystore.properties
+
+# Ad-hoc files that may hold an OAuth token
+/output.txt
+
+# Built artifacts for hand-installing
+/dist
