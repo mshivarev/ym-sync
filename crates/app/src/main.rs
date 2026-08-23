@@ -16,11 +16,12 @@ use tokio::sync::mpsc;
 use ymsync::api::{self, Track, YandexMusic};
 use ymsync::cache::Cache;
 use ymsync::config::Config;
+use ymsync::discover;
 use ymsync::engine::{Command as EngineCommand, Snapshot};
 use ymsync::fmt_ms;
 use ymsync::player::Player;
 use ymsync::session;
-use ymsync_proto::TrackRef;
+use ymsync_proto::{PROTOCOL_VERSION, TrackRef};
 
 /// How often the status line is refreshed when nothing notable changes.
 const STATUS_EVERY: Duration = Duration::from_secs(2);
@@ -69,6 +70,17 @@ enum Command {
     /// Ничего не требует — ни сети, ни релея, ни токена.
     #[command(alias = "library")]
     Cache,
+
+    /// Найти комнаты в локальной сети
+    ///
+    /// Спрашивает сеть широковещательно и печатает, кто ответил. Токены не
+    /// нужны: чтобы войти в найденную комнату, её секрет всё равно надо знать.
+    #[command(alias = "find")]
+    Rooms {
+        /// Сколько ждать ответов, мс
+        #[arg(long, default_value_t = 700)]
+        wait: u64,
+    },
 
     /// Проверить весь путь до звука: токен, поиск, подпись ссылки, загрузка, декодирование
     Probe {
@@ -201,6 +213,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Config => show_config(&cfg, &config_path),
         Command::Cache => show_cache(&cfg),
+        Command::Rooms { wait } => show_rooms(&cfg, Duration::from_millis(wait)).await,
         Command::Probe { query } => probe(&cfg, &query).await,
         Command::Search { query, limit } => search(&cfg, &query.join(" "), limit).await,
         Command::Play { source } => {
@@ -680,6 +693,72 @@ fn show_cache(cfg: &Config) -> Result<()> {
     }
     println!();
     println!("играть без интернета: ymsync play --offline --host");
+    Ok(())
+}
+
+/// Asks the local network who is holding a room.
+///
+/// Needs no tokens at all, which is the point: this is the command you run to
+/// find out what to put in the config. The room's own secret is still required to
+/// get in, and never travels over discovery.
+async fn show_rooms(cfg: &Config, wait: Duration) -> Result<()> {
+    let rooms = discover::find_rooms(wait).await?;
+    if rooms.is_empty() {
+        println!("в сети никто не отвечает.");
+        println!();
+        println!(
+            "Комнату держит либо `ymsync-relay`, либо участник с --host. Если она \
+             точно поднята, проверьте, что порт {} открыт в брандмауэре и что обе \
+             машины в одной сети (не разные Wi-Fi и не гостевая сеть).",
+            ymsync_proto::DISCOVERY_PORT
+        );
+        return Ok(());
+    }
+
+    println!("нашлось: {}", rooms.len());
+    println!();
+    for (index, found) in rooms.iter().enumerate() {
+        println!(
+            "{:2}. {:<28} {:<20} {}{}",
+            index + 1,
+            found.relay,
+            if found.room.is_empty() {
+                "— комнат пока нет"
+            } else {
+                &found.room
+            },
+            if found.room.is_empty() {
+                "подключитесь со своим именем комнаты".to_string()
+            } else {
+                format!("слушателей {}", found.listeners)
+            },
+            if found.compatible {
+                String::new()
+            } else {
+                format!("  (протокол {}, наш {})", found.protocol, PROTOCOL_VERSION)
+            }
+        );
+    }
+    println!();
+
+    // The first usable entry is what the user most likely wants, so spell out the
+    // exact command rather than making them assemble it.
+    match rooms.iter().find(|found| found.compatible) {
+        Some(found) => {
+            print!("подключиться: ymsync play --relay {}", found.relay);
+            if found.room.is_empty() {
+                println!(" (имя комнаты возьмётся из конфига)");
+            } else {
+                println!(" --room {}", found.room);
+            }
+            if cfg.room_token.trim().is_empty() {
+                println!("но сначала впишите room_token — он должен совпадать с токеном комнаты");
+            }
+        }
+        None => println!(
+            "все найденные комнаты другой версии протокола — обновите ym-sync на всех устройствах"
+        ),
+    }
     Ok(())
 }
 

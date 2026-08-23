@@ -17,5 +17,13 @@ object Native {
 
     /** What is downloaded on this device. Reads an in-memory index; no network. */
     external fun library(handle: Long): String
+
+    /**
+     * Asks the local network which rooms are out there.
+     *
+     * The one call that needs no session: it is what you do before you know where
+     * to connect. Blocks for up to `waitMs`, so keep it off the main thread.
+     */
+    external fun findRooms(waitMs: Int): String
     external fun stop(handle: Long): String
 }

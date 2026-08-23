@@ -16,7 +16,9 @@
         <input id="host" type="checkbox" />
         <span>комната здесь</span>
       </label>
-      <input id="advertise" class="addr hidden" placeholder="адрес для остальных" title="заполните, если адрес определился не тот — например на машине с VPN" />
+      <input id="advertise" class="addr hidden" placeholder="192.168.1.10" title="какой адрес сообщать остальным; заполните, если определился не тот — например на машине с VPN" />
+      <button id="find-rooms" title="спросить сеть, кто держит комнату">Комнаты</button>
+      <select id="rooms" class="rooms hidden" title="найденные в сети комнаты"></select>
       <button id="connect" class="primary">Подключиться</button>
     </div>
     <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>

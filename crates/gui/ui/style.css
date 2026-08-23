@@ -69,7 +69,14 @@ header {
 }
 
 .addr {
-  width: 15ch;
+  width: 16ch;
+  font-size: 12px;
+}
+
+/* Wide enough for «комната · ws://192.168.1.10:8787», capped so it cannot push
+   the status line off the header. */
+.rooms {
+  max-width: 30ch;
   font-size: 12px;
 }
 

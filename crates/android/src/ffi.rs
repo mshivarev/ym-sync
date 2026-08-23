@@ -11,6 +11,7 @@
 //!     external fun search(handle: Long, query: String, limit: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun library(handle: Long): String
+//!     external fun findRooms(waitMs: Int): String
 //!     external fun stop(handle: Long): String
 //! }
 //! ```
@@ -18,8 +19,12 @@
 //! Every call answers with `{"ok": …}` or `{"error": "…"}`. Reporting failures in
 //! the payload rather than throwing keeps the boundary to one shape and avoids
 //! raising Java exceptions from Rust.
+//!
+//! All of them take a session handle except `findRooms`, which is what you call
+//! before you know where to connect.
 
 use std::fmt::Display;
+use std::time::Duration;
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
@@ -178,6 +183,34 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_library(
     let text = match unsafe { borrow(handle) } {
         None => failed("сессия не запущена"),
         Some(session) => ok(session.library()),
+    };
+    reply(&mut env, &text)
+}
+
+/// Asks the local network which rooms are out there.
+///
+/// The one call with no handle: discovery is what you do *before* connecting, so
+/// there is no session to hang it on. A one-shot runtime is cheaper than keeping
+/// one alive for a button that may never be pressed, and the call blocks for the
+/// wait it was given — Kotlin makes it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_findRooms(
+    mut env: JNIEnv,
+    _class: JClass,
+    wait_ms: jint,
+) -> jstring {
+    let text = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Err(err) => failed(err),
+        Ok(runtime) => {
+            let wait = Duration::from_millis(wait_ms.clamp(100, 5_000) as u64);
+            match runtime.block_on(ymsync::discover::find_rooms(wait)) {
+                Ok(rooms) => ok(serde_json::json!({ "rooms": rooms })),
+                Err(err) => failed(err),
+            }
+        }
     };
     reply(&mut env, &text)
 }

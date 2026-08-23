@@ -6,10 +6,12 @@
 #![forbid(unsafe_code)]
 
 pub mod clock;
+pub mod discovery;
 pub mod message;
 pub mod sync;
 
 pub use clock::{ClockSample, ClockSampler, sample_from_roundtrip};
+pub use discovery::{DISCOVERY_PORT, Discovery, RoomBrief};
 pub use message::{
     ClientMsg, Command, Event, PROTOCOL_VERSION, PeerShare, PlaybackState, ServerMsg, TrackRef,
 };

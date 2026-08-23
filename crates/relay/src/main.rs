@@ -26,6 +26,15 @@ struct Args {
     /// YMSYNC_ROOM_TOKEN environment variable.
     #[arg(long)]
     token: Option<String>,
+
+    /// Не отвечать на широковещательные запросы «кто держит комнаты»
+    ///
+    /// По умолчанию релей отвечает: так клиенты находят комнату сами, командой
+    /// `ymsync rooms`. В ответе только имена комнат и число слушателей — ни
+    /// токена, ни того, что играет. С этим ключом комната остаётся доступной
+    /// тем, кому адрес назвали руками, и невидимой для поиска.
+    #[arg(long)]
+    no_discovery: bool,
 }
 
 #[tokio::main]
@@ -47,7 +56,7 @@ async fn main() -> Result<()> {
              YMSYNC_ROOM_TOKEN. То же значение впишите игрокам в room_token",
         )?;
 
-    let mut server = ymsync_relay::bind(&args.bind, token).await?;
+    let mut server = ymsync_relay::bind_with(&args.bind, token, !args.no_discovery).await?;
 
     // Ctrl-C closes the sockets rather than having the process vanish out from
     // under its peers, which is what the embedded relay does too.

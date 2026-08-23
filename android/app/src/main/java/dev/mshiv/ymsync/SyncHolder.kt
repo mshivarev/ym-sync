@@ -105,4 +105,19 @@ object Commands {
             is NativeResult.Ok -> Result.success(reply.value.toLibrary())
         }
     }
+
+    /**
+     * Asks the local network which rooms are out there.
+     *
+     * The one call here that needs no session: it is what you do before you know
+     * where to connect, so there is no handle to check.
+     */
+    suspend fun findRooms(waitMs: Int = 700): Result<List<FoundRoom>> {
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.findRooms(waitMs)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok ->
+                Result.success(reply.value.optJSONArray("rooms")?.toFoundRooms() ?: emptyList())
+        }
+    }
 }

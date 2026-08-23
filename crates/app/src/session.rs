@@ -97,7 +97,7 @@ pub async fn start(
     //    below, and there has to be something listening by then.
     let (relay, relay_url, join_url) = if cfg.host.enabled {
         let bind = format!("{}:{}", cfg.host.bind, cfg.host.port);
-        let server = ymsync_relay::bind(&bind, room_token.clone())
+        let server = ymsync_relay::bind_with(&bind, room_token.clone(), cfg.host.discoverable)
             .await
             .context("не удалось поднять комнату на этом устройстве")?;
         let port = server.local_addr().port();
@@ -178,6 +178,7 @@ mod tests {
                 bind: "127.0.0.1".to_string(),
                 port: 0,
                 advertise: "192.168.1.50".to_string(),
+                discoverable: true,
             },
             share: ShareConfig {
                 enabled: false,

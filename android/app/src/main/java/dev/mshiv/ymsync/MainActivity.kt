@@ -397,6 +397,8 @@ private fun SettingsCard(settings: Settings) {
     var hostRoom by remember { mutableStateOf(settings.hostRoom) }
     var autoCache by remember { mutableStateOf(settings.autoCache) }
     var cacheLimit by remember { mutableStateOf(settings.cacheLimitGb.toString()) }
+    var searching by remember { mutableStateOf(false) }
+    var found by remember { mutableStateOf(emptyList<FoundRoom>()) }
     val scope = rememberCoroutineScope()
 
     Card {
@@ -418,6 +420,65 @@ private fun SettingsCard(settings: Settings) {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+
+            // Fills the two fields above from the network, so nobody has to read
+            // an IP address off another screen and type it in.
+            OutlinedButton(
+                enabled = !searching,
+                onClick = {
+                    searching = true
+                    scope.launch {
+                        Commands.findRooms()
+                            .onSuccess { rooms ->
+                                found = rooms
+                                SyncHolder.say(
+                                    if (rooms.isEmpty()) {
+                                        "в сети никто не отвечает — комнату держит " +
+                                            "ymsync-relay или участник с включённым хостингом"
+                                    } else {
+                                        "нашлось комнат: ${rooms.size}"
+                                    },
+                                )
+                            }
+                            .onFailure { SyncHolder.say(it.message) }
+                        searching = false
+                    }
+                },
+            ) { Text(if (searching) "Ищу…" else "Найти комнаты в сети") }
+
+            found.forEach { candidate ->
+                TextButton(
+                    // A relay of another version would refuse us, so it is shown
+                    // and disabled rather than hidden: that explains the situation.
+                    enabled = candidate.compatible,
+                    onClick = {
+                        relay = candidate.relay
+                        settings.relay = candidate.relay
+                        // An empty name means that relay holds no rooms yet, so
+                        // the one already configured here is what will be created.
+                        if (candidate.room.isNotEmpty()) {
+                            room = candidate.room
+                            settings.room = candidate.room
+                        }
+                        // Joining somebody's room and holding your own are opposites.
+                        hostRoom = false
+                        settings.hostRoom = false
+                        SyncHolder.say("вписал ${candidate.relay}")
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        buildString {
+                            append(candidate.room.ifEmpty { "комнат пока нет" })
+                            append(" · ${candidate.relay}")
+                            if (candidate.listeners > 0) append(" · ${candidate.listeners}")
+                            if (!candidate.compatible) append(" · другая версия")
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             OutlinedTextField(
                 value = roomToken,
                 onValueChange = { roomToken = it; settings.roomToken = it },

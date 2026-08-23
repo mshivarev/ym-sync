@@ -133,6 +133,13 @@ pub struct HostConfig {
     /// Worth setting by hand on a machine with several networks, where the
     /// automatic answer may pick a VPN or a virtual switch.
     pub advertise: String,
+    /// Answer «кто держит комнаты» broadcasts, so the others can find this room
+    /// without being told its address.
+    ///
+    /// The answer names the room and counts its listeners — no token, and nothing
+    /// about what is playing. Turn it off to leave the room reachable only for
+    /// those given the address by hand.
+    pub discoverable: bool,
 }
 
 impl Default for HostConfig {
@@ -142,6 +149,7 @@ impl Default for HostConfig {
             bind: "0.0.0.0".to_string(),
             port: 8787,
             advertise: String::new(),
+            discoverable: true,
         }
     }
 }

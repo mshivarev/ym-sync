@@ -10,6 +10,8 @@ const ui = {
   hosting: el("hosting"),
   host: el("host"),
   advertise: el("advertise"),
+  findRooms: el("find-rooms"),
+  rooms: el("rooms"),
   kind: el("kind"),
   source: el("source"),
   load: el("load"),
@@ -68,6 +70,9 @@ let autoCache = false;
 /// Ids that cost no internet: on this disk, or on somebody else's in the room.
 let cachedIds = new Set();
 let lanIds = new Set();
+/// A room picked out of the network: overrides the configured relay and room for
+/// the next connect only.
+let chosenRoom = null;
 
 function fmt(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
@@ -111,6 +116,8 @@ function setConnected(value) {
   // Hosting is chosen before the relay is bound, so it cannot change mid-session.
   ui.host.disabled = value;
   ui.advertise.disabled = value;
+  ui.findRooms.disabled = value;
+  ui.rooms.disabled = value;
   updateLibraryButtons();
 
   if (!value) {
@@ -361,6 +368,8 @@ ui.connect.addEventListener("click", async () => {
     const snapshot = await call("connect", {
       host: ui.host.checked,
       advertise: ui.advertise.value,
+      relay: chosenRoom?.relay ?? "",
+      room: chosenRoom?.room ?? "",
     });
     if (snapshot) {
       setConnected(true);
@@ -377,6 +386,63 @@ ui.connect.addEventListener("click", async () => {
 // that cannot be worked out automatically — see `ymsync::net`.
 ui.host.addEventListener("change", () => {
   ui.advertise.classList.toggle("hidden", !ui.host.checked);
+  // Holding the room yourself and joining somebody else's are opposites.
+  if (ui.host.checked) clearChosenRoom();
+});
+
+/// Forgets a room picked out of the network, going back to the configured one.
+function clearChosenRoom() {
+  chosenRoom = null;
+  ui.rooms.value = "";
+}
+
+// Discovery is a question to the network, not to the relay: it works before
+// anything is configured, which is the point — the answer is what to configure.
+ui.findRooms.addEventListener("click", async () => {
+  ui.findRooms.disabled = true;
+  const label = ui.findRooms.textContent;
+  ui.findRooms.textContent = "Ищу…";
+
+  const found = await call("find_rooms", { wait: 700 });
+
+  ui.findRooms.textContent = label;
+  ui.findRooms.disabled = false;
+  if (!found) return;
+
+  if (found.length === 0) {
+    ui.rooms.classList.add("hidden");
+    clearChosenRoom();
+    toast("в сети никто не отвечает — комнату держит ymsync-relay или участник с «комната здесь»");
+    return;
+  }
+
+  ui.rooms.replaceChildren(
+    new Option("комната из сети…", ""),
+    ...found.map((room, index) => {
+      // An empty name means the relay holds no rooms yet: pick it and the
+      // configured room name is used, which is what creates one.
+      const name = room.room || "комнат пока нет";
+      const listeners = room.listeners ? ` · ${room.listeners}` : "";
+      const version = room.compatible ? "" : " · другая версия";
+      const option = new Option(`${name} · ${room.relay}${listeners}${version}`, index);
+      // A relay of another protocol version would refuse this client, so the row
+      // is shown and greyed rather than hidden: it explains the situation.
+      option.disabled = !room.compatible;
+      return option;
+    }),
+  );
+  ui.rooms.classList.remove("hidden");
+  ui.rooms.onchange = () => {
+    const room = found[Number(ui.rooms.value)];
+    chosenRoom = room ? { relay: room.relay, room: room.room } : null;
+    if (chosenRoom) {
+      // Joining somebody's room and hosting your own are mutually exclusive.
+      ui.host.checked = false;
+      ui.advertise.classList.add("hidden");
+      ui.status.textContent = `${chosenRoom.room || "комната из конфига"} · ${chosenRoom.relay}`;
+    }
+  };
+  toast(`нашлось: ${found.length}`);
 });
 
 ui.kind.addEventListener("change", () => {

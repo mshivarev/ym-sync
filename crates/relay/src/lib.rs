@@ -36,11 +36,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+use ymsync_proto::discovery::{DISCOVERY_PORT, Discovery, MAX_DATAGRAM, MAX_ROOMS_IN_REPLY, RoomBrief};
 use ymsync_proto::{
     ClientMsg, Command, PROTOCOL_VERSION, PeerShare, PlaybackState, ServerMsg, TrackRef, secret_eq,
     unix_ms,
@@ -97,6 +98,9 @@ pub struct Server {
     shutdown: watch::Sender<bool>,
     accept: Option<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
+    /// Answers discovery broadcasts. Absent when discovery is off, or when the
+    /// well-known UDP port was already taken.
+    beacon: Option<JoinHandle<()>>,
 }
 
 impl Server {
@@ -107,12 +111,17 @@ impl Server {
         self.local_addr
     }
 
+    /// Whether this relay answers «кто держит комнаты» broadcasts.
+    pub fn discoverable(&self) -> bool {
+        self.beacon.is_some()
+    }
+
     /// Stops listening and drops every peer, waiting for the tasks to finish.
     pub async fn stop(&mut self) {
         // The connections are told first: one that notices here closes its
         // socket, rather than having it severed underneath it.
         let _ = self.shutdown.send(true);
-        for task in [self.accept.take(), self.ticker.take()]
+        for task in [self.accept.take(), self.ticker.take(), self.beacon.take()]
             .into_iter()
             .flatten()
         {
@@ -125,9 +134,13 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
-        for task in [self.accept.as_ref(), self.ticker.as_ref()]
-            .into_iter()
-            .flatten()
+        for task in [
+            self.accept.as_ref(),
+            self.ticker.as_ref(),
+            self.beacon.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             task.abort();
         }
@@ -138,7 +151,21 @@ impl Drop for Server {
 ///
 /// `bind_addr` is the usual `host:port`; port 0 asks the OS for a free one,
 /// which [`Server::local_addr`] then reports.
+///
+/// Answers discovery broadcasts as well — see [`bind_with`] to turn that off.
 pub async fn bind(bind_addr: &str, token: impl Into<String>) -> Result<Server> {
+    bind_with(bind_addr, token, true).await
+}
+
+/// [`bind`], with a say over discovery.
+///
+/// Turning it off leaves the room reachable for anyone told its address by hand,
+/// and invisible to `ymsync rooms`.
+pub async fn bind_with(
+    bind_addr: &str,
+    token: impl Into<String>,
+    discoverable: bool,
+) -> Result<Server> {
     let token = token.into();
     if token.trim().is_empty() {
         bail!(
@@ -158,6 +185,12 @@ pub async fn bind(bind_addr: &str, token: impl Into<String>) -> Result<Server> {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
+    let beacon = if discoverable {
+        start_beacon(local_addr, Arc::clone(&rooms), shutdown_rx.clone()).await
+    } else {
+        None
+    };
+
     let ticker = tokio::spawn(advance_ended_tracks(
         Arc::clone(&rooms),
         shutdown_rx.clone(),
@@ -169,7 +202,130 @@ pub async fn bind(bind_addr: &str, token: impl Into<String>) -> Result<Server> {
         shutdown,
         accept: Some(accept),
         ticker: Some(ticker),
+        beacon,
     })
+}
+
+/// Brings up the discovery responder, or explains why it stayed down.
+///
+/// Never fatal. A relay that cannot be found is still a relay, and the two ways
+/// this fails are both ordinary: the well-known UDP port already belongs to
+/// another relay on this machine, or the room is bound to loopback and there is
+/// nobody out there to answer.
+async fn start_beacon(
+    local_addr: SocketAddr,
+    rooms: Rooms,
+    shutdown: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if local_addr.ip().is_loopback() {
+        info!(
+            "комната привязана к loopback — обнаружение выключено: снаружи к ней \
+             всё равно не подключиться"
+        );
+        return None;
+    }
+
+    match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+        Ok(socket) => {
+            info!(port = DISCOVERY_PORT, "answering discovery broadcasts");
+            Some(tokio::spawn(answer_discovery(
+                socket,
+                local_addr.port(),
+                instance_id(),
+                rooms,
+                shutdown,
+            )))
+        }
+        Err(err) => {
+            warn!(
+                port = DISCOVERY_PORT,
+                "обнаружение выключено, порт занят (обычно — другим релеем на этой \
+                 машине): {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Identifies this relay process in its discovery answers.
+///
+/// Built from the process id and the moment of asking rather than from a random
+/// generator, which would mean a dependency for something that only has to be
+/// unlikely to collide on one local network. Two relays on one machine differ by
+/// pid; two on different machines differ by start time.
+fn instance_id() -> u64 {
+    ((std::process::id() as u64) << 32) ^ (unix_ms() as u64 & 0xffff_ffff)
+}
+
+/// Tells anyone who asks which rooms this relay holds.
+///
+/// The answer carries names and listener counts and nothing else — see
+/// [`ymsync_proto::discovery`] for what that deliberately leaves out.
+async fn answer_discovery(
+    socket: UdpSocket,
+    tcp_port: u16,
+    id: u64,
+    rooms: Rooms,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    loop {
+        let (len, from) = tokio::select! {
+            received = socket.recv_from(&mut buffer) => match received {
+                Ok(pair) => pair,
+                // A datagram nobody was listening for can fail the *next* recv on
+                // Windows (ICMP port unreachable surfaces as an error on the
+                // socket). Carrying on is right: the socket is still usable.
+                Err(err) => {
+                    debug!(%err, "discovery socket hiccup");
+                    continue;
+                }
+            },
+            _ = shutdown.changed() => return,
+        };
+
+        match serde_json::from_slice::<Discovery>(&buffer[..len]) {
+            Ok(Discovery::Query { protocol }) => {
+                debug!(%from, protocol, "discovery query");
+                let list = room_list(&rooms).await;
+                let named = list.len();
+                let reply = encode_discovery(&Discovery::Rooms {
+                    protocol: PROTOCOL_VERSION,
+                    id,
+                    port: tcp_port,
+                    rooms: list,
+                });
+                match socket.send_to(&reply, from).await {
+                    Ok(sent) => debug!(%from, rooms = named, bytes = sent, "answered discovery"),
+                    Err(err) => debug!(%from, %err, "cannot answer discovery"),
+                }
+            }
+            // Our own answer, seen because a client on this machine broadcast the
+            // question; or somebody else's traffic on the same port.
+            Ok(Discovery::Rooms { .. }) => {}
+            Err(err) => debug!(%from, %err, "undecodable discovery datagram"),
+        }
+    }
+}
+
+/// The rooms this relay is willing to name, sorted so that two consecutive
+/// answers to the same question look identical.
+async fn room_list(rooms: &Rooms) -> Vec<RoomBrief> {
+    let guard = rooms.lock().await;
+    let mut list: Vec<RoomBrief> = guard
+        .iter()
+        .map(|(name, room)| RoomBrief {
+            name: name.clone(),
+            listeners: room.peers.len(),
+        })
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list.truncate(MAX_ROOMS_IN_REPLY);
+    list
+}
+
+fn encode_discovery(msg: &Discovery) -> Vec<u8> {
+    serde_json::to_vec(msg).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 async fn accept_loop(
@@ -905,6 +1061,16 @@ mod tests {
         }
     }
 
+    /// Rooms as the discovery answer sees them: only membership matters, so the
+    /// peers can be empty maps.
+    async fn rooms_named(names: &[&str]) -> Rooms {
+        let mut map = HashMap::new();
+        for name in names {
+            map.insert((*name).to_string(), Room::default());
+        }
+        Arc::new(Mutex::new(map))
+    }
+
     fn room_with_two_tracks(now: i64) -> RoomState {
         let mut state = RoomState::default();
         state
@@ -1261,5 +1427,74 @@ mod tests {
     #[test]
     fn a_room_with_no_offers_has_an_empty_map() {
         assert!(Room::default().shares().is_empty());
+    }
+
+    /// Two searches in a row must produce the same list, so the answer is sorted
+    /// rather than left in `HashMap` order.
+    #[tokio::test]
+    async fn the_discovery_answer_names_rooms_in_order() {
+        let rooms = rooms_named(&["кухня", "home", "гараж"]).await;
+        let names: Vec<String> = room_list(&rooms)
+            .await
+            .into_iter()
+            .map(|brief| brief.name)
+            .collect();
+        assert_eq!(names, ["home", "гараж", "кухня"]);
+    }
+
+    #[tokio::test]
+    async fn the_discovery_answer_counts_listeners() {
+        let rooms = rooms_named(&["home"]).await;
+        {
+            let mut guard = rooms.lock().await;
+            let room = guard.get_mut("home").unwrap();
+            for id in 1..=3 {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                room.peers.insert(id, Peer { tx, share: None });
+            }
+        }
+        let list = room_list(&rooms).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].listeners, 3);
+    }
+
+    /// An empty room is still worth naming: its queue is what somebody coming
+    /// back would rejoin.
+    #[tokio::test]
+    async fn a_room_nobody_is_in_is_still_announced() {
+        let rooms = rooms_named(&["home"]).await;
+        let list = room_list(&rooms).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].listeners, 0);
+    }
+
+    /// The whole answer has to fit in one datagram, so the list is capped.
+    #[tokio::test]
+    async fn the_answer_is_capped() {
+        let names: Vec<String> = (0..MAX_ROOMS_IN_REPLY + 10)
+            .map(|i| format!("room-{i:03}"))
+            .collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let rooms = rooms_named(&borrowed).await;
+        assert_eq!(room_list(&rooms).await.len(), MAX_ROOMS_IN_REPLY);
+    }
+
+    /// A room bound to loopback answers nobody: there is no one out there who
+    /// could connect to it anyway, and claiming otherwise would put an
+    /// unreachable address in somebody's list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loopback_room_is_not_discoverable() {
+        let server = bind_with("127.0.0.1:0", "secret", true)
+            .await
+            .expect("bind");
+        assert!(!server.discoverable());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_can_be_turned_off() {
+        let server = bind_with("127.0.0.1:0", "secret", false)
+            .await
+            .expect("bind");
+        assert!(!server.discoverable());
     }
 }

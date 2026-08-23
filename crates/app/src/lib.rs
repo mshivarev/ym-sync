@@ -9,6 +9,7 @@
 pub mod api;
 pub mod cache;
 pub mod config;
+pub mod discover;
 pub mod engine;
 pub mod link;
 pub mod net;

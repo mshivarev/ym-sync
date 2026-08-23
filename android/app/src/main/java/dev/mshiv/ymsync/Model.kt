@@ -28,6 +28,16 @@ data class Library(
     val directory: String,
 )
 
+/** A room somebody on this network is holding. */
+data class FoundRoom(
+    /** Ready to put in the relay field: `ws://<address>:<port>`. */
+    val relay: String,
+    val room: String,
+    val listeners: Int,
+    /** False when that relay speaks another protocol version and would refuse us. */
+    val compatible: Boolean,
+)
+
 /** Mirrors `ymsync::engine::Snapshot`. */
 data class Snapshot(
     val connected: Boolean,
@@ -108,6 +118,17 @@ fun JSONObject.toLibrary() =
         limitBytes = optLong("limit_bytes"),
         directory = optString("directory"),
     )
+
+fun JSONObject.toFoundRoom() =
+    FoundRoom(
+        relay = optString("relay"),
+        room = optString("room"),
+        listeners = optInt("listeners"),
+        compatible = optBoolean("compatible"),
+    )
+
+fun JSONArray.toFoundRooms(): List<FoundRoom> =
+    (0 until length()).mapNotNull { optJSONObject(it)?.toFoundRoom() }
 
 /**
  * Reads a snapshot from the core.

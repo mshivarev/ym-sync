@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -15,6 +16,7 @@ use tokio::sync::Mutex;
 use ymsync::api::{self, Track, YandexMusic};
 use ymsync::cache::{Cache, CachedTrack};
 use ymsync::config::Config;
+use ymsync::discover::{self, FoundRoom};
 use ymsync::engine::{Command, Snapshot};
 use ymsync::player::Player;
 use ymsync::session::{self, Session};
@@ -107,15 +109,18 @@ fn settings(state: State<'_, AppState>) -> Settings {
 
 /// Connects, optionally running the room's relay in this process.
 ///
-/// `host` and `advertise` come from the window rather than from the file, and are
-/// not written back — the same deal as `ymsync play --host`: the tick holds for
-/// this run, and `config.toml` stays the default. Hosting has to be decided here
-/// because the relay is bound before the engine connects to it.
+/// `host`, `advertise`, `relay` and `room` come from the window rather than from
+/// the file, and are not written back — the same deal as `ymsync play --host`: the
+/// choice holds for this run and `config.toml` stays the default. Hosting has to
+/// be decided here because the relay is bound before the engine connects to it,
+/// and a room picked out of the network is only known at this point too.
 #[tauri::command]
 async fn connect(
     app: AppHandle,
     host: bool,
     advertise: String,
+    relay: String,
+    room: String,
     state: State<'_, AppState>,
 ) -> Result<Snapshot, String> {
     let mut slot = state.session.lock().await;
@@ -136,9 +141,16 @@ async fn connect(
     if host {
         cfg.host.enabled = true;
     }
-    let advertise = advertise.trim();
-    if !advertise.is_empty() {
-        cfg.host.advertise = advertise.to_string();
+    // Anything the window left blank keeps what the file said.
+    for (field, chosen) in [
+        (&mut cfg.host.advertise, advertise),
+        (&mut cfg.relay, relay),
+        (&mut cfg.room, room),
+    ] {
+        let chosen = chosen.trim();
+        if !chosen.is_empty() {
+            *field = chosen.to_string();
+        }
     }
 
     // Hosting the room and serving cached tracks are both set up here, in the
@@ -295,6 +307,17 @@ async fn control(
     send(&state, command).await
 }
 
+/// Asks the local network which rooms are out there.
+///
+/// Needs no connection and no tokens: this is what you press *before* knowing
+/// where to connect. Answering rooms name themselves and count their listeners —
+/// getting in still needs the room's secret.
+#[tauri::command]
+async fn find_rooms(wait: u64) -> Result<Vec<FoundRoom>, String> {
+    let wait = Duration::from_millis(wait.clamp(100, 5_000));
+    discover::find_rooms(wait).await.map_err(fail)
+}
+
 /// This device's offline library, newest first.
 ///
 /// Answers with no connection and no internet: the metadata was stored beside the
@@ -392,7 +415,8 @@ fn main() {
             library,
             download,
             cancel_downloads,
-            forget
+            forget,
+            find_rooms
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");
