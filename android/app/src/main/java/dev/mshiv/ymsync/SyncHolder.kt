@@ -88,4 +88,21 @@ object Commands {
             is NativeResult.Ok -> Result.success(reply.value.optInt("queued"))
         }
     }
+
+    /**
+     * What is downloaded on this device.
+     *
+     * Unlike everything else here this touches no network — it reads an index the
+     * core keeps in memory — but it still goes through the core, so it stays off
+     * the main thread with the rest.
+     */
+    suspend fun library(): Result<Library> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.library(handle)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.toLibrary())
+        }
+    }
 }

@@ -7,6 +7,7 @@ const el = (id) => document.getElementById(id);
 const ui = {
   connect: el("connect"),
   status: el("status"),
+  hosting: el("hosting"),
   kind: el("kind"),
   source: el("source"),
   load: el("load"),
@@ -17,6 +18,15 @@ const ui = {
   results: el("results"),
   queue: el("queue"),
   queueCount: el("queue-count"),
+  dlTrack: el("dl-track"),
+  dlQueue: el("dl-queue"),
+  dlCancel: el("dl-cancel"),
+  library: el("library"),
+  libCount: el("lib-count"),
+  libHint: el("lib-hint"),
+  libPlay: el("lib-play"),
+  libQueue: el("lib-queue"),
+  libRefresh: el("lib-refresh"),
   title: el("title"),
   subtitle: el("subtitle"),
   prev: el("prev"),
@@ -47,10 +57,25 @@ let queueKey = "";
 let dragging = false;
 let toastTimer = null;
 let volumeTimer = null;
+/// This device's downloads, and where they live. Known before connecting.
+let library = [];
+let libraryRevision = -1;
+let cacheDir = "";
+let cacheLimit = 0;
+let autoCache = false;
+/// Ids that cost no internet: on this disk, or on somebody else's in the room.
+let cachedIds = new Set();
+let lanIds = new Set();
 
 function fmt(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+/** Binary units, to match what the file manager beside this window says. */
+function fmtSize(bytes) {
+  const mib = (bytes || 0) / (1024 * 1024);
+  return mib >= 1024 ? `${(mib / 1024).toFixed(1)} ГиБ` : `${mib.toFixed(1)} МиБ`;
 }
 
 function toast(message) {
@@ -77,17 +102,24 @@ function setConnected(value) {
   ui.connect.classList.toggle("primary", !value);
 
   // Protocol 3 has no roles: everyone in the room may drive it.
-  for (const node of [ui.kind, ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek]) {
+  for (const node of [ui.kind, ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek,
+    ui.dlTrack, ui.dlQueue]) {
     node.disabled = !value;
   }
+  updateLibraryButtons();
 
   if (!value) {
     latest = null;
     queueKey = "";
+    libraryRevision = -1;
+    cachedIds = new Set();
+    lanIds = new Set();
     ui.status.className = "status";
     ui.status.textContent = "не подключено";
     ui.drift.classList.add("hidden");
     ui.wave.classList.add("hidden");
+    ui.hosting.classList.add("hidden");
+    ui.dlCancel.classList.add("hidden");
     ui.queue.replaceChildren();
     ui.queueCount.textContent = "";
     ui.title.textContent = "—";
@@ -99,9 +131,28 @@ function setConnected(value) {
   }
 }
 
+/// Playing the library means queueing it into the room, so it needs both the
+/// tracks and a connection.
+function updateLibraryButtons() {
+  const usable = connected && library.length > 0;
+  ui.libPlay.disabled = !usable;
+  ui.libQueue.disabled = !usable;
+}
+
+/// Where a track would come from, when that costs no internet.
+function origin(trackId) {
+  if (cachedIds.has(trackId)) {
+    return { text: "\u2913", cls: "mark disk", title: "есть на этом устройстве" };
+  }
+  if (lanIds.has(trackId)) {
+    return { text: "\u21C4", cls: "mark lan", title: "есть у кого-то в комнате" };
+  }
+  return null;
+}
+
 /// Rows are real buttons: keyboard-reachable, and assistive tech (and UI
 /// automation) can activate them, which a bare `li` with a click handler cannot.
-function trackItem(track, index, { current, onClick }) {
+function trackItem(track, index, { current, onClick, trailing }) {
   const item = document.createElement("li");
 
   const entry = document.createElement("button");
@@ -116,11 +167,17 @@ function trackItem(track, index, { current, onClick }) {
   name.className = "name";
   name.textContent = `${track.artist} — ${track.title}`;
 
+  const flag = origin(track.track_id);
+  const mark = document.createElement("span");
+  mark.className = flag ? flag.cls : "mark";
+  mark.textContent = flag ? flag.text : "";
+  if (flag) mark.title = flag.title;
+
   const time = document.createElement("span");
   time.className = "time";
-  time.textContent = fmt(track.duration_ms);
+  time.textContent = trailing ?? fmt(track.duration_ms);
 
-  entry.append(number, name, time);
+  entry.append(number, name, mark, time);
   entry.addEventListener("click", onClick);
   item.append(entry);
   return item;
@@ -153,15 +210,72 @@ function renderResults() {
   );
 }
 
+/// The offline library. Rows carry a delete of their own, because this is the one
+/// list where the tracks belong to this device rather than to the room.
+function renderLibrary() {
+  ui.library.replaceChildren(
+    ...library.map((entry, index) => {
+      const item = trackItem(entry, index, {
+        current: false,
+        trailing: fmtSize(entry.bytes),
+        onClick: () => call("queue_tracks", { tracks: [entry], start: 0, replace: false }),
+      });
+      item.className = "pair";
+
+      const drop = document.createElement("button");
+      drop.type = "button";
+      drop.className = "drop";
+      drop.textContent = "\u00D7";
+      drop.title = "удалить с этого устройства";
+      drop.addEventListener("click", async () => {
+        await call("forget", { id: entry.track_id });
+        await refreshLibrary();
+      });
+
+      item.append(drop);
+      return item;
+    }),
+  );
+}
+
+/** Re-reads what is on disk. Works with no connection and no internet. */
+async function refreshLibrary() {
+  const tracks = await call("library");
+  if (!tracks) return;
+
+  library = tracks;
+  cachedIds = new Set(tracks.map((entry) => entry.track_id));
+  ui.libCount.textContent = tracks.length ? `· ${tracks.length}` : "";
+
+  const total = tracks.reduce((sum, entry) => sum + entry.bytes, 0);
+  const size = cacheLimit ? `${fmtSize(total)} из ${fmtSize(cacheLimit)}` : fmtSize(total);
+  const kept = autoCache ? "сохраняется всё, что играет" : "сохраняется только скачанное";
+  ui.libHint.textContent = tracks.length
+    ? `${size} · ${kept} · ${cacheDir}`
+    : `пусто — «↓ трек» и «↓ очередь» оставляют музыку здесь · ${cacheDir}`;
+
+  renderLibrary();
+  updateLibraryButtons();
+}
+
 function render(snapshot) {
   latest = snapshot;
+  // Recomputed before anything is drawn: both lists mark their rows with it.
+  cachedIds = new Set(snapshot.cached || []);
+  lanIds = new Set(snapshot.on_lan || []);
 
   const track = snapshot.track;
   ui.title.textContent = track ? `${track.artist} — ${track.title}` : "—";
 
   const place = snapshot.queue.length ? `${snapshot.index + 1} из ${snapshot.queue.length}` : "";
   const note = snapshot.loading ? "загрузка…" : (snapshot.notice || "");
-  ui.subtitle.textContent = [place, note].filter(Boolean).join(" · ");
+  const fetching = snapshot.downloading
+    ? snapshot.download_queue > 0
+      ? `скачиваю, ещё ${snapshot.download_queue}`
+      : "скачиваю"
+    : "";
+  ui.subtitle.textContent = [place, note, fetching].filter(Boolean).join(" · ");
+  ui.dlCancel.classList.toggle("hidden", snapshot.download_queue === 0);
 
   ui.toggle.textContent = snapshot.playing ? "\u23F8" : "\u25B6";
   ui.position.textContent = fmt(snapshot.position_ms);
@@ -174,9 +288,19 @@ function render(snapshot) {
 
   const rtt = snapshot.rtt_ms === null ? "?" : snapshot.rtt_ms;
   const offset = snapshot.offset_ms === null ? "?" : snapshot.offset_ms;
+  const sharing = snapshot.sharing_peers ? ` · раздают ${snapshot.sharing_peers}` : "";
   ui.status.textContent =
-    `участников ${snapshot.peers} · rtt ${rtt} мс · смещение ${offset} мс`;
+    `участников ${snapshot.peers} · rtt ${rtt} мс · смещение ${offset} мс${sharing}`;
   ui.status.className = `status ${snapshot.connected ? "live" : "broken"}`;
+
+  // The address others must type in, and the reason this app has no `relay` of
+  // its own to show while hosting.
+  if (snapshot.hosting) {
+    ui.hosting.classList.remove("hidden");
+    ui.hosting.textContent = `комната здесь · ${snapshot.hosting}`;
+  } else {
+    ui.hosting.classList.add("hidden");
+  }
 
   // The station is a room-wide setting, but only its feeder can refill it, so
   // say which of the two we are looking at.
@@ -197,11 +321,26 @@ function render(snapshot) {
     ui.drift.textContent = `рассинхрон ${drift > 0 ? "+" : ""}${drift} мс`;
   }
 
-  // Rebuilding 85 list items four times a second would fight the scrollbar.
-  const key = `${snapshot.queue.length}|${snapshot.index}|${snapshot.queue[0]?.track_id ?? ""}`;
+  // Rebuilding 85 list items four times a second would fight the scrollbar. The
+  // cache revision is in the key because a finished download changes the marks
+  // on rows that have not otherwise moved.
+  const key = [
+    snapshot.queue.length,
+    snapshot.index,
+    snapshot.queue[0]?.track_id ?? "",
+    snapshot.cache_revision,
+    lanIds.size,
+  ].join("|");
   if (key !== queueKey) {
     queueKey = key;
     renderQueue(snapshot);
+    renderResults();
+  }
+
+  // A download that finished changed the disk, so the library panel is stale.
+  if (snapshot.cache_revision !== libraryRevision) {
+    libraryRevision = snapshot.cache_revision;
+    refreshLibrary();
   }
 }
 
@@ -282,6 +421,34 @@ ui.toggle.addEventListener("click", () => call("control", { action: "toggle" }))
 ui.next.addEventListener("click", () => call("control", { action: "next" }));
 ui.prev.addEventListener("click", () => call("control", { action: "prev" }));
 
+ui.dlTrack.addEventListener("click", () => {
+  const track = latest?.track;
+  if (!track) {
+    toast("сейчас ничего не играет");
+    return;
+  }
+  call("download", { tracks: [track] });
+});
+ui.dlQueue.addEventListener("click", () => {
+  const tracks = latest?.queue ?? [];
+  if (tracks.length === 0) {
+    toast("очередь пуста");
+    return;
+  }
+  call("download", { tracks });
+});
+ui.dlCancel.addEventListener("click", () => call("cancel_downloads"));
+
+// Replacing the queue with the library is how you listen with no internet: every
+// one of these plays off the disk.
+ui.libPlay.addEventListener("click", () =>
+  call("queue_tracks", { tracks: library, start: 0, replace: true }),
+);
+ui.libQueue.addEventListener("click", () =>
+  call("queue_tracks", { tracks: library, start: 0, replace: false }),
+);
+ui.libRefresh.addEventListener("click", () => refreshLibrary());
+
 ui.seek.addEventListener("pointerdown", () => {
   dragging = true;
 });
@@ -322,7 +489,16 @@ listen("closed", () => {
   if (!settings) return;
 
   ui.volume.value = Math.round(settings.volume * 100);
-  ui.status.textContent = `${settings.room} · ${settings.relay}`;
+  // While hosting there is no relay to name: this app is the relay, and its
+  // address is only known once the socket is bound.
+  ui.status.textContent = settings.hosting
+    ? `${settings.room} · комнату держит это устройство`
+    : `${settings.room} · ${settings.relay}`;
+
+  cacheDir = settings.cache_dir;
+  cacheLimit = settings.cache_limit_bytes;
+  autoCache = settings.auto_cache;
+  await refreshLibrary();
 
   const missing = [];
   if (!settings.has_yandex_token) missing.push("yandex_token");

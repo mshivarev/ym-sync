@@ -29,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -55,7 +56,7 @@ private val Warn = Color(0xFFFFC72C)
 private val Bad = Color(0xFFFF6B6B)
 
 /// Sources that are a whole collection in themselves, with nothing to type in.
-private val SELF_CONTAINED = setOf("wave", "likes")
+private val SELF_CONTAINED = setOf("wave", "likes", "offline")
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,6 +92,13 @@ private fun App(settings: Settings) {
     var source by remember { mutableStateOf("") }
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
+    var library by remember { mutableStateOf<Library?>(null) }
+
+    // A finished download changes the disk, and the cache revision is how the
+    // core says so — cheaper than re-reading the list on every snapshot.
+    LaunchedEffect(running, snapshot?.cacheRevision) {
+        library = if (running) Commands.library().getOrNull() else null
+    }
 
     // Media3 needs notification permission for its playback notification.
     val askNotifications = rememberLauncherForActivityResult(
@@ -227,6 +235,7 @@ private fun App(settings: Settings) {
                             track = track,
                             current = false,
                             enabled = canDrive,
+                            mark = markFor(snapshot, track.trackId),
                         ) {
                             scope.launch {
                                 Commands.queueFrom("track", track.trackId, replace = false)
@@ -239,20 +248,94 @@ private fun App(settings: Settings) {
                 val queue = snapshot?.queue ?: emptyList()
                 if (queue.isNotEmpty()) {
                     item { SectionTitle("Очередь · ${queue.size}") }
+                    item {
+                        // Keeping music here is per-device, so it sits with the
+                        // queue rather than with the room's controls.
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                enabled = canDrive && snapshot?.track != null,
+                                onClick = {
+                                    scope.launch { Commands.send("download") { put("queue", false) } }
+                                },
+                            ) { Text("↓ трек") }
+                            OutlinedButton(
+                                enabled = canDrive,
+                                onClick = {
+                                    scope.launch { Commands.send("download") { put("queue", true) } }
+                                },
+                            ) { Text("↓ очередь") }
+                            if ((snapshot?.downloadQueue ?: 0) > 0) {
+                                TextButton(
+                                    onClick = {
+                                        scope.launch { Commands.send("cancel_downloads") }
+                                    },
+                                ) { Text("отменить") }
+                            }
+                        }
+                    }
                     items(queue.size, key = { "q${queue[it].trackId}$it" }) { index ->
                         TrackRow(
                             position = index + 1,
                             track = queue[index],
                             current = index == (snapshot?.index ?: -1),
                             enabled = canDrive,
+                            mark = markFor(snapshot, queue[index].trackId),
                         ) {
                             scope.launch { Commands.send("index") { put("index", index) } }
+                        }
+                    }
+                }
+
+                val downloaded = library?.tracks ?: emptyList()
+                if (downloaded.isNotEmpty()) {
+                    item { SectionTitle("На устройстве · ${downloaded.size} · ${librarySize(library)}") }
+                    items(downloaded.size, key = { "c${downloaded[it].track.trackId}" }) { index ->
+                        val entry = downloaded[index]
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TrackRow(
+                                position = index + 1,
+                                track = entry.track,
+                                current = false,
+                                enabled = canDrive,
+                                modifier = Modifier.weight(1f),
+                                trailing = formatSize(entry.bytes),
+                            ) {
+                                scope.launch {
+                                    Commands.queueFrom("track", entry.track.trackId, replace = false)
+                                        .onFailure { error -> SyncHolder.say(error.message) }
+                                }
+                            }
+                            TextButton(
+                                onClick = {
+                                    scope.launch {
+                                        Commands.send("forget") {
+                                            put("track_id", entry.track.trackId)
+                                        }
+                                        library = Commands.library().getOrNull()
+                                    }
+                                },
+                            ) { Text("×") }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Where a track would come from, when that costs no internet: this device's own
+/// disk, or somebody else's in the room.
+private fun markFor(snapshot: Snapshot?, trackId: String): String = when {
+    snapshot == null -> ""
+    trackId in snapshot.cached -> "\u2913"
+    trackId in snapshot.onLan -> "\u21C4"
+    else -> ""
+}
+
+private fun librarySize(library: Library?): String {
+    val bytes = formatSize(library?.bytes ?: 0)
+    val limit = library?.limitBytes ?: 0
+    return if (limit > 0) "$bytes из ${formatSize(limit)}" else bytes
 }
 
 @Composable
@@ -263,6 +346,16 @@ private fun StatusLine(snapshot: Snapshot?, message: String?) {
             else -> buildString {
                 append("участников ${snapshot.peers}")
                 snapshot.rttMs?.let { append(" · rtt $it мс") }
+                if (snapshot.sharingPeers > 0) append(" · раздают ${snapshot.sharingPeers}")
+                if (snapshot.downloading != null) {
+                    append(
+                        if (snapshot.downloadQueue > 0) {
+                            " · скачиваю, ещё ${snapshot.downloadQueue}"
+                        } else {
+                            " · скачиваю"
+                        },
+                    )
+                }
             }
         }
         Text(
@@ -270,6 +363,15 @@ private fun StatusLine(snapshot: Snapshot?, message: String?) {
             color = if (snapshot?.connected == true) Good else MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
+        // The address the others have to type in. Only known once the socket is
+        // bound, which is why it comes from the snapshot and not the settings.
+        snapshot?.hosting?.let {
+            Text(
+                "комната здесь · $it",
+                color = Accent,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         // What the engine has to say — a skipped track, a station that stopped
         // answering — would otherwise never reach the screen.
         snapshot?.notice?.let {
@@ -292,6 +394,9 @@ private fun SettingsCard(settings: Settings) {
     var roomToken by remember { mutableStateOf(settings.roomToken) }
     var yandexToken by remember { mutableStateOf(settings.yandexToken) }
     var bias by remember { mutableStateOf(settings.positionBiasMs.toString()) }
+    var hostRoom by remember { mutableStateOf(settings.hostRoom) }
+    var autoCache by remember { mutableStateOf(settings.autoCache) }
+    var cacheLimit by remember { mutableStateOf(settings.cacheLimitGb.toString()) }
     val scope = rememberCoroutineScope()
 
     Card {
@@ -355,7 +460,64 @@ private fun SettingsCard(settings: Settings) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            HorizontalDivider()
+
+            SettingSwitch(
+                label = "держать комнату на этом телефоне",
+                hint = "релей не нужен: остальные вписывают адрес, который покажет строка " +
+                    "состояния. Так же выглядит и прослушивание скачанного без интернета.",
+                checked = hostRoom,
+                onChange = { hostRoom = it; settings.hostRoom = it },
+            )
+            SettingSwitch(
+                label = "оставлять всё, что играет",
+                hint = "иначе на телефоне остаётся только скачанное кнопками «↓».",
+                checked = autoCache,
+                onChange = { autoCache = it; settings.autoCache = it },
+            )
+            OutlinedTextField(
+                value = cacheLimit,
+                onValueChange = { typed ->
+                    cacheLimit = typed.filter { it.isDigit() || it == '.' }
+                    // 0 means no limit, and an unreadable value must not be
+                    // silently taken for one.
+                    settings.cacheLimitGb = cacheLimit.toFloatOrNull() ?: settings.cacheLimitGb
+                },
+                label = { Text("лимит на скачанное, ГБ (0 — без лимита)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "Эти три применятся при следующем подключении: ядро читает настройки " +
+                    "при старте. Файлы лежат в ${settings.cacheDir} и удаляются вместе " +
+                    "с приложением.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
+    }
+}
+
+/// A switch with the sentence that explains what it costs, because none of these
+/// are obvious from a label alone.
+@Composable
+private fun SettingSwitch(
+    label: String,
+    hint: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, modifier = Modifier.weight(1f))
+            Switch(checked = checked, onCheckedChange = onChange)
+        }
+        Text(
+            hint,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -381,6 +543,7 @@ private fun SourceRow(
                 "track" to "трек",
                 "wave" to "моя волна",
                 "likes" to "мне нравится",
+                "offline" to "скачанное",
             ).forEach { (id, label) ->
                 FilterChip(
                     selected = kind == id,
@@ -424,9 +587,14 @@ private fun TrackRow(
     track: TrackInfo,
     current: Boolean,
     enabled: Boolean,
+    modifier: Modifier = Modifier,
+    /// Small hint of where the track would come from; see [markFor].
+    mark: String = "",
+    /// Replaces the duration on the right, where size matters more.
+    trailing: String? = null,
     onClick: () -> Unit,
 ) {
-    TextButton(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+    TextButton(onClick = onClick, enabled = enabled, modifier = modifier.fillMaxWidth()) {
         Text(
             "$position",
             style = MaterialTheme.typography.bodySmall,
@@ -440,8 +608,16 @@ private fun TrackRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        if (mark.isNotEmpty()) {
+            Text(
+                mark,
+                style = MaterialTheme.typography.bodySmall,
+                color = Good,
+                modifier = Modifier.padding(end = 6.dp),
+            )
+        }
         Text(
-            formatMs(track.durationMs),
+            trailing ?: formatMs(track.durationMs),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

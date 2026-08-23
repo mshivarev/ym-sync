@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use ymsync::api::{self, Track, YandexMusic};
 use ymsync::config::Config;
-use ymsync::engine::{self, Command, Handle};
+use ymsync::engine::{Command, Handle};
 use ymsync::playback::Playback;
+use ymsync::session::{self as core, Session as CoreSession};
 use ymsync_proto::TrackRef;
 
 use crate::{ExternalPlayback, PlayerState};
@@ -32,11 +33,23 @@ pub enum Request {
     StopWave,
     /// Recalibrates ExoPlayer's reporting lag without a reconnect.
     Bias { ms: i64 },
+    /// Keeps music on this device: the whole queue, or just what is playing.
+    Download { queue: bool },
+    /// Forgets everything still waiting to be downloaded.
+    CancelDownloads,
+    /// Deletes one track from this device.
+    Forget { track_id: String },
 }
 
-impl From<Request> for Command {
-    fn from(request: Request) -> Self {
-        match request {
+impl Request {
+    /// The engine command this request means, where that does not depend on what
+    /// is currently on screen.
+    ///
+    /// [`Request::Download`] is the exception: the UI says *which* tracks it means
+    /// — this one, or everything queued — rather than naming ids, so
+    /// [`Session::send`] resolves it against the latest snapshot.
+    fn command(self) -> Option<Command> {
+        Some(match self {
             Request::Toggle => Command::TogglePause,
             Request::Next => Command::Next,
             Request::Prev => Command::Prev,
@@ -46,17 +59,24 @@ impl From<Request> for Command {
             Request::Index { index } => Command::PlayIndex(index),
             Request::StopWave => Command::StopStation,
             Request::Bias { ms } => Command::SetPositionBias(ms),
-        }
+            Request::CancelDownloads => Command::CancelDownloads,
+            Request::Forget { track_id } => Command::Forget { track_id },
+            Request::Download { .. } => return None,
+        })
     }
 }
 
 pub struct Session {
     runtime: tokio::runtime::Runtime,
-    engine: Handle,
+    /// The engine plus whatever it brought up: a relay when this phone hosts the
+    /// room, and the file server offering its downloads to the others.
+    core: CoreSession,
     api: Arc<YandexMusic>,
     playback: Arc<ExternalPlayback>,
     /// Queue revision Kotlin has already been given; see [`Session::poll`].
     sent_revision: AtomicU64,
+    /// Same idea for the list of downloaded ids.
+    sent_cache_revision: AtomicU64,
 }
 
 impl Session {
@@ -76,20 +96,31 @@ impl Session {
 
         let api = Arc::new(YandexMusic::new(cfg.require_yandex_token()?)?);
         let playback = Arc::new(ExternalPlayback::new(cfg.volume));
-        let engine = runtime.block_on(engine::spawn(
+        // Kotlin passes an app-private path in `cache.dir`, which is the only
+        // place this process may write without asking for a permission.
+        let cache = core::open_cache(&cfg)?;
+        let core = runtime.block_on(core::start(
             &cfg,
             Arc::clone(&api),
             Arc::clone(&playback) as Arc<dyn Playback>,
+            cache,
         ))?;
 
         Ok(Self {
             runtime,
-            engine,
+            core,
             api,
             playback,
             // Revisions start at 1, so the first queue is always sent.
             sent_revision: AtomicU64::new(0),
+            // The cache revision does start at 0, so this one has to begin
+            // somewhere it can never match.
+            sent_cache_revision: AtomicU64::new(u64::MAX),
         })
+    }
+
+    fn engine(&self) -> &Handle {
+        self.core.handle()
     }
 
     /// The one call Kotlin makes on a timer: hand in the player's state, take out
@@ -101,13 +132,23 @@ impl Session {
     pub fn poll(&self, state: PlayerState) -> serde_json::Value {
         self.playback.report(state);
 
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine().snapshot();
         let revision = snapshot.queue_revision;
         let known = self.sent_revision.swap(revision, Ordering::Relaxed) == revision;
+        let cache_revision = snapshot.cache_revision;
+        let cache_known =
+            self.sent_cache_revision.swap(cache_revision, Ordering::Relaxed) == cache_revision;
 
         let mut snapshot = serde_json::to_value(&snapshot).unwrap_or_default();
-        if known && let Some(object) = snapshot.as_object_mut() {
-            object.remove("queue");
+        if let Some(object) = snapshot.as_object_mut() {
+            if known {
+                object.remove("queue");
+            }
+            // For the same reason as the queue: a well-used offline library runs
+            // into the thousands of ids.
+            if cache_known {
+                object.remove("cached");
+            }
         }
 
         serde_json::json!({
@@ -117,7 +158,35 @@ impl Session {
     }
 
     pub fn send(&self, request: Request) {
-        self.engine.send(request.into());
+        if let Request::Download { queue } = request {
+            let snapshot = self.engine().snapshot();
+            let tracks = if queue {
+                snapshot.queue
+            } else {
+                snapshot.track.into_iter().collect()
+            };
+            if !tracks.is_empty() {
+                self.engine().send(Command::Download { tracks });
+            }
+            return;
+        }
+        if let Some(command) = request.command() {
+            self.engine().send(command);
+        }
+    }
+
+    /// What is on this device's disk, for the offline screen.
+    ///
+    /// Reads the in-memory index only, so Kotlin may call it straight from the UI
+    /// thread — and it answers with no network at all.
+    pub fn library(&self) -> serde_json::Value {
+        let cache = self.engine().cache();
+        serde_json::json!({
+            "tracks": cache.tracks(),
+            "bytes": cache.total_bytes(),
+            "limit_bytes": cache.limit_bytes(),
+            "directory": cache.directory().display().to_string(),
+        })
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<TrackRef>> {
@@ -136,11 +205,27 @@ impl Session {
         // The wave has no track list to resolve: the engine follows the station
         // and asks it for more as the queue runs down.
         if kind == "wave" {
-            self.engine.send(Command::PlayStation {
+            self.engine().send(Command::PlayStation {
                 id: api::WAVE_STATION.to_string(),
                 replace,
             });
             return Ok(0);
+        }
+
+        // Neither does the offline library: its metadata is on disk beside the
+        // audio, which is what makes this work with no internet.
+        if kind == "offline" {
+            let tracks: Vec<TrackRef> = self
+                .engine()
+                .cache()
+                .tracks()
+                .into_iter()
+                .map(|entry| entry.track)
+                .collect();
+            if tracks.is_empty() {
+                bail!("на этом устройстве ничего не скачано");
+            }
+            return Ok(self.queue(tracks, replace));
         }
 
         let tracks = self.runtime.block_on(async {
@@ -169,26 +254,28 @@ impl Session {
             }
         })?;
 
-        let queue: Vec<TrackRef> = tracks.iter().map(Track::to_track_ref).collect();
-        let length = queue.len();
-        self.engine.send(if replace {
-            Command::SetQueue {
-                tracks: queue,
-                start: 0,
-            }
+        Ok(self.queue(
+            tracks.iter().map(Track::to_track_ref).collect(),
+            replace,
+        ))
+    }
+
+    /// Sends a resolved list to the room, replacing the queue or extending it.
+    fn queue(&self, tracks: Vec<TrackRef>, replace: bool) -> usize {
+        let length = tracks.len();
+        self.engine().send(if replace {
+            Command::SetQueue { tracks, start: 0 }
         } else {
-            Command::Enqueue { tracks: queue }
+            Command::Enqueue { tracks }
         });
-        Ok(length)
+        length
     }
 
     pub fn stop(self) {
-        let Session {
-            runtime, engine, ..
-        } = self;
-        engine.send(Command::Shutdown);
-        // Give the loop a moment to say goodbye to the relay.
-        let _ = runtime.block_on(engine.join());
+        let Session { runtime, core, .. } = self;
+        // Shuts the engine down first and the servers it brought up second, so a
+        // hosted relay is still there to hear this player say goodbye.
+        let _ = runtime.block_on(core.shutdown());
     }
 }
 
@@ -210,10 +297,33 @@ mod tests {
             (r#"{"action":"index","index":3}"#, Command::PlayIndex(3)),
             (r#"{"action":"stop_wave"}"#, Command::StopStation),
             (r#"{"action":"bias","ms":400}"#, Command::SetPositionBias(400)),
+            (
+                r#"{"action":"cancel_downloads"}"#,
+                Command::CancelDownloads,
+            ),
+            (
+                r#"{"action":"forget","track_id":"42"}"#,
+                Command::Forget {
+                    track_id: "42".to_string(),
+                },
+            ),
         ];
         for (json, expected) in cases {
             let request: Request = serde_json::from_str(json).expect(json);
-            assert_eq!(Command::from(request), expected, "{json}");
+            assert_eq!(request.command(), Some(expected), "{json}");
+        }
+    }
+
+    /// Downloading names a scope rather than ids, so it cannot become a command
+    /// without the current snapshot.
+    #[test]
+    fn a_download_request_has_no_command_of_its_own() {
+        for json in [
+            r#"{"action":"download","queue":false}"#,
+            r#"{"action":"download","queue":true}"#,
+        ] {
+            let request: Request = serde_json::from_str(json).expect(json);
+            assert_eq!(request.command(), None, "{json}");
         }
     }
 

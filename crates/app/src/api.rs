@@ -39,7 +39,7 @@ pub struct YandexMusic {
 
 /// The platform TLS stack (schannel on Windows) needs no help.
 #[cfg(not(feature = "tls-rustls"))]
-fn client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
@@ -51,7 +51,7 @@ fn client_builder() -> reqwest::ClientBuilder {
 /// The provider is named explicitly so this does not depend on whether
 /// [`crate::install_tls_provider`] ran first.
 #[cfg(feature = "tls-rustls")]
-fn client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 

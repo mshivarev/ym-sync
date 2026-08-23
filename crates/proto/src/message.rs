@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 /// * 3 — the relay owns the queue and the playhead. Clients no longer publish
 ///   state; they send [`Command`]s and follow what comes back. Roles are gone:
 ///   every peer plays and every peer may command.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// * 4 — cached tracks are shared over the local network:
+///   [`ClientMsg::Share`] announces which tracks a peer will serve and on what
+///   port, and [`ServerMsg::Shares`] hands the room the resulting map. The bytes
+///   themselves never touch the relay.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Identifies a track well enough for another account to resolve it.
 ///
@@ -32,6 +36,25 @@ impl std::fmt::Display for TrackRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} — {} [{}]", self.artist, self.title, self.track_id)
     }
+}
+
+/// Where one peer's cached tracks can be fetched from, as the relay sees it.
+///
+/// `endpoint` is composed by the relay, not announced by the peer: a machine with
+/// a VPN, a Hyper-V switch and a Wi-Fi adapter cannot reliably say which of its
+/// own addresses the others can reach, whereas the relay is already holding a
+/// socket that demonstrably works. So a peer announces only the port its file
+/// server listens on, and the relay pairs it with the address that connection
+/// arrived on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerShare {
+    /// The relay's id for the peer. Meaningful only within one room, and only
+    /// until that peer reconnects.
+    pub peer: u64,
+    /// Base URL of the peer's file server, e.g. `http://192.168.1.10:8788`.
+    pub endpoint: String,
+    /// Track ids this peer will serve.
+    pub tracks: Vec<String>,
 }
 
 /// The room's playhead, as the relay sees it.
@@ -114,6 +137,14 @@ pub enum ClientMsg {
     Do {
         command: Command,
     },
+    /// Announces what this peer can serve to the others over the local network.
+    /// `port` is where its file server listens; `None` withdraws the offer.
+    ///
+    /// The address is left to the relay — see [`PeerShare::endpoint`].
+    Share {
+        port: Option<u16>,
+        tracks: Vec<String>,
+    },
     Bye,
 }
 
@@ -148,6 +179,13 @@ pub enum ServerMsg {
         id: Option<String>,
         yours: bool,
     },
+    /// The room's whole sharing map, broadcast whenever it changes.
+    ///
+    /// A peer's own entry is included: it costs a few bytes and keeps one frame
+    /// correct for everybody, rather than each peer needing its own version.
+    Shares {
+        peers: Vec<PeerShare>,
+    },
     Error {
         code: String,
         message: String,
@@ -170,6 +208,10 @@ pub enum Event {
     Station {
         id: Option<String>,
         yours: bool,
+    },
+    /// Who in the room can serve which cached tracks over the local network.
+    Shares {
+        peers: Vec<PeerShare>,
     },
     Error {
         code: String,
@@ -293,6 +335,61 @@ mod tests {
         };
         let text = serde_json::to_string(&msg).unwrap();
         assert_eq!(text, r#"{"t":"queue","revision":0,"tracks":[]}"#);
+        assert_eq!(msg, serde_json::from_str::<ServerMsg>(&text).unwrap());
+    }
+
+    #[test]
+    fn a_share_announcement_carries_only_the_port() {
+        let msg = ClientMsg::Share {
+            port: Some(8788),
+            tracks: vec!["1".into(), "2".into()],
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(text, r#"{"t":"share","port":8788,"tracks":["1","2"]}"#);
+        assert!(
+            !text.contains("192.") && !text.contains("endpoint"),
+            "the peer must not name its own address: {text}"
+        );
+        assert_eq!(msg, serde_json::from_str::<ClientMsg>(&text).unwrap());
+    }
+
+    #[test]
+    fn withdrawing_an_offer_roundtrips() {
+        let msg = ClientMsg::Share {
+            port: None,
+            tracks: Vec::new(),
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(msg, serde_json::from_str::<ClientMsg>(&text).unwrap());
+    }
+
+    #[test]
+    fn the_sharing_map_roundtrips_through_json() {
+        let msg = ServerMsg::Shares {
+            peers: vec![
+                PeerShare {
+                    peer: 1,
+                    endpoint: "http://192.168.1.10:8788".into(),
+                    tracks: vec!["42".into()],
+                },
+                // IPv6 endpoints have to survive the round trip too, brackets
+                // and all.
+                PeerShare {
+                    peer: 2,
+                    endpoint: "http://[fe80::1]:8788".into(),
+                    tracks: Vec::new(),
+                },
+            ],
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(msg, serde_json::from_str::<ServerMsg>(&text).unwrap());
+    }
+
+    #[test]
+    fn an_empty_sharing_map_is_representable() {
+        let msg = ServerMsg::Shares { peers: Vec::new() };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(text, r#"{"t":"shares","peers":[]}"#);
         assert_eq!(msg, serde_json::from_str::<ServerMsg>(&text).unwrap());
     }
 }

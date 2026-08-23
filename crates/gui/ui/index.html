@@ -14,6 +14,7 @@
     <div class="connect">
       <button id="connect" class="primary">Подключиться</button>
     </div>
+    <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>
     <div id="status" class="status">не подключено</div>
   </header>
 
@@ -47,7 +48,27 @@
 
     <section class="panel">
       <h2>Очередь <span id="queue-count" class="dim"></span></h2>
+
+      <div class="row">
+        <button id="dl-track" title="оставить текущий трек на этом устройстве">&#8595; трек</button>
+        <button id="dl-queue" title="оставить всю очередь на этом устройстве">&#8595; очередь</button>
+        <button id="dl-cancel" class="hidden" title="забыть всё, что ещё не скачалось">отменить</button>
+      </div>
+
       <ul id="queue" class="list"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>На устройстве <span id="lib-count" class="dim"></span></h2>
+
+      <div class="row">
+        <button id="lib-play">Играть</button>
+        <button id="lib-queue">В очередь</button>
+        <button id="lib-refresh" title="перечитать папку с треками">&#8635;</button>
+      </div>
+
+      <ul id="library" class="list"></ul>
+      <p id="lib-hint" class="hint"></p>
     </section>
   </main>
 

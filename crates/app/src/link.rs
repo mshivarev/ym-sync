@@ -220,6 +220,18 @@ impl Link {
         self.out.send(ClientMsg::Do { command }).is_ok()
     }
 
+    /// Offers this machine's cached tracks to the rest of the room, or withdraws
+    /// the offer with `port: None`.
+    ///
+    /// Only the port goes out. The address is composed by the relay from the
+    /// socket this very message arrives on, which is the one address the room is
+    /// known to be able to reach — a machine with a VPN, a virtual switch and
+    /// Wi-Fi cannot pick that out from the inside.
+    #[must_use]
+    pub fn announce_share(&self, port: Option<u16>, tracks: Vec<String>) -> bool {
+        self.out.send(ClientMsg::Share { port, tracks }).is_ok()
+    }
+
     pub fn say_goodbye(&self) {
         let _ = self.out.send(ClientMsg::Bye);
     }
@@ -276,6 +288,11 @@ async fn read_loop(
             }
             Ok(ServerMsg::Station { id, yours }) => {
                 if events.send(Event::Station { id, yours }).is_err() {
+                    break;
+                }
+            }
+            Ok(ServerMsg::Shares { peers }) => {
+                if events.send(Event::Shares { peers }).is_err() {
                     break;
                 }
             }

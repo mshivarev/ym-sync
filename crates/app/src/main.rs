@@ -14,10 +14,12 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
 use ymsync::api::{self, Track, YandexMusic};
+use ymsync::cache::Cache;
 use ymsync::config::Config;
-use ymsync::engine::{self, Command as EngineCommand, Snapshot};
+use ymsync::engine::{Command as EngineCommand, Snapshot};
 use ymsync::fmt_ms;
 use ymsync::player::Player;
+use ymsync::session;
 use ymsync_proto::TrackRef;
 
 /// How often the status line is refreshed when nothing notable changes.
@@ -42,6 +44,17 @@ struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     room: Option<String>,
 
+    /// Держать комнату на этом устройстве: релей поднимается в этом же процессе
+    ///
+    /// Так же выглядит и прослушивание без интернета: комната живёт здесь,
+    /// очередь берётся из скачанного, никуда подключаться не нужно.
+    #[arg(long, global = true)]
+    host: bool,
+
+    /// Какой адрес сообщать остальным при --host (по умолчанию определяется сам)
+    #[arg(long, global = true, value_name = "ADDR")]
+    advertise: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -50,6 +63,12 @@ struct Cli {
 enum Command {
     /// Показать путь к конфигу и создать шаблон, если его нет
     Config,
+
+    /// Что скачано на это устройство: офлайн-библиотека
+    ///
+    /// Ничего не требует — ни сети, ни релея, ни токена.
+    #[command(alias = "library")]
+    Cache,
 
     /// Проверить весь путь до звука: токен, поиск, подпись ссылки, загрузка, декодирование
     Probe {
@@ -106,6 +125,10 @@ struct SourceArgs {
     /// «Моя волна»: бесконечная станция, очередь пополняется сама
     #[arg(long)]
     wave: bool,
+
+    /// Только скачанное на это устройство: очередь из офлайн-библиотеки, без сети
+    #[arg(long)]
+    offline: bool,
 }
 
 enum Source {
@@ -116,6 +139,8 @@ enum Source {
     Likes,
     /// Not a list at all: the engine follows the station and asks it for more.
     Wave,
+    /// Everything on this device's disk. The only source that needs no network.
+    Offline,
 }
 
 impl SourceArgs {
@@ -140,6 +165,9 @@ impl SourceArgs {
         if self.wave {
             return Ok(Some(Source::Wave));
         }
+        if self.offline {
+            return Ok(Some(Source::Offline));
+        }
         Ok(None)
     }
 }
@@ -163,9 +191,16 @@ async fn main() -> Result<()> {
     if let Some(room) = cli.room {
         cfg.room = room;
     }
+    if cli.host {
+        cfg.host.enabled = true;
+    }
+    if let Some(advertise) = cli.advertise {
+        cfg.host.advertise = advertise;
+    }
 
     match cli.command {
         Command::Config => show_config(&cfg, &config_path),
+        Command::Cache => show_cache(&cfg),
         Command::Probe { query } => probe(&cfg, &query).await,
         Command::Search { query, limit } => search(&cfg, &query.join(" "), limit).await,
         Command::Play { source } => {
@@ -178,26 +213,43 @@ async fn main() -> Result<()> {
 
 async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
     let api = Arc::new(YandexMusic::new(cfg.require_yandex_token()?)?);
+    // Opened before anything connects: with --offline this is where the queue
+    // comes from, and the engine plays out of the same cache.
+    let cache = session::open_cache(cfg)?;
 
     // Resolve the queue before touching audio or the relay, so a bad query fails
     // immediately instead of half-way into a session.
     let queue = match &source {
+        Some(Source::Offline) => offline_queue(&cache)?,
         Some(source) => resolve_queue(&api, source).await?,
         None => Vec::new(),
     };
 
     let player = Arc::new(Player::new(cfg.volume)?);
-    let handle = engine::spawn(cfg, Arc::clone(&api), player).await?;
+    let session = session::start(cfg, Arc::clone(&api), player, cache).await?;
+    let handle = session.handle();
 
     let start = handle.snapshot();
     println!(
         "⇄ комната «{}» на {} (участников: {}, смещение часов {:+} мс, rtt {} мс)",
         cfg.room,
-        cfg.relay,
+        // When hosting, the address others must use — not the `relay` line in the
+        // config, which is exactly what hosting ignores.
+        session.join_url().unwrap_or(&cfg.relay),
         start.peers,
         start.offset_ms.unwrap_or_default(),
         start.rtt_ms.unwrap_or_default(),
     );
+    if let Some(url) = session.join_url() {
+        println!("  комнату держит это устройство — остальным вписать relay = \"{url}\"");
+    }
+    if let Some(port) = session.share_port() {
+        println!(
+            "  раздаю своё скачанное на порту {port} ({} трек(ов), {})",
+            start.cached.len(),
+            fmt_bytes(start.cache_bytes)
+        );
+    }
 
     if queue.is_empty() {
         if matches!(source, Some(Source::Wave)) {
@@ -250,6 +302,28 @@ async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
                             last_status = Instant::now();
                         }
                         Action::Engine(command) => handle.send(command),
+                        // What to download is whatever is on screen, so these are
+                        // resolved against the latest snapshot rather than parsed.
+                        Action::Download { whole_queue } => {
+                            let snapshot = handle.snapshot();
+                            let tracks = if whole_queue {
+                                snapshot.queue
+                            } else {
+                                snapshot.track.into_iter().collect()
+                            };
+                            if tracks.is_empty() {
+                                println!("нечего скачивать");
+                            } else {
+                                handle.send(EngineCommand::Download { tracks });
+                            }
+                        }
+                        Action::Forget => match handle.snapshot().track {
+                            Some(track) => handle.send(EngineCommand::Forget {
+                                track_id: track.track_id,
+                            }),
+                            None => println!("сейчас ничего не играет"),
+                        },
+                        Action::Cache => print_cache(&handle.snapshot()),
                         Action::Unknown(text) => {
                             println!("не понял: {text} (введите ? для подсказки)");
                         }
@@ -279,8 +353,28 @@ async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
         }
     }
 
-    handle.send(EngineCommand::Shutdown);
-    handle.join().await
+    // Closes the engine first and the servers it brought up second, so a hosted
+    // relay is still listening to hear this player say goodbye.
+    session.shutdown().await
+}
+
+/// The queue that needs no network: everything on this device's disk.
+///
+/// The metadata was stored beside the audio for exactly this, so nothing is asked
+/// of Yandex — which is what makes `--offline --host` work on a train.
+fn offline_queue(cache: &Cache) -> Result<Vec<TrackRef>> {
+    let tracks: Vec<TrackRef> = cache
+        .tracks()
+        .into_iter()
+        .map(|entry| entry.track)
+        .collect();
+    if tracks.is_empty() {
+        bail!(
+            "на этом устройстве ничего не скачано: включите что-нибудь и нажмите d \
+             (или da — всю очередь), либо поставьте auto = true в [cache]"
+        );
+    }
+    Ok(tracks)
 }
 
 async fn resolve_queue(api: &YandexMusic, source: &Source) -> Result<Vec<TrackRef>> {
@@ -296,8 +390,9 @@ async fn resolve_queue(api: &YandexMusic, source: &Source) -> Result<Vec<TrackRe
         Source::Album(id) => api.album_tracks(id).await?,
         Source::Playlist(owner, kind) => api.playlist_tracks(owner, kind).await?,
         Source::Likes => api.liked_tracks().await?,
-        // The station is asked for tracks by the engine, as the queue runs down.
-        Source::Wave => Vec::new(),
+        // Neither asks Yandex anything: the station is asked by the engine as the
+        // queue runs down, and the offline library is built in `offline_queue`.
+        Source::Wave | Source::Offline => Vec::new(),
     };
     Ok(tracks.iter().map(Track::to_track_ref).collect())
 }
@@ -321,19 +416,58 @@ fn print_status(snapshot: &Snapshot) {
     } else {
         format!(" [{}/{}]", snapshot.index + 1, snapshot.queue.len())
     };
+    // Worth stating, because it is the difference between this track costing
+    // internet and costing nothing.
+    let origin = match snapshot.track.as_ref().map(|track| &track.track_id) {
+        Some(id) if snapshot.cached.contains(id) => " (с диска)",
+        Some(id) if snapshot.on_lan.contains(id) => " (из комнаты)",
+        _ => "",
+    };
 
     print!(
-        "{} {title}{place}  {position}  участников {}",
+        "{} {title}{place}  {position}{origin}  участников {}",
         if snapshot.playing { "▶" } else { "⏸" },
         snapshot.peers
     );
     if let Some(drift_ms) = snapshot.drift_ms {
         print!("  рассинхрон {drift_ms:+} мс, rtt {} мс", snapshot.rtt_ms.unwrap_or_default());
     }
+    if let Some(id) = &snapshot.downloading {
+        print!("  ↓ {id}");
+        if snapshot.download_queue > 0 {
+            print!(" (+{})", snapshot.download_queue);
+        }
+    }
     if let Some(notice) = &snapshot.notice {
         print!("  · {notice}");
     }
     println!();
+}
+
+/// What this device has on disk, and what the room can supply without internet.
+fn print_cache(snapshot: &Snapshot) {
+    println!(
+        "на диске: {} трек(ов), {} {}",
+        snapshot.cached.len(),
+        fmt_bytes(snapshot.cache_bytes),
+        limit_phrase(snapshot.cache_limit_bytes),
+    );
+    if let Some(id) = &snapshot.downloading {
+        print!("скачиваю: {id}");
+        if snapshot.download_queue > 0 {
+            print!(", в очереди ещё {}", snapshot.download_queue);
+        }
+        println!();
+    }
+    match snapshot.share_port {
+        Some(port) => println!("раздаю остальным: порт {port}"),
+        None => println!("раздача выключена"),
+    }
+    println!(
+        "готовы отдать по сети: {} участник(ов), {} трек(ов)",
+        snapshot.sharing_peers,
+        snapshot.on_lan.len()
+    );
 }
 
 /// What a typed line means.
@@ -343,6 +477,14 @@ enum Action {
     Help,
     Status,
     Engine(EngineCommand),
+    /// Keep on this device: the current track, or everything queued.
+    Download {
+        whole_queue: bool,
+    },
+    /// Delete the current track from this device.
+    Forget,
+    /// Report the offline library and what the room can supply over the network.
+    Cache,
     Unknown(String),
 }
 
@@ -359,6 +501,11 @@ fn parse_input(line: &str) -> Action {
         "p" | "pause" => return Action::Engine(EngineCommand::TogglePause),
         "n" | "next" => return Action::Engine(EngineCommand::Next),
         "b" | "prev" => return Action::Engine(EngineCommand::Prev),
+        "d" | "download" => return Action::Download { whole_queue: false },
+        "da" => return Action::Download { whole_queue: true },
+        "dc" => return Action::Engine(EngineCommand::CancelDownloads),
+        "f" | "forget" => return Action::Forget,
+        "c" | "cache" => return Action::Cache,
         _ => {}
     }
 
@@ -406,6 +553,30 @@ fn print_controls() {
         "команды: p — пауза/продолжить · n / b — следующий / предыдущий · #3 — трек из очереди · \
          <сек> — перейти · +30 / -10 — смещение · v 70 — громкость · q — выход"
     );
+    println!(
+        "офлайн:  d — оставить трек на устройстве · da — всю очередь · dc — отменить скачивание · \
+         f — удалить трек с устройства · c — что на диске"
+    );
+}
+
+/// Binary units, because that is what the file manager beside this window says.
+fn fmt_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mib = bytes as f64 / MIB;
+    if mib >= 1024.0 {
+        format!("{:.1} ГиБ", mib / 1024.0)
+    } else {
+        format!("{mib:.1} МиБ")
+    }
+}
+
+/// How to describe a cache ceiling, where 0 means there is none.
+fn limit_phrase(limit_bytes: u64) -> String {
+    if limit_bytes == 0 {
+        "без ограничения".to_string()
+    } else {
+        format!("из {}", fmt_bytes(limit_bytes))
+    }
 }
 
 /// Reads stdin in its own task: `Lines::next_line` is not cancel-safe, so
@@ -448,6 +619,67 @@ fn show_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
     println!();
     println!("порог коррекции: {} мс", cfg.sync.seek_threshold_ms);
     println!("сверка позиции : каждые {} мс", cfg.sync.correction_interval_ms);
+    println!();
+    println!("кэш треков     : {}", cfg.cache.directory()?.display());
+    println!(
+        "                 {} · сохранять всё, что играет: {}",
+        limit_phrase(cfg.cache.limit_bytes()),
+        present(cfg.cache.auto)
+    );
+    println!(
+        "раздача по сети: {}",
+        match (cfg.share.enabled, cfg.share.port) {
+            (false, _) => "выключена".to_string(),
+            (true, 0) => "включена, порт выберет система".to_string(),
+            (true, port) => format!("включена, порт {port}"),
+        }
+    );
+    println!(
+        "комната здесь  : {}",
+        if cfg.host.enabled {
+            format!("да, слушаем {}:{}", cfg.host.bind, cfg.host.port)
+        } else {
+            format!("нет, подключаемся к {}", cfg.relay)
+        }
+    );
+    Ok(())
+}
+
+/// The offline library, listed without touching the network, the relay or Yandex —
+/// so this command still answers on a machine with no internet at all.
+fn show_cache(cfg: &Config) -> Result<()> {
+    let cache = session::open_cache(cfg)?;
+    let tracks = cache.tracks();
+
+    println!("скачано на это устройство: {}", cache.directory().display());
+    println!(
+        "{} трек(ов), {} {}",
+        tracks.len(),
+        fmt_bytes(cache.total_bytes()),
+        limit_phrase(cache.limit_bytes())
+    );
+    if tracks.is_empty() {
+        println!();
+        println!(
+            "пусто. Включите что-нибудь (ymsync play --album <id>) и нажмите d — \
+             текущий трек, da — всю очередь"
+        );
+        return Ok(());
+    }
+
+    println!();
+    for (index, entry) in tracks.iter().enumerate() {
+        println!(
+            "{:2}. {:>12}  {:>10}  {}{}",
+            index + 1,
+            entry.track.track_id,
+            fmt_bytes(entry.bytes),
+            entry.track,
+            if entry.pinned { "  (скачан)" } else { "" }
+        );
+    }
+    println!();
+    println!("играть без интернета: ymsync play --offline --host");
     Ok(())
 }
 
@@ -667,5 +899,52 @@ mod tests {
         assert_eq!(parse_input("+abc"), Action::Unknown("+abc".to_string()));
         assert_eq!(parse_input("nan"), Action::Unknown("nan".to_string()));
         assert_eq!(parse_input("inf"), Action::Unknown("inf".to_string()));
+    }
+
+    /// Downloading is about what is on screen, so the parser only says *which*
+    /// tracks are meant; the loop turns that into ids.
+    #[test]
+    fn offline_commands_parse() {
+        assert_eq!(
+            parse_input("d"),
+            Action::Download { whole_queue: false }
+        );
+        assert_eq!(
+            parse_input("download"),
+            Action::Download { whole_queue: false }
+        );
+        assert_eq!(parse_input("da"), Action::Download { whole_queue: true });
+        assert_eq!(
+            parse_input("dc"),
+            Action::Engine(EngineCommand::CancelDownloads)
+        );
+        assert_eq!(parse_input("f"), Action::Forget);
+        assert_eq!(parse_input("forget"), Action::Forget);
+        assert_eq!(parse_input("c"), Action::Cache);
+        assert_eq!(parse_input("cache"), Action::Cache);
+    }
+
+    /// `d` and its friends must not swallow anything that used to mean a seek or
+    /// a volume change.
+    #[test]
+    fn offline_commands_do_not_shadow_the_older_ones() {
+        assert_eq!(parse_input("db"), Action::Unknown("db".to_string()));
+        assert_eq!(parse_input("cc"), Action::Unknown("cc".to_string()));
+        assert_eq!(parse_input("v 70"), Action::Engine(EngineCommand::SetVolume(0.7)));
+        assert_eq!(parse_input("30"), Action::Engine(EngineCommand::SeekTo(30_000)));
+    }
+
+    #[test]
+    fn sizes_are_reported_in_binary_units() {
+        assert_eq!(fmt_bytes(0), "0.0 МиБ");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 МиБ");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.0 ГиБ");
+    }
+
+    /// 0 is how the config says "no ceiling", and it must not print as "из 0".
+    #[test]
+    fn an_absent_cache_limit_is_named_rather_than_shown_as_zero() {
+        assert_eq!(limit_phrase(0), "без ограничения");
+        assert_eq!(limit_phrase(8 * 1024 * 1024 * 1024), "из 8.0 ГиБ");
     }
 }

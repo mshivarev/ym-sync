@@ -15,22 +15,27 @@
 //! so an endless station needs a peer to resolve batches and push them in; the
 //! peer that switched the wave on becomes that feeder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tracing::debug;
 use ymsync_proto::{
-    Correction, Event, PlaybackState, SyncParams, TrackRef, decide, target_position_ms, trust_clock,
+    Correction, Event, PeerShare, PlaybackState, SyncParams, TrackRef, decide, target_position_ms,
+    trust_clock,
 };
 
 use crate::api::{Track, YandexMusic};
+use crate::cache::{Cache, Insertion};
 use crate::config::Config;
 use crate::link::Link;
 use crate::playback::{AudioSource, Playback};
+use crate::share;
 
 /// A snapshot whose seq is this far below the last one means the relay restarted
 /// and began a fresh counter, rather than a frame arriving late.
@@ -41,6 +46,13 @@ const SEQ_RESTART_GAP: u64 = 64;
 /// after this many attempts.
 const MAX_LOAD_ATTEMPTS: u8 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Shortest gap between telling the room what this machine has cached.
+///
+/// Downloading an album finishes a track every few seconds, and each one changes
+/// the list. Without a floor here every peer in the room would get a fresh copy
+/// of the whole list that often, so changes are coalesced instead.
+const ANNOUNCE_MIN_GAP: Duration = Duration::from_secs(2);
 
 /// Quiet period after a hard seek.
 ///
@@ -94,6 +106,15 @@ pub enum Command {
     /// Recalibrates this device's reporting lag while it plays, so the figure can
     /// be dialled in against the drift on screen instead of through a reconnect.
     SetPositionBias(i64),
+    /// Keeps these tracks on this device, so they play with no network at all.
+    ///
+    /// Queued rather than started at once: one download at a time, behind
+    /// whatever playback needs — see [`Engine::network_free`].
+    Download { tracks: Vec<TrackRef> },
+    /// Forgets everything still waiting to be downloaded. What is on disk stays.
+    CancelDownloads,
+    /// Deletes a downloaded track from this device.
+    Forget { track_id: String },
     Shutdown,
 }
 
@@ -121,6 +142,32 @@ pub struct Snapshot {
     pub drift_ms: Option<i64>,
     pub rtt_ms: Option<i64>,
     pub offset_ms: Option<i64>,
+    /// Ids of the tracks on this device's disk.
+    ///
+    /// Behind an `Arc` because the whole list is cloned into every snapshot
+    /// several times a second, and a well-used cache runs into the thousands.
+    pub cached: Arc<Vec<String>>,
+    /// Bumped whenever `cached` changes, so a front end can skip re-sending a
+    /// list that has not moved.
+    pub cache_revision: u64,
+    pub cache_bytes: u64,
+    /// 0 means no limit.
+    pub cache_limit_bytes: u64,
+    /// The track being downloaded for offline use, if any.
+    pub downloading: Option<String>,
+    /// How many more are waiting behind it.
+    pub download_queue: usize,
+    /// How many peers in the room are offering cached tracks over the local
+    /// network.
+    pub sharing_peers: usize,
+    /// Ids the room can supply over the local network, whoever holds them.
+    /// A front end uses this to show that a track will cost no internet.
+    pub on_lan: Arc<Vec<String>>,
+    /// The port this machine serves its own cache on, if it is sharing.
+    pub share_port: Option<u16>,
+    /// Set when this app is running the room's relay itself; the address others
+    /// should connect to.
+    pub hosting: Option<String>,
     /// Last thing worth telling the user about.
     pub notice: Option<String>,
 }
@@ -130,6 +177,7 @@ pub struct Snapshot {
 pub struct Handle {
     commands: mpsc::UnboundedSender<Command>,
     snapshots: watch::Receiver<Snapshot>,
+    cache: Arc<Cache>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -147,6 +195,15 @@ impl Handle {
         self.snapshots.clone()
     }
 
+    /// This device's downloaded tracks.
+    ///
+    /// The way to fill a queue with no network: the metadata was stored next to
+    /// the audio, so nothing has to be asked of Yandex. Reads the in-memory index
+    /// only, which is why the Android front end may call it from its UI thread.
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
+    }
+
     /// Waits for the loop to finish — after [`Command::Shutdown`], or when the
     /// relay connection dies.
     pub async fn join(self) -> Result<()> {
@@ -154,22 +211,46 @@ impl Handle {
     }
 }
 
+/// What a front end hands the engine besides the configuration.
+///
+/// Assembled by [`crate::session::start`], which is what every front end actually
+/// calls: hosting a room and serving cached tracks both have to be set up before
+/// the engine connects, and doing that in one place keeps the three front ends
+/// from each getting it subtly wrong.
+pub struct Wiring {
+    pub api: Arc<YandexMusic>,
+    pub player: Arc<dyn Playback>,
+    pub cache: Arc<Cache>,
+    /// Where to connect. Not `cfg.relay` when this app hosts the room itself.
+    pub relay_url: String,
+    /// Port the local file server listens on, to be announced to the room.
+    pub share_port: Option<u16>,
+    /// The address to give other people, when this app is hosting.
+    pub hosting: Option<String>,
+}
+
 /// Connects to the relay and starts the loop.
-pub async fn spawn(
-    cfg: &Config,
-    api: Arc<YandexMusic>,
-    player: Arc<dyn Playback>,
-) -> Result<Handle> {
-    let room_token = cfg.require_room_token()?;
+pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
+    let Wiring {
+        api,
+        player,
+        cache,
+        relay_url,
+        share_port,
+        hosting,
+    } = wiring;
+
+    let room_token = cfg.require_room_token()?.to_string();
     let (link, events) = Link::connect(
-        &cfg.relay,
+        &relay_url,
         &cfg.room,
-        room_token,
+        &room_token,
         Duration::from_secs(cfg.sync.clock_probe_secs),
     )
     .await?;
 
     let peers = link.peers_at_join();
+    let cached = Arc::new(cache.ids());
     let (snapshots, snapshot_rx) = watch::channel(Snapshot {
         connected: true,
         peers,
@@ -187,11 +268,25 @@ pub async fn spawn(
         drift_ms: None,
         rtt_ms: link.clock().rtt_ms(),
         offset_ms: link.clock().offset_ms(),
+        cached: Arc::clone(&cached),
+        cache_revision: 0,
+        cache_bytes: cache.total_bytes(),
+        cache_limit_bytes: cache.limit_bytes(),
+        downloading: None,
+        download_queue: 0,
+        sharing_peers: 0,
+        on_lan: Arc::new(Vec::new()),
+        share_port,
+        hosting: hosting.clone(),
         notice: None,
     });
 
     let engine = Engine {
         api,
+        http: share::client()?,
+        cache: Arc::clone(&cache),
+        auto_cache: cfg.cache.auto,
+        room_token,
         player,
         link,
         params: cfg.sync.params(),
@@ -205,6 +300,17 @@ pub async fn spawn(
         loading: None,
         prefetched: None,
         prefetching: None,
+        downloads: VecDeque::new(),
+        downloading: None,
+        shares: Vec::new(),
+        share_port,
+        // True from the start: the room has not been told anything yet, and even
+        // an empty cache is worth stating so a peer knows where it stands.
+        share_dirty: true,
+        last_announce: None,
+        cached,
+        cache_revision: 0,
+        hosting,
         drift_ms: None,
         position_bias_ms: cfg.sync.position_bias_ms,
         last_seek: None,
@@ -223,6 +329,7 @@ pub async fn spawn(
     Ok(Handle {
         commands,
         snapshots: snapshot_rx,
+        cache,
         task,
     })
 }
@@ -232,6 +339,11 @@ enum Internal {
     Loaded {
         track_id: String,
         error: Option<String>,
+        /// Where the audio came from, so the user can see when the room supplied
+        /// it instead of the internet.
+        origin: Option<Origin>,
+        /// Whether it landed on disk, which is what moves the shared list.
+        stored: bool,
     },
     /// A transient failure earned another try.
     Retry {
@@ -247,8 +359,29 @@ enum Internal {
     /// speak up then.
     Prefetched {
         track_id: String,
-        ready: Option<(TrackRef, AudioSource)>,
+        ready: Option<(TrackRef, AudioSource, Origin)>,
+        stored: bool,
     },
+    /// One track finished downloading for offline use.
+    Downloaded {
+        track_id: String,
+        label: String,
+        origin: Option<Origin>,
+        error: Option<String>,
+        /// The cache had to ignore its limit because everything in it was
+        /// downloaded deliberately.
+        over_limit: bool,
+    },
+}
+
+/// Where a track's audio came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Already on this disk. No network at all — this is what offline play is.
+    Cache,
+    /// Another player in the room, over the local network.
+    Peer,
+    Yandex,
 }
 
 /// A track fetched ahead of time, waiting for the room to reach it.
@@ -258,6 +391,9 @@ struct Prefetched {
     /// As the API resolved it, which is what gets staged.
     track: TrackRef,
     source: AudioSource,
+    /// Kept so the notice can still say where the audio came from once the room
+    /// reaches this track.
+    origin: Origin,
 }
 
 /// An endless station this peer is feeding into the room.
@@ -275,6 +411,14 @@ struct Station {
 
 struct Engine {
     api: Arc<YandexMusic>,
+    /// For pulling tracks off other players on the local network. Separate from
+    /// the Yandex client because a peer answers at once or not at all.
+    http: reqwest::Client,
+    cache: Arc<Cache>,
+    /// Keep every track that plays, not just the ones asked for by name.
+    auto_cache: bool,
+    /// Also the credential the file server checks, so a peer fetch can present it.
+    room_token: String,
     player: Arc<dyn Playback>,
     link: Link,
     params: SyncParams,
@@ -301,6 +445,25 @@ struct Engine {
     prefetched: Option<Prefetched>,
     /// Which track a prefetch is in flight for.
     prefetching: Option<String>,
+
+    /// Tracks the user asked to keep on this device, oldest request first.
+    downloads: VecDeque<TrackRef>,
+    /// The download in flight.
+    downloading: Option<String>,
+
+    /// Who in the room is offering cached tracks, as the relay last described it.
+    shares: Vec<PeerShare>,
+    /// The port this machine serves its own cache on.
+    share_port: Option<u16>,
+    /// The cache has changed and the room has not been told yet.
+    share_dirty: bool,
+    last_announce: Option<std::time::Instant>,
+    /// Cached ids, as last published in a snapshot.
+    cached: Arc<Vec<String>>,
+    cache_revision: u64,
+    /// Set when this app runs the room's relay: the address to hand out.
+    hosting: Option<String>,
+
     drift_ms: Option<i64>,
     /// Cancels a backend's constant reporting lag; see [`crate::config::SyncConfig`].
     position_bias_ms: i64,
@@ -463,6 +626,53 @@ impl Engine {
                 self.notice = Some(format!("поправка позиции: {ms} мс"));
             }
 
+            Command::Download { tracks } => {
+                let mut queued = 0;
+                let mut already = 0;
+                for track in tracks {
+                    if self.cache.has(&track.track_id) {
+                        already += 1;
+                        continue;
+                    }
+                    let known = self.downloading.as_deref() == Some(track.track_id.as_str())
+                        || self.downloads.iter().any(|t| t.track_id == track.track_id);
+                    if known {
+                        continue;
+                    }
+                    self.downloads.push_back(track);
+                    queued += 1;
+                }
+                self.notice = Some(match (queued, already) {
+                    (0, 0) => "нечего скачивать".to_string(),
+                    (0, _) => "всё это уже скачано".to_string(),
+                    (1, _) => "скачиваю 1 трек".to_string(),
+                    (n, 0) => format!("скачиваю {n} треков"),
+                    (n, already) => format!("скачиваю {n} треков, {already} уже есть"),
+                });
+            }
+
+            Command::CancelDownloads => {
+                let dropped = self.downloads.len();
+                self.downloads.clear();
+                // The one in flight is left to finish: it is nearly free by now,
+                // and cancelling a request mid-body gains nothing.
+                self.notice = Some(match dropped {
+                    0 => "очередь скачивания пуста".to_string(),
+                    n => format!("отменил скачивание {n} треков"),
+                });
+            }
+
+            Command::Forget { track_id } => {
+                self.downloads.retain(|t| t.track_id != track_id);
+                match self.cache.remove(&track_id) {
+                    Ok(()) => {
+                        self.refresh_cache_view();
+                        self.notice = Some("удалил трек с устройства".to_string());
+                    }
+                    Err(err) => self.notice = Some(format!("не удалось удалить: {err:#}")),
+                }
+            }
+
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -515,25 +725,95 @@ impl Engine {
             .prefetched
             .take_if(|ready| ready.track_id == track.track_id)
         {
-            let Prefetched { track, source, .. } = ready;
+            let Prefetched {
+                track,
+                source,
+                origin,
+                ..
+            } = ready;
             tokio::spawn(async move {
                 let error = stage_track(&player, track, source)
                     .await
                     .err()
                     .map(|err| format!("{label}: {err:#}"));
-                let _ = internal_tx.send(Internal::Loaded { track_id, error });
+                let _ = internal_tx.send(Internal::Loaded {
+                    track_id,
+                    error,
+                    origin: Some(origin),
+                    // Whatever it cost was accounted for when it was prefetched.
+                    stored: false,
+                });
             });
             return;
         }
 
-        let api = Arc::clone(&self.api);
+        let fetch = self.fetch_for(&track.track_id, self.auto_cache, false);
+        let want = track.clone();
         tokio::spawn(async move {
-            let error = load_track(&api, &player, &track_id)
-                .await
-                .err()
-                .map(|err| format!("{label}: {err:#}"));
-            let _ = internal_tx.send(Internal::Loaded { track_id, error });
+            let outcome = fetch_source(&fetch, &want).await;
+            let (error, origin, stored) = match outcome {
+                Err(err) => (Some(format!("{label}: {err:#}")), None, false),
+                Ok(Fetched {
+                    track,
+                    source,
+                    origin,
+                    stored,
+                }) => {
+                    let error = stage_track(&player, track, source)
+                        .await
+                        .err()
+                        .map(|err| format!("{label}: {err:#}"));
+                    (error, Some(origin), stored)
+                }
+            };
+            let _ = internal_tx.send(Internal::Loaded {
+                track_id,
+                error,
+                origin,
+                stored,
+            });
         });
+    }
+
+    /// Whether the one network slot is free.
+    ///
+    /// Yandex answers HTTP 429 «Concurrency limit exceeded» when one account pulls
+    /// two streams at once, so the current track, the next one and anything being
+    /// downloaded for offline use all queue behind this single gate. Playback has
+    /// the first claim on it: filling the offline library must never be the reason
+    /// a track starts late.
+    fn network_free(&self) -> bool {
+        self.loading.is_none() && self.prefetching.is_none() && self.downloading.is_none()
+    }
+
+    /// Assembles what a background fetch needs, including who in the room can
+    /// supply this track without going to the internet.
+    fn fetch_for(&self, track_id: &str, store: bool, pinned: bool) -> Fetch {
+        Fetch {
+            api: Arc::clone(&self.api),
+            http: self.http.clone(),
+            cache: Arc::clone(&self.cache),
+            player: Arc::clone(&self.player),
+            room_token: self.room_token.clone(),
+            peers: self.peers_with(track_id),
+            store,
+            pinned,
+        }
+    }
+
+    /// Endpoints that say they hold this track.
+    ///
+    /// Our own entry is in the room's map too and is deliberately not filtered
+    /// out: we only ever announce what is cached here, so an id that reached this
+    /// point — having already missed the cache — cannot match it. In the small
+    /// window after an eviction it can, and then our own file server answers 404
+    /// and the fetch moves on, which costs one request on loopback.
+    fn peers_with(&self, track_id: &str) -> Vec<String> {
+        self.shares
+            .iter()
+            .filter(|share| share.tracks.iter().any(|id| id == track_id))
+            .map(|share| share.endpoint.clone())
+            .collect()
     }
 
     /// The queue entry after the one the room is on.
@@ -545,11 +825,9 @@ impl Engine {
     /// Fetches the next queue entry while the current one plays, so the change of
     /// track costs no network.
     ///
-    /// Strictly one fetch at a time. Yandex answers HTTP 429 «Concurrency limit
-    /// exceeded» when one account pulls two streams at once, so this waits for the
-    /// current track to finish loading rather than racing it.
+    /// Strictly one fetch at a time — see [`Engine::network_free`].
     fn prefetch_next(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
-        if self.loading.is_some() || self.prefetching.is_some() {
+        if !self.network_free() {
             return;
         }
         let Some(next) = self.next_track() else {
@@ -581,15 +859,103 @@ impl Engine {
         }
 
         self.prefetching = Some(next.track_id.clone());
-        let api = Arc::clone(&self.api);
-        let player = Arc::clone(&self.player);
+        let fetch = self.fetch_for(&next.track_id, self.auto_cache, false);
         let internal = internal.clone();
         let track_id = next.track_id.clone();
 
         tokio::spawn(async move {
-            let ready = fetch_source(&api, &player, &track_id).await.ok();
-            let _ = internal.send(Internal::Prefetched { track_id, ready });
+            let fetched = fetch_source(&fetch, &next).await.ok();
+            let stored = fetched.as_ref().is_some_and(|f| f.stored);
+            let _ = internal.send(Internal::Prefetched {
+                track_id,
+                ready: fetched.map(|f| (f.track, f.source, f.origin)),
+                stored,
+            });
         });
+    }
+
+    /// Starts the next offline download, if the network is not needed for
+    /// playback right now.
+    fn pump_downloads(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        if !self.network_free() {
+            return;
+        }
+        // Anything that arrived by another route in the meantime — the room played
+        // it, or a neighbour's copy came through the ordinary load — is already
+        // done.
+        while self
+            .downloads
+            .front()
+            .is_some_and(|track| self.cache.has(&track.track_id))
+        {
+            self.downloads.pop_front();
+        }
+        let Some(track) = self.downloads.pop_front() else {
+            return;
+        };
+
+        self.downloading = Some(track.track_id.clone());
+        let fetch = self.fetch_for(&track.track_id, true, true);
+        let internal = internal.clone();
+        let track_id = track.track_id.clone();
+        let label = track.to_string();
+
+        tokio::spawn(async move {
+            let message = match download(&fetch, &track).await {
+                Ok((origin, insertion)) => Internal::Downloaded {
+                    track_id,
+                    label,
+                    origin: Some(origin),
+                    error: None,
+                    over_limit: insertion.over_limit,
+                },
+                Err(err) => Internal::Downloaded {
+                    track_id,
+                    label,
+                    origin: None,
+                    error: Some(format!("{err:#}")),
+                    over_limit: false,
+                },
+            };
+            let _ = internal.send(message);
+        });
+    }
+
+    /// Re-reads what is cached, for the snapshot and for the room.
+    ///
+    /// Called only when the cache actually moved: it clones every id, and a
+    /// well-used cache holds thousands.
+    fn refresh_cache_view(&mut self) {
+        self.cached = Arc::new(self.cache.ids());
+        self.cache_revision += 1;
+        self.share_dirty = true;
+    }
+
+    /// Tells the room what this machine can serve, at most every
+    /// [`ANNOUNCE_MIN_GAP`].
+    fn announce_share(&mut self) {
+        if !self.share_dirty {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_announce
+            && now.duration_since(last) < ANNOUNCE_MIN_GAP
+        {
+            return;
+        }
+
+        // Sharing off means an empty offer rather than silence, so a peer that saw
+        // an earlier offer knows it has been withdrawn.
+        let tracks = match self.share_port {
+            Some(_) => (*self.cached).clone(),
+            None => Vec::new(),
+        };
+        if !self.link.announce_share(self.share_port, tracks) {
+            self.connected = false;
+            return;
+        }
+        self.share_dirty = false;
+        self.last_announce = Some(now);
     }
 
     fn handle_internal(&mut self, message: Internal, internal: &mpsc::UnboundedSender<Internal>) {
@@ -632,19 +998,62 @@ impl Engine {
                 }
             }
 
-            Internal::Prefetched { track_id, ready } => {
+            Internal::Prefetched {
+                track_id,
+                ready,
+                stored,
+            } => {
                 if self.prefetching.as_deref() != Some(track_id.as_str()) {
                     return;
                 }
                 self.prefetching = None;
+                if stored {
+                    self.refresh_cache_view();
+                }
                 // A failure stays quiet on purpose: this track may never be
                 // reached, and the ordinary load will report it if it is.
-                if let Some((track, source)) = ready {
+                if let Some((track, source, origin)) = ready {
                     self.prefetched = Some(Prefetched {
                         track_id,
                         track,
                         source,
+                        origin,
                     });
+                }
+            }
+
+            Internal::Downloaded {
+                track_id,
+                label,
+                origin,
+                error,
+                over_limit,
+            } => {
+                if self.downloading.as_deref() == Some(track_id.as_str()) {
+                    self.downloading = None;
+                }
+                match error {
+                    Some(error) => {
+                        self.notice = Some(format!("не удалось скачать {label}: {error}"));
+                    }
+                    None => {
+                        self.refresh_cache_view();
+                        let left = self.downloads.len();
+                        let source = match origin {
+                            Some(Origin::Peer) => " (из локальной сети)",
+                            _ => "",
+                        };
+                        self.notice = Some(if over_limit {
+                            format!(
+                                "скачал {label}{source}, но кеш уже больше лимита — \
+                                 удалите что-нибудь или поднимите cache.limit_gb"
+                            )
+                        } else if left > 0 {
+                            format!("скачал {label}{source}, осталось {left}")
+                        } else {
+                            format!("скачал {label}{source}")
+                        });
+                    }
                 }
             }
 
@@ -658,12 +1067,20 @@ impl Engine {
                 }
             }
 
-            Internal::Loaded { track_id, error } => {
+            Internal::Loaded {
+                track_id,
+                error,
+                origin,
+                stored,
+            } => {
                 // A newer request overtook this one.
                 if self.loading.as_deref() != Some(track_id.as_str()) {
                     return;
                 }
                 self.loading = None;
+                if stored {
+                    self.refresh_cache_view();
+                }
 
                 if let Some(error) = error {
                     let attempts = self.attempts.entry(track_id.clone()).or_insert(0);
@@ -693,7 +1110,20 @@ impl Engine {
                 }
 
                 self.attempts.remove(&track_id);
-                self.notice = None;
+                self.notice = match origin {
+                    // Worth saying: it means this track cost nothing and would
+                    // have played with the internet unplugged.
+                    Some(Origin::Cache) => Some("играю с устройства".to_string()),
+                    Some(Origin::Peer) => Some("взял у участника по локальной сети".to_string()),
+                    _ => None,
+                };
+                // Records that this track played, which is what eviction sorts
+                // by. Off the loop, since it writes a file.
+                if matches!(origin, Some(Origin::Cache)) {
+                    let cache = Arc::clone(&self.cache);
+                    let id = track_id.clone();
+                    tokio::task::spawn_blocking(move || cache.touch(&id));
+                }
                 // The next correction tick puts the playhead where the room is.
             }
         }
@@ -773,17 +1203,40 @@ impl Engine {
                 }
             }
 
+            Event::Shares { peers } => {
+                // A track that was being sat out because this account cannot play
+                // it may now be reachable from somebody who can: a neighbour's
+                // copy plays regardless of what this account is licensed for. So a
+                // new map is a reason to try again.
+                let newly_offered: Vec<String> = peers
+                    .iter()
+                    .flat_map(|share| share.tracks.iter())
+                    .filter(|id| self.unavailable.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                for id in newly_offered {
+                    self.unavailable.remove(&id);
+                    self.attempts.remove(&id);
+                }
+                self.shares = peers;
+            }
+
             Event::Error { code, message } => {
                 self.notice = Some(format!("релей сообщил об ошибке ({code}): {message}"));
             }
         }
     }
 
-    /// One pass: keep a station fed, fetch the next track, then pull the playhead
-    /// onto the room's.
+    /// One pass: keep a station fed, keep the room told what we have, fetch the
+    /// next track, download what was asked for, then pull the playhead onto the
+    /// room's.
     fn tick(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
         self.feed_station(internal);
+        self.announce_share();
         self.prefetch_next(internal);
+        // After the prefetch, deliberately: the next track the room will play
+        // matters more than filling the offline library.
+        self.pump_downloads(internal);
         self.correct();
     }
 
@@ -929,33 +1382,263 @@ impl Engine {
             drift_ms: self.drift_ms,
             rtt_ms: self.link.clock().rtt_ms(),
             offset_ms: self.link.clock().offset_ms(),
+            cached: Arc::clone(&self.cached),
+            cache_revision: self.cache_revision,
+            cache_bytes: self.cache.total_bytes(),
+            cache_limit_bytes: self.cache.limit_bytes(),
+            downloading: self.downloading.clone(),
+            download_queue: self.downloads.len(),
+            sharing_peers: self
+                .shares
+                .iter()
+                .filter(|share| !share.tracks.is_empty())
+                .count(),
+            on_lan: Arc::new(self.lan_ids()),
+            share_port: self.share_port,
+            hosting: self.hosting.clone(),
             notice: self.notice.clone(),
         });
     }
+
+    /// Every track id the room can supply without the internet, deduplicated.
+    fn lan_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .shares
+            .iter()
+            .flat_map(|share| share.tracks.iter().cloned())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
+/// Everything a background fetch needs, in a form that can be moved into a
+/// spawned task without borrowing the engine.
+#[derive(Clone)]
+struct Fetch {
+    api: Arc<YandexMusic>,
+    http: reqwest::Client,
+    cache: Arc<Cache>,
+    player: Arc<dyn Playback>,
+    /// The room's secret, which the peers' file servers check.
+    room_token: String,
+    /// Endpoints that say they hold this track.
+    peers: Vec<String>,
+    /// Keep the bytes on disk even when they came from Yandex.
+    store: bool,
+    /// Mark what is stored as a deliberate download, safe from eviction.
+    pinned: bool,
+}
+
+/// A track ready to be handed to the player.
+struct Fetched {
+    track: TrackRef,
+    source: AudioSource,
+    origin: Origin,
+    /// Whether this fetch put something on disk.
+    stored: bool,
 }
 
 /// Resolves a track and produces whatever this backend wants to be handed.
 ///
-/// Split out from [`load_track`] so the same work can be done ahead of time for
-/// the next track in the queue.
-async fn fetch_source(
-    api: &YandexMusic,
-    player: &Arc<dyn Playback>,
-    track_id: &str,
-) -> Result<(TrackRef, AudioSource)> {
+/// The order of preference, and why it is that order:
+///
+/// 1. **This device's cache.** No network at all, which is exactly what makes
+///    offline listening work — and note that the metadata comes from the sidecar,
+///    so not even a lookup is needed.
+/// 2. **A peer on the local network.** Faster than the internet, spends no Yandex
+///    request (and so cannot trip the concurrency limit), and plays tracks this
+///    account is not licensed for, because the bytes come from an account that is.
+/// 3. **Yandex.**
+///
+/// `want` is the track as the room's queue describes it, which is why step 2 needs
+/// no lookup either: a peer's file server carries audio, not metadata.
+async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched> {
+    let id = want.track_id.as_str();
+
+    if let Some(cached) = fetch.cache.track(id) {
+        return Ok(Fetched {
+            track: cached,
+            source: from_cache(fetch, id).await?,
+            origin: Origin::Cache,
+            stored: false,
+        });
+    }
+
+    if !fetch.peers.is_empty() {
+        match from_peers(fetch, want).await {
+            Ok((source, stored)) => {
+                return Ok(Fetched {
+                    track: want.clone(),
+                    source,
+                    origin: Origin::Peer,
+                    stored,
+                });
+            }
+            // Not fatal: the peer may have evicted it, or gone. Yandex is next.
+            Err(err) => debug!(track = id, "no luck on the local network: {err:#}"),
+        }
+    }
+
+    let (track, url) = yandex_stream(&fetch.api, id).await?;
+
+    // Straight through, without ever holding the whole track, when nothing needs
+    // the bytes: that is how a streaming backend normally plays.
+    if !fetch.player.needs_bytes() && !fetch.store {
+        return Ok(Fetched {
+            track,
+            source: AudioSource::Url(url),
+            origin: Origin::Yandex,
+            stored: false,
+        });
+    }
+
+    let data = fetch.api.fetch_track(&url).await?;
+    let stored = fetch.store && store(fetch, &track, &data).await.is_some();
+
+    let source = if fetch.player.needs_bytes() {
+        AudioSource::Bytes(data)
+    } else {
+        // A streaming backend plays the file that was just written; if the write
+        // did not happen, the signed URL still works.
+        match fetch.cache.file_url(id) {
+            Some(file) => AudioSource::Url(file),
+            None => AudioSource::Url(url),
+        }
+    };
+    Ok(Fetched {
+        track,
+        source,
+        origin: Origin::Yandex,
+        stored,
+    })
+}
+
+/// Produces a source for a track already on this disk.
+async fn from_cache(fetch: &Fetch, track_id: &str) -> Result<AudioSource> {
+    if !fetch.player.needs_bytes() {
+        // ExoPlayer opens a local file itself, so nothing is read here at all.
+        return fetch
+            .cache
+            .file_url(track_id)
+            .map(AudioSource::Url)
+            .with_context(|| format!("трек {track_id} исчез из кеша"));
+    }
+    let cache = Arc::clone(&fetch.cache);
+    let id = track_id.to_string();
+    let data = tokio::task::spawn_blocking(move || cache.read(&id))
+        .await
+        .context("задача чтения кеша упала")??;
+    Ok(AudioSource::Bytes(data))
+}
+
+/// Pulls a track from whoever in the room has it. Returns the source and whether
+/// it was stored.
+///
+/// Bytes that came from the room are always kept, whatever `store` says. Two
+/// reasons: fetching them *was* the download the user asked for, and a streaming
+/// backend has nothing to play from until they are a file on disk.
+async fn from_peers(fetch: &Fetch, want: &TrackRef) -> Result<(AudioSource, bool)> {
+    let mut last: Option<anyhow::Error> = None;
+    for endpoint in &fetch.peers {
+        let pulled = share::fetch_from_peer(
+            &fetch.http,
+            endpoint,
+            &fetch.room_token,
+            &want.track_id,
+        )
+        .await;
+        let data = match pulled {
+            Ok(data) => data,
+            Err(err) => {
+                last = Some(err);
+                continue;
+            }
+        };
+
+        let stored = store(fetch, want, &data).await.is_some();
+        let source = match fetch.cache.file_url(&want.track_id) {
+            Some(file) if !fetch.player.needs_bytes() => AudioSource::Url(file),
+            // Either this backend wants bytes anyway, or the write failed — in
+            // which case a streaming backend has nothing to open and this errors
+            // out below.
+            _ if fetch.player.needs_bytes() => AudioSource::Bytes(data),
+            _ => {
+                last = Some(anyhow!(
+                    "трек получен от участника, но не удалось сохранить его на устройство"
+                ));
+                continue;
+            }
+        };
+        return Ok((source, stored));
+    }
+    Err(last.unwrap_or_else(|| anyhow!("никто в комнате не раздаёт этот трек")))
+}
+
+/// Writes a track to the cache, reporting failure as `None` rather than an error.
+///
+/// A cache that cannot be written is a nuisance, not a reason to stop the music:
+/// every caller has bytes in hand and can play them regardless.
+async fn store(fetch: &Fetch, track: &TrackRef, data: &Bytes) -> Option<Insertion> {
+    let cache = Arc::clone(&fetch.cache);
+    let track = track.clone();
+    let data = data.clone();
+    let pinned = fetch.pinned;
+
+    let result = tokio::task::spawn_blocking(move || cache.insert(&track, &data, pinned)).await;
+    match result {
+        Ok(Ok(insertion)) => Some(insertion),
+        Ok(Err(err)) => {
+            debug!("could not cache a track: {err:#}");
+            None
+        }
+        Err(err) => {
+            debug!("the cache write task failed: {err}");
+            None
+        }
+    }
+}
+
+/// Resolves a track on Yandex, checking this account may play it.
+async fn yandex_stream(api: &YandexMusic, track_id: &str) -> Result<(TrackRef, String)> {
     let track = api.track(track_id).await?;
     if !track.available {
         bail!("недоступен на этом аккаунте");
     }
     let url = api.stream_url(track_id).await?;
-    let track_ref = track.to_track_ref();
+    Ok((track.to_track_ref(), url))
+}
 
-    if !player.needs_bytes() {
-        // A streaming backend (ExoPlayer) fetches the signed URL itself.
-        return Ok((track_ref, AudioSource::Url(url)));
+/// Gets a track onto this device, without involving the player.
+///
+/// Same order of preference as [`fetch_source`], for the same reasons — a track
+/// the room already holds costs no internet and no Yandex request.
+async fn download(fetch: &Fetch, want: &TrackRef) -> Result<(Origin, Insertion)> {
+    let id = want.track_id.as_str();
+
+    let mut last: Option<anyhow::Error> = None;
+    for endpoint in &fetch.peers {
+        match share::fetch_from_peer(&fetch.http, endpoint, &fetch.room_token, id).await {
+            Ok(data) => {
+                let insertion = store(fetch, want, &data)
+                    .await
+                    .context("не удалось сохранить трек на устройство")?;
+                return Ok((Origin::Peer, insertion));
+            }
+            Err(err) => last = Some(err),
+        }
     }
-    let data = api.fetch_track(&url).await?;
-    Ok((track_ref, AudioSource::Bytes(data)))
+    if let Some(err) = last {
+        debug!(track = id, "no luck on the local network: {err:#}");
+    }
+
+    let (track, url) = yandex_stream(&fetch.api, id).await?;
+    let data = fetch.api.fetch_track(&url).await?;
+    let insertion = store(fetch, &track, &data)
+        .await
+        .context("не удалось сохранить трек на устройство")?;
+    Ok((Origin::Yandex, insertion))
 }
 
 /// Hands a resolved track to the backend.
@@ -974,12 +1657,6 @@ async fn stage_track(
                 .context("задача загрузки звука упала")?
         }
     }
-}
-
-/// Resolves, downloads and stages one track.
-async fn load_track(api: &YandexMusic, player: &Arc<dyn Playback>, track_id: &str) -> Result<()> {
-    let (track, source) = fetch_source(api, player, track_id).await?;
-    stage_track(player, track, source).await
 }
 
 /// Snapshots can arrive out of order, and a relay restart resets the counter.

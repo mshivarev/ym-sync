@@ -67,6 +67,17 @@ header {
   color: var(--bad);
 }
 
+/* A fact about this machine rather than about the room: it is running the relay
+   the others connect to. */
+.chip {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #6b5a20;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
 /* ---------- controls ---------- */
 
 button,
@@ -112,7 +123,7 @@ input[type="range"] {
 
 main {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1.1fr 1fr 1fr;
   gap: 12px;
   padding: 12px 16px;
   min-height: 0;
@@ -221,6 +232,49 @@ h2 {
 .list li.skipped .name {
   color: var(--dim);
   text-decoration: line-through;
+}
+
+/* Where a track will come from: on this disk, or from somebody else on the local
+   network. Either way it costs no internet, which is the point of showing it. */
+.list .mark {
+  font-size: 11px;
+  color: var(--dim);
+  min-width: 1.2em;
+  text-align: center;
+}
+
+.list .mark.disk {
+  color: var(--good);
+}
+
+.list .mark.lan {
+  color: var(--accent);
+}
+
+/* A library row carries its own delete button, so the row is not one big
+   button the way queue and search rows are. */
+.list li.pair {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.list li.pair .entry {
+  flex: 1;
+  min-width: 0;
+}
+
+.drop {
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--dim);
+}
+
+.drop:hover:not(:disabled) {
+  color: var(--bad);
+  background: var(--panel-2);
 }
 
 /* ---------- footer ---------- */

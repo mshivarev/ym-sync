@@ -14,7 +14,7 @@ audio-rodio = ["dep:rodio"]
 
 # Command-line front end. Off for library-only builds such as the Android
 # shared object, which needs neither clap nor a terminal.
-cli = ["dep:clap", "tokio/io-std", "tokio/io-util", "tokio/signal"]
+cli = ["dep:clap", "tokio/io-std", "tokio/signal"]
 
 # TLS backends. schannel on Windows; rustls with the ring provider where the
 # platform stack is not available.
@@ -43,12 +43,22 @@ quick-xml = { version = "0.41.0", features = ["serialize"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "charset", "system-proxy", "query"] }
 rodio = { version = "0.21.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-serde = { version = "1.0.229", features = ["derive"] }
+# `rc` so a snapshot can carry its cached-track list behind an `Arc`: the list
+# runs into the thousands and is cloned into every snapshot, several times a
+# second.
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
+# `macros` and `io-util` are base features rather than part of `cli`:
+# `tokio::select!` is used by the engine and the relay link, and the cached-track
+# file server reads and writes its sockets by hand.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "net", "macros", "io-util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = { version = "1", optional = true }
 ymsync-proto = { version = "0.1.0", path = "../proto" }
+# Hosting a room in this process, which is also what makes offline play work: a
+# machine with no internet is the authority for its own room. Default features
+# off — the embedded relay needs neither clap nor a signal handler.
+ymsync-relay = { version = "0.1.0", path = "../relay", default-features = false }

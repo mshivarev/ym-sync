@@ -12,7 +12,8 @@ pub const DEFAULT_RELAY: &str = "ws://127.0.0.1:8787";
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Relay URL. `ws://` for a LAN or localhost relay, `wss://` once it sits
-    /// behind TLS.
+    /// behind TLS. Ignored while `[host].enabled` is set, since the app then
+    /// connects to the relay it is running itself.
     pub relay: String,
     /// Players sharing a room name sync with each other.
     pub room: String,
@@ -23,6 +24,9 @@ pub struct Config {
     /// 0.0 to 1.0 (values above 1.0 amplify and may clip).
     pub volume: f32,
     pub sync: SyncConfig,
+    pub cache: CacheConfig,
+    pub share: ShareConfig,
+    pub host: HostConfig,
 }
 
 impl Default for Config {
@@ -34,6 +38,110 @@ impl Default for Config {
             yandex_token: String::new(),
             volume: 0.8,
             sync: SyncConfig::default(),
+            cache: CacheConfig::default(),
+            share: ShareConfig::default(),
+            host: HostConfig::default(),
+        }
+    }
+}
+
+/// Where downloaded tracks live and how much room they may take.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Empty means the per-user data directory. Android passes its own
+    /// app-private path, which is the only place it may write without asking for
+    /// a permission.
+    pub dir: String,
+    /// Gigabytes. 0 means no limit, and then only an explicit delete frees space.
+    pub limit_gb: f64,
+    /// Keep every track that plays, not just the ones explicitly downloaded.
+    ///
+    /// Off by default: a cache that fills itself is a cache the user did not ask
+    /// for. With it on, a few evenings of listening leaves a usable offline
+    /// library, and the limit above is what stops it growing without end.
+    pub auto: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            limit_gb: 8.0,
+            auto: false,
+        }
+    }
+}
+
+impl CacheConfig {
+    pub fn limit_bytes(&self) -> u64 {
+        if self.limit_gb <= 0.0 {
+            return 0;
+        }
+        (self.limit_gb * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+
+    /// Where to keep tracks, falling back to the per-user data directory.
+    pub fn directory(&self) -> Result<PathBuf> {
+        if !self.dir.trim().is_empty() {
+            return Ok(PathBuf::from(self.dir.trim()));
+        }
+        let dirs = directories::ProjectDirs::from("", "", "ymsync")
+            .context("cannot determine a per-user data directory for the track cache")?;
+        Ok(dirs.data_dir().join("tracks"))
+    }
+}
+
+/// Serving this machine's cached tracks to the rest of the room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShareConfig {
+    /// Whether to offer cached tracks to the others at all.
+    pub enabled: bool,
+    /// Port for the file server. 0 asks the OS for a free one, which is right
+    /// unless a firewall rule has to name a fixed port.
+    pub port: u16,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 0,
+        }
+    }
+}
+
+/// Running the room's relay in this process instead of connecting to a separate
+/// one.
+///
+/// This is also how listening offline works: with no network at all, a machine
+/// hosts the room on itself, and the queue and playhead have an authority again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostConfig {
+    pub enabled: bool,
+    /// Interface to listen on. `0.0.0.0` accepts the local network as well as
+    /// this machine; `127.0.0.1` keeps the room strictly private.
+    pub bind: String,
+    /// 0 asks the OS for a free port. A fixed one is friendlier, because the
+    /// others have to type it.
+    pub port: u16,
+    /// Address to advertise to the others, and to dial ourselves. Empty means
+    /// "work it out" — see `ymsync::net`.
+    ///
+    /// Worth setting by hand on a machine with several networks, where the
+    /// automatic answer may pick a VPN or a virtual switch.
+    pub advertise: String,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "0.0.0.0".to_string(),
+            port: 8787,
+            advertise: String::new(),
         }
     }
 }
@@ -233,13 +341,83 @@ mod tests {
             "room_token": "secret",
             "yandex_token": "y0_token",
             "volume": 0.8,
-            "sync": { "position_bias_ms": 400 }
+            "sync": { "position_bias_ms": 400 },
+            "cache": { "dir": "/data/user/0/dev.mshiv.ymsync/files/tracks", "limit_gb": 2.0 },
+            "share": { "enabled": true },
+            "host": { "enabled": true, "port": 8787, "advertise": "192.168.3.50" }
         }"#;
         let config: Config = serde_json::from_str(json).expect("android config");
         assert_eq!(config.relay, "ws://192.168.3.203:8787");
         assert_eq!(config.sync.position_bias_ms, 400);
+        assert_eq!(
+            config.cache.dir,
+            "/data/user/0/dev.mshiv.ymsync/files/tracks"
+        );
+        assert!(config.host.enabled);
+        assert_eq!(config.host.advertise, "192.168.3.50");
         // Everything the client left out keeps its default.
         assert_eq!(config.sync.seek_threshold_ms, 300);
         assert_eq!(config.sync.correction_interval_ms, 250);
+        assert_eq!(config.share.port, 0);
+        assert_eq!(config.host.bind, "0.0.0.0");
+    }
+
+    /// Caching, sharing and hosting arrived after people already had config
+    /// files, and all three are optional, so an older file has to keep working
+    /// untouched.
+    #[test]
+    fn a_config_from_before_the_offline_features_still_loads() {
+        let text = "\
+relay = \"ws://192.168.1.10:8787\"
+room = \"home\"
+room_token = \"secret\"
+yandex_token = \"y0_x\"
+volume = 0.8
+
+[sync]
+seek_threshold_ms = 300
+";
+        let parsed: Config = toml::from_str(text).expect("an older config");
+        assert_eq!(parsed.relay, "ws://192.168.1.10:8787");
+        assert_eq!(parsed.cache.limit_gb, 8.0);
+        assert!(!parsed.cache.auto, "automatic caching is opt-in");
+        assert!(parsed.share.enabled);
+        assert!(!parsed.host.enabled, "hosting is opt-in");
+    }
+
+    #[test]
+    fn the_cache_limit_converts_to_bytes() {
+        let cache = CacheConfig {
+            limit_gb: 2.0,
+            ..CacheConfig::default()
+        };
+        assert_eq!(cache.limit_bytes(), 2 * 1024 * 1024 * 1024);
+    }
+
+    /// 0 is how the config says "no limit", and a negative figure is a typo that
+    /// must not come out as an enormous unsigned number.
+    #[test]
+    fn a_zero_or_negative_limit_means_unlimited() {
+        for limit_gb in [0.0, -1.0] {
+            let cache = CacheConfig {
+                limit_gb,
+                ..CacheConfig::default()
+            };
+            assert_eq!(cache.limit_bytes(), 0, "limit_gb = {limit_gb}");
+        }
+    }
+
+    /// Android has to write inside its own sandbox, so an explicit directory
+    /// always wins over the per-user default.
+    #[test]
+    fn an_explicit_cache_directory_is_used_as_given() {
+        let cache = CacheConfig {
+            dir: "  /tmp/ymsync-tracks  ".to_string(),
+            ..CacheConfig::default()
+        };
+        assert_eq!(
+            cache.directory().unwrap(),
+            std::path::PathBuf::from("/tmp/ymsync-tracks")
+        );
     }
 }

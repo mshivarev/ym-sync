@@ -5,13 +5,34 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = ["cli"]
+
+# The standalone `ymsync-relay` binary. Off when a player embeds the relay to
+# host a room itself, which is how the Android build avoids clap entirely.
+cli = ["dep:clap", "dep:tracing-subscriber", "tokio/signal"]
+
+[[bin]]
+name = "ymsync-relay"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"], optional = true }
 futures-util = "0.3.34"
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
-tokio-tungstenite = "0.30.0"
+# `macros` is a base feature rather than part of `cli`: `tokio::select!` is used
+# by the library itself, not only by the binary.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+# Server side only, and deliberately without TLS: the relay is meant to sit
+# behind a reverse proxy when it faces the internet, and the default features
+# would drag in native-tls, which does not cross-compile to Android.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 ymsync-proto = { version = "0.1.0", path = "../proto" }
+
+[dev-dependencies]
+# The integration tests act as clients, which the relay itself never does.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }

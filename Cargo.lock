@@ -5660,6 +5660,7 @@ dependencies = [
  "tracing-subscriber",
  "webpki-roots 1.0.9",
  "ymsync-proto",
+ "ymsync-relay",
 ]
 
 [[package]]

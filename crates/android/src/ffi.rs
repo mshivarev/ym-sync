@@ -10,6 +10,7 @@
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
+//!     external fun library(handle: Long): String
 //!     external fun stop(handle: Long): String
 //! }
 //! ```
@@ -164,6 +165,19 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_queueFrom(
                 Err(err) => failed(err),
             },
         },
+    };
+    reply(&mut env, &text)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_library(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let text = match unsafe { borrow(handle) } {
+        None => failed("сессия не запущена"),
+        Some(session) => ok(session.library()),
     };
     reply(&mut env, &text)
 }

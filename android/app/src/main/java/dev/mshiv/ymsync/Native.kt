@@ -14,5 +14,8 @@ object Native {
     external fun send(handle: Long, requestJson: String): String
     external fun search(handle: Long, query: String, limit: Int): String
     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
+
+    /** What is downloaded on this device. Reads an in-memory index; no network. */
+    external fun library(handle: Long): String
     external fun stop(handle: Long): String
 }

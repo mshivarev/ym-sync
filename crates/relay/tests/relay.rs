@@ -11,10 +11,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use ymsync_proto::{ClientMsg, Command, PROTOCOL_VERSION, ServerMsg, TrackRef, unix_ms};
+use ymsync_proto::{
+    ClientMsg, Command, PROTOCOL_VERSION, PeerShare, ServerMsg, TrackRef, unix_ms,
+};
 
 const TOKEN: &str = "integration-token";
-const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous on purpose: every test here spawns its own relay *process*, and the
+/// test harness runs them all at once, so a tight ceiling measures how busy the
+/// machine is rather than how quickly the relay answers. It is still a ceiling —
+/// a relay that never replies fails instead of hanging the run.
+const RECV_TIMEOUT: Duration = Duration::from_secs(20);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -78,12 +84,17 @@ impl Relay {
         ws
     }
 
-    /// Joins and swallows the welcome, which every test would otherwise repeat.
+    /// Joins and swallows the handshake frames every test would otherwise repeat:
+    /// the welcome, then the sharing map that follows it.
     async fn join(&self) -> Ws {
         let mut ws = self.join_with(TOKEN).await;
         match recv(&mut ws).await {
             ServerMsg::Welcome { protocol, .. } => assert_eq!(protocol, PROTOCOL_VERSION),
             other => panic!("expected a welcome, got {other:?}"),
+        }
+        match recv(&mut ws).await {
+            ServerMsg::Shares { .. } => {}
+            other => panic!("expected the sharing map after the welcome, got {other:?}"),
         }
         ws
     }
@@ -543,4 +554,204 @@ async fn a_station_claim_dies_with_the_peer_that_held_it() {
         ServerMsg::State { state } => assert_eq!(state.station, None),
         other => panic!("expected the station to be dropped, got {other:?}"),
     }
+}
+
+/// Next sharing map for this socket, skipping the frames these tests do not care
+/// about.
+async fn recv_shares(ws: &mut Ws) -> Vec<PeerShare> {
+    match recv_ignoring_peers(ws).await {
+        ServerMsg::Shares { peers } => peers,
+        other => panic!("expected a sharing map, got {other:?}"),
+    }
+}
+
+async fn announce(ws: &mut Ws, port: Option<u16>, tracks: &[&str]) {
+    send(
+        ws,
+        &ClientMsg::Share {
+            port,
+            tracks: tracks.iter().map(|t| t.to_string()).collect(),
+        },
+    )
+    .await;
+}
+
+/// The whole point of the brokerage: a peer says only which port it serves on,
+/// and everyone learns a URL they can actually reach it at.
+#[tokio::test]
+async fn the_relay_turns_an_announced_port_into_a_reachable_address() {
+    let relay = Relay::start().await;
+    let mut one = relay.join().await;
+    let mut two = relay.join().await;
+
+    announce(&mut one, Some(8788), &["10", "11"]).await;
+
+    for ws in [&mut one, &mut two] {
+        let shares = recv_shares(ws).await;
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].tracks, ["10", "11"]);
+        // The tests connect over loopback, so that is the address the relay sees
+        // — paired with the port the peer named, never one it guessed.
+        assert_eq!(shares[0].endpoint, "http://127.0.0.1:8788");
+    }
+}
+
+/// The sender is included, exactly as it is for a command: what the relay says is
+/// the truth even for whoever caused it.
+#[tokio::test]
+async fn withdrawing_an_offer_empties_the_map_for_everyone() {
+    let relay = Relay::start().await;
+    let mut one = relay.join().await;
+    let mut two = relay.join().await;
+
+    announce(&mut one, Some(8788), &["10"]).await;
+    for ws in [&mut one, &mut two] {
+        assert_eq!(recv_shares(ws).await.len(), 1);
+    }
+
+    announce(&mut one, None, &[]).await;
+    for ws in [&mut one, &mut two] {
+        assert!(recv_shares(ws).await.is_empty(), "the offer was withdrawn");
+    }
+}
+
+/// Peers re-announce whenever their cache moves, and downloading a hundred tracks
+/// one at a time must not put a hundred identical frames on every socket.
+#[tokio::test]
+async fn an_announcement_that_changes_nothing_is_not_rebroadcast() {
+    let relay = Relay::start().await;
+    let mut one = relay.join().await;
+    let mut two = relay.join().await;
+
+    announce(&mut one, Some(8788), &["10"]).await;
+    assert_eq!(recv_shares(&mut two).await.len(), 1);
+
+    announce(&mut one, Some(8788), &["10"]).await;
+    assert_quiet(&mut two, 11).await;
+
+    // A real change still goes out.
+    announce(&mut one, Some(8788), &["10", "12"]).await;
+    assert_eq!(recv_shares(&mut two).await[0].tracks, ["10", "12"]);
+}
+
+/// An endpoint is only good while its owner is connected; a peer that has gone
+/// cannot serve anything, and would otherwise be left in the map as a URL that
+/// times out.
+#[tokio::test]
+async fn a_departing_peer_is_dropped_from_the_map() {
+    let relay = Relay::start().await;
+    let mut watcher = relay.join().await;
+
+    {
+        let mut sharer = relay.join().await;
+        announce(&mut sharer, Some(8788), &["10"]).await;
+        assert_eq!(recv_shares(&mut watcher).await.len(), 1);
+    }
+
+    assert!(recv_shares(&mut watcher).await.is_empty());
+}
+
+/// A peer that never offered anything has nothing to withdraw, so its departure
+/// must not put a pointless frame on every other socket.
+#[tokio::test]
+async fn a_departing_peer_that_shared_nothing_is_silent() {
+    let relay = Relay::start().await;
+    let mut watcher = relay.join().await;
+
+    drop(relay.join().await);
+
+    assert_quiet(&mut watcher, 12).await;
+}
+
+#[tokio::test]
+async fn an_over_long_announcement_is_refused() {
+    let relay = Relay::start().await;
+    let mut ws = relay.join().await;
+
+    let many: Vec<String> = (0..10_001).map(|n| n.to_string()).collect();
+    send(
+        &mut ws,
+        &ClientMsg::Share {
+            port: Some(8788),
+            tracks: many,
+        },
+    )
+    .await;
+
+    match recv_ignoring_peers(&mut ws).await {
+        ServerMsg::Error { code, .. } => assert_eq!(code, "too_many_shares"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+/// Hosting a room from inside the player is the same relay, bound in-process.
+/// This is what makes offline listening work, so it is worth proving that a
+/// client cannot tell the difference.
+#[tokio::test]
+async fn an_embedded_relay_serves_an_ordinary_client() {
+    let mut server = ymsync_relay::bind("127.0.0.1:0", TOKEN)
+        .await
+        .expect("bind an in-process relay");
+    let url = format!("ws://{}", server.local_addr());
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect to the embedded relay");
+    send(
+        &mut ws,
+        &ClientMsg::Hello {
+            protocol: PROTOCOL_VERSION,
+            room: "embedded".to_string(),
+            token: TOKEN.to_string(),
+            client: "integration".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut ws).await {
+        ServerMsg::Welcome { protocol, peers, .. } => {
+            assert_eq!(protocol, PROTOCOL_VERSION);
+            assert_eq!(peers, 1);
+        }
+        other => panic!("expected a welcome, got {other:?}"),
+    }
+
+    // And it really is a room: it takes a queue and answers with one.
+    let _shares = recv(&mut ws).await;
+    command(&mut ws, set_queue(&["1", "2"])).await;
+    match recv_ignoring_peers(&mut ws).await {
+        ServerMsg::Queue { tracks, .. } => assert_eq!(tracks.len(), 2),
+        other => panic!("expected a queue, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+/// Port 0 asks the OS for a free port, which is how an embedded relay keeps out
+/// of the way of anything already listening.
+#[tokio::test]
+async fn an_embedded_relay_reports_the_port_it_was_given() {
+    let server = ymsync_relay::bind("127.0.0.1:0", TOKEN).await.expect("bind");
+    assert_ne!(server.local_addr().port(), 0);
+}
+
+#[tokio::test]
+async fn an_embedded_relay_refuses_to_start_without_a_token() {
+    assert!(ymsync_relay::bind("127.0.0.1:0", "   ").await.is_err());
+}
+
+/// Dropping the handle has to close the listener, or a front end that stops
+/// hosting would leave the port occupied until the process exits.
+#[tokio::test]
+async fn dropping_the_handle_stops_the_listener() {
+    let server = ymsync_relay::bind("127.0.0.1:0", TOKEN).await.expect("bind");
+    let url = format!("ws://{}", server.local_addr());
+    drop(server);
+
+    for _ in 0..100 {
+        if tokio_tungstenite::connect_async(&url).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the relay kept listening on {url} after its handle was dropped");
 }

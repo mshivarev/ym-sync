@@ -13,9 +13,11 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use ymsync::api::{self, Track, YandexMusic};
+use ymsync::cache::{Cache, CachedTrack};
 use ymsync::config::Config;
-use ymsync::engine::{self, Command, Handle, Snapshot};
+use ymsync::engine::{Command, Snapshot};
 use ymsync::player::Player;
+use ymsync::session::{self, Session};
 use ymsync_proto::TrackRef;
 
 struct AppState {
@@ -23,7 +25,12 @@ struct AppState {
     config_path: String,
     /// Built on first use, then reused; searching does not need a connection.
     api: Mutex<Option<Arc<YandexMusic>>>,
-    engine: Mutex<Option<Handle>>,
+    /// Opened on first use and kept: the window lists the offline library before
+    /// anything connects, and the engine then plays out of that same cache.
+    cache: Mutex<Option<Arc<Cache>>>,
+    /// The engine plus whatever it brought up — a hosted relay, the file server
+    /// for cached tracks. Held whole so that disconnecting closes those ports.
+    session: Mutex<Option<Session>>,
 }
 
 impl AppState {
@@ -39,6 +46,16 @@ impl AppState {
         *slot = Some(Arc::clone(&api));
         Ok(api)
     }
+
+    async fn cache(&self) -> Result<Arc<Cache>, String> {
+        let mut slot = self.cache.lock().await;
+        if let Some(cache) = slot.as_ref() {
+            return Ok(Arc::clone(cache));
+        }
+        let cache = session::open_cache(&self.config).map_err(fail)?;
+        *slot = Some(Arc::clone(&cache));
+        Ok(cache)
+    }
 }
 
 /// Anything the page needs before connecting.
@@ -50,6 +67,15 @@ struct Settings {
     has_yandex_token: bool,
     has_room_token: bool,
     config_path: String,
+    /// This app will run the room's relay itself rather than dial one.
+    hosting: bool,
+    /// Cached tracks will be offered to the rest of the room over the network.
+    sharing: bool,
+    cache_dir: String,
+    /// 0 means no limit.
+    cache_limit_bytes: u64,
+    /// Everything that plays is kept, not only explicit downloads.
+    auto_cache: bool,
 }
 
 #[tauri::command]
@@ -62,17 +88,29 @@ fn settings(state: State<'_, AppState>) -> Settings {
         has_yandex_token: !cfg.yandex_token.trim().is_empty(),
         has_room_token: !cfg.room_token.trim().is_empty(),
         config_path: state.config_path.clone(),
+        hosting: cfg.host.enabled,
+        sharing: cfg.share.enabled,
+        // A path that cannot be worked out is not worth failing the whole window
+        // over: the panel simply shows no location.
+        cache_dir: cfg
+            .cache
+            .directory()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+        cache_limit_bytes: cfg.cache.limit_bytes(),
+        auto_cache: cfg.cache.auto,
     }
 }
 
 #[tauri::command]
 async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot, String> {
-    let mut slot = state.engine.lock().await;
+    let mut slot = state.session.lock().await;
     if slot.is_some() {
         return Err("уже подключено".to_string());
     }
 
     let api = state.api().await?;
+    let cache = state.cache().await?;
     let volume = state.config.volume;
     // Opening the audio device blocks briefly.
     let player = tokio::task::spawn_blocking(move || Player::new(volume))
@@ -80,13 +118,15 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot,
         .map_err(fail)?
         .map_err(fail)?;
 
-    let handle = engine::spawn(&state.config, api, Arc::new(player))
+    // Hosting the room and serving cached tracks are both set up here, in the
+    // order the engine needs them.
+    let session = session::start(&state.config, api, Arc::new(player), cache)
         .await
         .map_err(fail)?;
-    let snapshot = handle.snapshot();
+    let snapshot = session.handle().snapshot();
 
     // Push every engine state change to the page.
-    let mut snapshots = handle.subscribe();
+    let mut snapshots = session.handle().subscribe();
     tauri::async_runtime::spawn(async move {
         while snapshots.changed().await.is_ok() {
             let snapshot = snapshots.borrow_and_update().clone();
@@ -97,22 +137,26 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot,
         let _ = app.emit("closed", ());
     });
 
-    *slot = Some(handle);
+    *slot = Some(session);
     Ok(snapshot)
 }
 
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state.engine.lock().await.take() {
-        handle.send(Command::Shutdown);
-        handle.join().await.map_err(fail)?;
+    if let Some(session) = state.session.lock().await.take() {
+        session.shutdown().await.map_err(fail)?;
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn snapshot(state: State<'_, AppState>) -> Result<Option<Snapshot>, String> {
-    Ok(state.engine.lock().await.as_ref().map(Handle::snapshot))
+    Ok(state
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| session.handle().snapshot()))
 }
 
 #[tauri::command]
@@ -228,10 +272,53 @@ async fn control(
     send(&state, command).await
 }
 
+/// This device's offline library, newest first.
+///
+/// Answers with no connection and no internet: the metadata was stored beside the
+/// audio precisely so this list can exist without asking Yandex anything.
+#[tauri::command]
+async fn library(state: State<'_, AppState>) -> Result<Vec<CachedTrack>, String> {
+    Ok(state.cache().await?.tracks())
+}
+
+/// Keeps these tracks on this device. Queued, one at a time, behind playback.
+#[tauri::command]
+async fn download(tracks: Vec<TrackRef>, state: State<'_, AppState>) -> Result<(), String> {
+    if tracks.is_empty() {
+        return Err("нечего скачивать".to_string());
+    }
+    send(&state, Command::Download { tracks }).await
+}
+
+#[tauri::command]
+async fn cancel_downloads(state: State<'_, AppState>) -> Result<(), String> {
+    send(&state, Command::CancelDownloads).await
+}
+
+/// Deletes a track from this device.
+///
+/// Goes through the engine while connected, because deleting also drops the track
+/// from the download queue and withdraws it from what the room is offered. With no
+/// session there is neither, so the cache is edited directly — otherwise the
+/// library panel would be read-only until you connect.
+#[tauri::command]
+async fn forget(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let connected = state.session.lock().await.is_some();
+    if connected {
+        return send(&state, Command::Forget { track_id: id }).await;
+    }
+
+    let cache = state.cache().await?;
+    tokio::task::spawn_blocking(move || cache.remove(&id))
+        .await
+        .map_err(fail)?
+        .map_err(fail)
+}
+
 async fn send(state: &State<'_, AppState>, command: Command) -> Result<(), String> {
-    match state.engine.lock().await.as_ref() {
-        Some(handle) => {
-            handle.send(command);
+    match state.session.lock().await.as_ref() {
+        Some(session) => {
+            session.handle().send(command);
             Ok(())
         }
         None => Err("нет подключения к релею".to_string()),
@@ -265,7 +352,8 @@ fn main() {
                 config,
                 config_path,
                 api: Mutex::new(None),
-                engine: Mutex::new(None),
+                cache: Mutex::new(None),
+                session: Mutex::new(None),
             });
             Ok(())
         })
@@ -277,7 +365,11 @@ fn main() {
             search,
             play_source,
             queue_tracks,
-            control
+            control,
+            library,
+            download,
+            cancel_downloads,
+            forget
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");
