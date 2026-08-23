@@ -69,6 +69,8 @@ struct Settings {
     config_path: String,
     /// This app will run the room's relay itself rather than dial one.
     hosting: bool,
+    /// Address to advertise while hosting; empty means "work it out".
+    advertise: String,
     /// Cached tracks will be offered to the rest of the room over the network.
     sharing: bool,
     cache_dir: String,
@@ -89,6 +91,7 @@ fn settings(state: State<'_, AppState>) -> Settings {
         has_room_token: !cfg.room_token.trim().is_empty(),
         config_path: state.config_path.clone(),
         hosting: cfg.host.enabled,
+        advertise: cfg.host.advertise.clone(),
         sharing: cfg.share.enabled,
         // A path that cannot be worked out is not worth failing the whole window
         // over: the panel simply shows no location.
@@ -102,8 +105,19 @@ fn settings(state: State<'_, AppState>) -> Settings {
     }
 }
 
+/// Connects, optionally running the room's relay in this process.
+///
+/// `host` and `advertise` come from the window rather than from the file, and are
+/// not written back — the same deal as `ymsync play --host`: the tick holds for
+/// this run, and `config.toml` stays the default. Hosting has to be decided here
+/// because the relay is bound before the engine connects to it.
 #[tauri::command]
-async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot, String> {
+async fn connect(
+    app: AppHandle,
+    host: bool,
+    advertise: String,
+    state: State<'_, AppState>,
+) -> Result<Snapshot, String> {
     let mut slot = state.session.lock().await;
     if slot.is_some() {
         return Err("уже подключено".to_string());
@@ -118,9 +132,18 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot,
         .map_err(fail)?
         .map_err(fail)?;
 
+    let mut cfg = state.config.clone();
+    if host {
+        cfg.host.enabled = true;
+    }
+    let advertise = advertise.trim();
+    if !advertise.is_empty() {
+        cfg.host.advertise = advertise.to_string();
+    }
+
     // Hosting the room and serving cached tracks are both set up here, in the
     // order the engine needs them.
-    let session = session::start(&state.config, api, Arc::new(player), cache)
+    let session = session::start(&cfg, api, Arc::new(player), cache)
         .await
         .map_err(fail)?;
     let snapshot = session.handle().snapshot();

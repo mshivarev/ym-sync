@@ -8,6 +8,8 @@ const ui = {
   connect: el("connect"),
   status: el("status"),
   hosting: el("hosting"),
+  host: el("host"),
+  advertise: el("advertise"),
   kind: el("kind"),
   source: el("source"),
   load: el("load"),
@@ -106,6 +108,9 @@ function setConnected(value) {
     ui.dlTrack, ui.dlQueue]) {
     node.disabled = !value;
   }
+  // Hosting is chosen before the relay is bound, so it cannot change mid-session.
+  ui.host.disabled = value;
+  ui.advertise.disabled = value;
   updateLibraryButtons();
 
   if (!value) {
@@ -353,7 +358,10 @@ ui.connect.addEventListener("click", async () => {
       return;
     }
     ui.connect.textContent = "Подключаюсь…";
-    const snapshot = await call("connect");
+    const snapshot = await call("connect", {
+      host: ui.host.checked,
+      advertise: ui.advertise.value,
+    });
     if (snapshot) {
       setConnected(true);
       render(snapshot);
@@ -363,6 +371,12 @@ ui.connect.addEventListener("click", async () => {
   } finally {
     ui.connect.disabled = false;
   }
+});
+
+// The address only matters while hosting, and guessing wrong is the one thing
+// that cannot be worked out automatically — see `ymsync::net`.
+ui.host.addEventListener("change", () => {
+  ui.advertise.classList.toggle("hidden", !ui.host.checked);
 });
 
 ui.kind.addEventListener("change", () => {
@@ -494,6 +508,11 @@ listen("closed", () => {
   ui.status.textContent = settings.hosting
     ? `${settings.room} · комнату держит это устройство`
     : `${settings.room} · ${settings.relay}`;
+
+  // The file supplies the default; the tick can still be changed per run.
+  ui.host.checked = settings.hosting;
+  ui.advertise.value = settings.advertise;
+  ui.advertise.classList.toggle("hidden", !settings.hosting);
 
   cacheDir = settings.cache_dir;
   cacheLimit = settings.cache_limit_bytes;

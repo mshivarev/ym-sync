@@ -12,6 +12,11 @@
   <header>
     <div class="brand">ym&#8209;sync</div>
     <div class="connect">
+      <label class="tick" title="поднять релей в этом же процессе: остальные подключаются к адресу, который появится рядом">
+        <input id="host" type="checkbox" />
+        <span>комната здесь</span>
+      </label>
+      <input id="advertise" class="addr hidden" placeholder="адрес для остальных" title="заполните, если адрес определился не тот — например на машине с VPN" />
       <button id="connect" class="primary">Подключиться</button>
     </div>
     <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>

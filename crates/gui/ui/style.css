@@ -50,10 +50,37 @@ header {
 .connect {
   display: flex;
   gap: 8px;
+  align-items: center;
+}
+
+/* Hosting is decided before connecting, so it lives next to that button rather
+   than in a settings screen. */
+.tick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.tick input {
+  accent-color: var(--accent);
+}
+
+.addr {
+  width: 15ch;
+  font-size: 12px;
 }
 
 .status {
   margin-left: auto;
+  /* Shrinks first when the header runs out of room: the connect controls and the
+     hosting address matter more than the tail of a URL. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -123,7 +150,9 @@ input[type="range"] {
 
 main {
   display: grid;
-  grid-template-columns: 1.1fr 1fr 1fr;
+  /* The first panel carries the source controls, so it needs the widest column;
+     the other two hold lists that shorten gracefully. */
+  grid-template-columns: 1.7fr 1fr 1fr;
   gap: 12px;
   padding: 12px 16px;
   min-height: 0;
@@ -133,6 +162,9 @@ main {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* Without this a grid column is at least as wide as its widest row, and the
+     source controls in the first panel would squeeze the other two. */
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -150,13 +182,22 @@ h2 {
 
 .row {
   display: flex;
+  /* Wrapping is the safety valve for a narrow window: buttons drop to the next
+     line instead of squeezing the field they belong to. */
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 8px;
 }
 
 .row input {
   flex: 1;
-  min-width: 0;
+  /* A text field narrower than this is not a text field any more. */
+  min-width: 10ch;
+}
+
+/* A label that wraps inside its own button reads as two broken words. */
+.row button {
+  white-space: nowrap;
 }
 
 .hint,
@@ -167,6 +208,9 @@ h2 {
 .hint {
   margin: 8px 0 0;
   font-size: 12px;
+  /* A cache path has no spaces to break at, and would otherwise run out of the
+     panel. */
+  overflow-wrap: anywhere;
 }
 
 .list {
