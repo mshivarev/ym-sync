@@ -261,16 +261,26 @@ impl Config {
         if path.exists() {
             bail!("{} already exists", path.display());
         }
+        Self::default().save(path)
+    }
+
+    /// Writes this configuration to `path`, creating parent directories.
+    ///
+    /// The window saves what was typed into it — the room, its password, where to
+    /// connect — so that a room is set up once rather than at every launch. Hand
+    /// written comments do not survive that, which is why the preamble is
+    /// re-emitted here instead of living only in the template.
+    pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let body = toml::to_string_pretty(&Self::default()).context("serialising defaults")?;
+        let body = toml::to_string_pretty(self).context("serialising the configuration")?;
         let text = format!(
             "# ym-sync configuration.\n\
              #\n\
              # yandex_token: OAuth token for this machine's Yandex account (see README).\n\
-             # room_token:   shared secret, must match the relay's --token.\n\
+             # room_token:   the room's password; everyone in the room needs the same one.\n\
              # Both can also be supplied as YM_TOKEN and YMSYNC_ROOM_TOKEN.\n\
              \n{body}"
         );
@@ -407,6 +417,36 @@ seek_threshold_ms = 300
             parsed.host.discoverable,
             "an older config still answers a search for rooms"
         );
+    }
+
+    /// The window writes back what was typed into it, so a saved file has to load
+    /// again as exactly the same settings — including the room's password, which
+    /// is the one value nobody wants to retype.
+    #[test]
+    fn a_saved_config_loads_back_unchanged() {
+        let dir = std::env::temp_dir().join(format!("ymsync-save-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        let config = Config {
+            relay: "ws://192.168.1.10:8787".to_string(),
+            room: "кухня".to_string(),
+            room_token: "пароль".to_string(),
+            yandex_token: "y0_x".to_string(),
+            host: HostConfig {
+                enabled: true,
+                ..HostConfig::default()
+            },
+            ..Config::default()
+        };
+        config.save(&path).expect("save");
+
+        let (loaded, _) = Config::load(Some(&path)).expect("load");
+        assert_eq!(loaded.room, "кухня");
+        assert_eq!(loaded.room_token, "пароль");
+        assert_eq!(loaded.relay, "ws://192.168.1.10:8787");
+        assert!(loaded.host.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

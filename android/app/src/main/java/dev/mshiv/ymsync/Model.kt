@@ -9,7 +9,27 @@ data class TrackInfo(
     val title: String,
     val artist: String,
     val durationMs: Long,
-)
+    /** Kept so a track queued from this screen loses nothing on the way. */
+    val albumId: String? = null,
+) {
+    /**
+     * The shape `Native.queueTracks` takes: `ymsync_proto::TrackRef`.
+     *
+     * A row on screen already holds everything the room needs, so playing it costs
+     * no lookup — see the note on `Session::queue_tracks`.
+     */
+    fun toJson(): JSONObject =
+        JSONObject()
+            .put("track_id", trackId)
+            .put("title", title)
+            .put("artist", artist)
+            .put("duration_ms", durationMs)
+            .apply { albumId?.let { put("album_id", it) } }
+}
+
+/** A list of tracks as the core expects it. */
+fun List<TrackInfo>.toJsonArray(): JSONArray =
+    JSONArray().apply { this@toJsonArray.forEach { put(it.toJson()) } }
 
 /** One downloaded track, as the offline screen lists it. */
 data class CachedTrack(
@@ -98,6 +118,7 @@ fun JSONObject.toTrackInfo() =
         title = optString("title"),
         artist = optString("artist"),
         durationMs = optLong("duration_ms"),
+        albumId = if (isNull("album_id")) null else optString("album_id"),
     )
 
 fun JSONArray.toTrackList(): List<TrackInfo> =
@@ -198,7 +219,8 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_ROOM, "home")!!
         set(value) = prefs.edit().putString(KEY_ROOM, value).apply()
 
-    var roomToken: String
+    /** The room's password. Everyone in the room needs the same one. */
+    var password: String
         get() = prefs.getString(KEY_ROOM_TOKEN, "")!!
         set(value) = prefs.edit().putString(KEY_ROOM_TOKEN, value).apply()
 
@@ -210,25 +232,6 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_VOLUME, 0.8f)
         set(value) = prefs.edit().putFloat(KEY_VOLUME, value).apply()
 
-    /**
-     * Cancels ExoPlayer's constant reporting lag. Calibrate from the drift the
-     * app shows, with the sign flipped: a steady `-400 мс` means 400 here.
-     */
-    var positionBiasMs: Int
-        get() = prefs.getInt(KEY_BIAS, 0)
-        set(value) = prefs.edit().putInt(KEY_BIAS, value).apply()
-
-    /**
-     * Run the room's relay on this phone instead of dialling one.
-     *
-     * This is also what listening with no internet looks like: the queue and the
-     * playhead need an authority, and with nothing to connect to the phone becomes
-     * that authority for itself.
-     */
-    var hostRoom: Boolean
-        get() = prefs.getBoolean(KEY_HOST, false)
-        set(value) = prefs.edit().putBoolean(KEY_HOST, value).apply()
-
     /** Keep every track that plays, not only the ones downloaded on purpose. */
     var autoCache: Boolean
         get() = prefs.getBoolean(KEY_AUTO_CACHE, false)
@@ -239,21 +242,28 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_CACHE_LIMIT, 2f)
         set(value) = prefs.edit().putFloat(KEY_CACHE_LIMIT, value).apply()
 
+    /** What still has to be filled in before a session can start. */
     val missing: List<String>
         get() = buildList {
             if (yandexToken.isBlank()) add("токен Яндекса")
-            if (roomToken.isBlank()) add("токен комнаты")
+            if (password.isBlank()) add("пароль комнаты")
+            if (room.isBlank()) add("название комнаты")
         }
 
-    fun configJson(): String =
+    /**
+     * The settings as the core reads them.
+     *
+     * `host` is which button was pressed: «Хостить» runs the room's relay on this
+     * phone — which is also what listening with no internet looks like, since the
+     * queue and the playhead need an authority — and «Подключиться» dials [relay].
+     */
+    fun configJson(host: Boolean): String =
         JSONObject()
             .put("relay", relay)
             .put("room", room)
-            .put("room_token", roomToken)
+            .put("room_token", password)
             .put("yandex_token", yandexToken)
             .put("volume", volume.toDouble())
-            // Every other sync field keeps its default on the Rust side.
-            .put("sync", JSONObject().put("position_bias_ms", positionBiasMs))
             .put(
                 "cache",
                 JSONObject()
@@ -267,7 +277,7 @@ class Settings(context: Context) {
             .put(
                 "host",
                 JSONObject()
-                    .put("enabled", hostRoom)
+                    .put("enabled", host)
                     .put("bind", "0.0.0.0")
                     .put("port", 8787),
             )
@@ -279,8 +289,6 @@ class Settings(context: Context) {
         const val KEY_ROOM_TOKEN = "room_token"
         const val KEY_YANDEX_TOKEN = "yandex_token"
         const val KEY_VOLUME = "volume"
-        const val KEY_BIAS = "position_bias_ms"
-        const val KEY_HOST = "host_room"
         const val KEY_AUTO_CACHE = "auto_cache"
         const val KEY_CACHE_LIMIT = "cache_limit_gb"
     }

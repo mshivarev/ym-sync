@@ -6,6 +6,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The Wi-Fi stack drops packets that were not addressed to this device, and
+         a search for rooms is a broadcast. Without the multicast lock this
+         permission allows, a room held on the phone is invisible from the
+         desktop. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <application
         android:allowBackup="false"
@@ -24,16 +30,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Playback outlives the activity, so it runs in a foreground media
-             service; Media3 supplies the notification and lock-screen controls. -->
+        <!-- Playback outlives the activity, so it runs in a foreground service.
+             The audio itself comes out of the Rust core, so there is no player
+             object here for a media session to wrap: the service exists for the
+             notification, the wake lock and the multicast lock. -->
         <service
             android:name=".SyncService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback">
-            <intent-filter>
-                <action android:name="androidx.media3.session.MediaSessionService" />
-            </intent-filter>
-        </service>
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 
 </manifest>

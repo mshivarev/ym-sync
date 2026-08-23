@@ -34,11 +34,17 @@ body {
 
 header {
   display: flex;
-  align-items: center;
-  gap: 16px;
+  flex-direction: column;
+  gap: 10px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 
 .brand {
@@ -47,34 +53,51 @@ header {
   color: var(--accent);
 }
 
-.connect {
+/* Getting into a room: the shared fields, then a line per way in. Two buttons
+   rather than a switch, because holding the room and joining one are two
+   different acts, not two states of the same one. */
+.setup {
   display: flex;
-  gap: 8px;
-  align-items: center;
+  flex-direction: column;
+  gap: 6px;
 }
 
-/* Hosting is decided before connecting, so it lives next to that button rather
-   than in a settings screen. */
-.tick {
+.setup .line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+}
+
+.setup label {
   font-size: 12px;
   color: var(--dim);
   white-space: nowrap;
 }
 
-.tick input {
-  accent-color: var(--accent);
+.setup input {
+  flex: 1;
+  min-width: 10ch;
 }
 
-.addr {
-  width: 16ch;
-  font-size: 12px;
+/* Both buttons keep the same width, so the two lines read as a pair of choices
+   rather than as a form with one odd row. */
+.setup #connect,
+.setup #host {
+  min-width: 14ch;
+  white-space: nowrap;
+}
+
+.hint.inline {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Wide enough for «комната · ws://192.168.1.10:8787», capped so it cannot push
-   the status line off the header. */
+   the buttons off the line. */
 .rooms {
   max-width: 30ch;
   font-size: 12px;

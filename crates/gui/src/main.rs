@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +23,19 @@ use ymsync::player::Player;
 use ymsync::session::{self, Session};
 use ymsync_proto::TrackRef;
 
+/// The session slot, shared with the task that watches the engine.
+///
+/// Shared rather than owned by the state on purpose: when the room closes, the
+/// engine ends on its own, and *something* has to empty this slot. Before, only
+/// the page was told, so the slot stayed full and every later connect answered
+/// «уже подключено» for the rest of the run.
+type SessionSlot = Arc<Mutex<Option<Session>>>;
+
 struct AppState {
-    config: Config,
-    config_path: String,
+    /// What the window is working with. Written back to `config_path` whenever a
+    /// connection succeeds, so a room is set up once rather than at every launch.
+    config: std::sync::Mutex<Config>,
+    config_path: PathBuf,
     /// Built on first use, then reused; searching does not need a connection.
     api: Mutex<Option<Arc<YandexMusic>>>,
     /// Opened on first use and kept: the window lists the offline library before
@@ -32,10 +43,14 @@ struct AppState {
     cache: Mutex<Option<Arc<Cache>>>,
     /// The engine plus whatever it brought up — a hosted relay, the file server
     /// for cached tracks. Held whole so that disconnecting closes those ports.
-    session: Mutex<Option<Session>>,
+    session: SessionSlot,
 }
 
 impl AppState {
+    fn config(&self) -> Config {
+        self.config.lock().expect("config mutex").clone()
+    }
+
     /// The API client, created on demand so the window can open even when no
     /// token is configured yet.
     async fn api(&self) -> Result<Arc<YandexMusic>, String> {
@@ -43,7 +58,8 @@ impl AppState {
         if let Some(api) = slot.as_ref() {
             return Ok(Arc::clone(api));
         }
-        let token = self.config.require_yandex_token().map_err(fail)?;
+        let config = self.config();
+        let token = config.require_yandex_token().map_err(fail)?;
         let api = Arc::new(YandexMusic::new(token).map_err(fail)?);
         *slot = Some(Arc::clone(&api));
         Ok(api)
@@ -54,9 +70,19 @@ impl AppState {
         if let Some(cache) = slot.as_ref() {
             return Ok(Arc::clone(cache));
         }
-        let cache = session::open_cache(&self.config).map_err(fail)?;
+        let cache = session::open_cache(&self.config()).map_err(fail)?;
         *slot = Some(Arc::clone(&cache));
         Ok(cache)
+    }
+
+    /// Remembers the settings a successful connection was made with.
+    ///
+    /// Reported rather than swallowed on failure: silently not saving a password
+    /// looks exactly like saving it until the next launch asks for it again.
+    fn remember(&self, config: Config) -> Result<(), String> {
+        let path = self.config_path.clone();
+        *self.config.lock().expect("config mutex") = config.clone();
+        config.save(&path).map_err(fail)
     }
 }
 
@@ -65,9 +91,11 @@ impl AppState {
 struct Settings {
     relay: String,
     room: String,
+    /// The room's password. Local to this machine and shown as typed: it is what
+    /// you read out to whoever joins from the sofa.
+    password: String,
     volume: f32,
     has_yandex_token: bool,
-    has_room_token: bool,
     config_path: String,
     /// This app will run the room's relay itself rather than dial one.
     hosting: bool,
@@ -84,14 +112,14 @@ struct Settings {
 
 #[tauri::command]
 fn settings(state: State<'_, AppState>) -> Settings {
-    let cfg = &state.config;
+    let cfg = state.config();
     Settings {
         relay: cfg.relay.clone(),
         room: cfg.room.clone(),
+        password: cfg.room_token.clone(),
         volume: cfg.volume,
         has_yandex_token: !cfg.yandex_token.trim().is_empty(),
-        has_room_token: !cfg.room_token.trim().is_empty(),
-        config_path: state.config_path.clone(),
+        config_path: state.config_path.display().to_string(),
         hosting: cfg.host.enabled,
         advertise: cfg.host.advertise.clone(),
         sharing: cfg.share.enabled,
@@ -109,11 +137,13 @@ fn settings(state: State<'_, AppState>) -> Settings {
 
 /// Connects, optionally running the room's relay in this process.
 ///
-/// `host`, `advertise`, `relay` and `room` come from the window rather than from
-/// the file, and are not written back — the same deal as `ymsync play --host`: the
-/// choice holds for this run and `config.toml` stays the default. Hosting has to
-/// be decided here because the relay is bound before the engine connects to it,
-/// and a room picked out of the network is only known at this point too.
+/// The two buttons in the window are this one command: «Подключиться» dials
+/// `relay`, «Хостить» binds a relay here and dials that instead. Hosting has to
+/// be decided at this point because the relay is bound before the engine connects
+/// to it.
+///
+/// Everything that worked is written back to `config.toml`, so the name and the
+/// password of a room are typed once.
 #[tauri::command]
 async fn connect(
     app: AppHandle,
@@ -121,6 +151,7 @@ async fn connect(
     advertise: String,
     relay: String,
     room: String,
+    password: String,
     state: State<'_, AppState>,
 ) -> Result<Snapshot, String> {
     let mut slot = state.session.lock().await;
@@ -128,30 +159,39 @@ async fn connect(
         return Err("уже подключено".to_string());
     }
 
+    let room = room.trim().to_string();
+    let password = password.trim().to_string();
+    let relay = relay.trim().to_string();
+    if room.is_empty() {
+        return Err("укажите название комнаты".to_string());
+    }
+    if password.is_empty() {
+        return Err("укажите пароль комнаты — он должен совпадать у всех участников".to_string());
+    }
+    if !host && relay.is_empty() {
+        return Err("укажите адрес комнаты или найдите её кнопкой «Комнаты»".to_string());
+    }
+
+    let mut cfg = state.config();
+    cfg.room = room;
+    cfg.room_token = password;
+    cfg.host.enabled = host;
+    if host {
+        // Empty means «определи сам» rather than «оставь как было»: the field is
+        // filled from the file, so what is in it now is what the user meant.
+        cfg.host.advertise = advertise.trim().to_string();
+    } else {
+        cfg.relay = relay;
+    }
+
     let api = state.api().await?;
     let cache = state.cache().await?;
-    let volume = state.config.volume;
+    let volume = cfg.volume;
     // Opening the audio device blocks briefly.
     let player = tokio::task::spawn_blocking(move || Player::new(volume))
         .await
         .map_err(fail)?
         .map_err(fail)?;
-
-    let mut cfg = state.config.clone();
-    if host {
-        cfg.host.enabled = true;
-    }
-    // Anything the window left blank keeps what the file said.
-    for (field, chosen) in [
-        (&mut cfg.host.advertise, advertise),
-        (&mut cfg.relay, relay),
-        (&mut cfg.room, room),
-    ] {
-        let chosen = chosen.trim();
-        if !chosen.is_empty() {
-            *field = chosen.to_string();
-        }
-    }
 
     // Hosting the room and serving cached tracks are both set up here, in the
     // order the engine needs them.
@@ -160,14 +200,25 @@ async fn connect(
         .map_err(fail)?;
     let snapshot = session.handle().snapshot();
 
-    // Push every engine state change to the page.
+    if let Err(err) = state.remember(cfg) {
+        let _ = app.emit("notice", format!("не удалось сохранить настройки: {err}"));
+    }
+
+    // Push every engine state change to the page, and hand the session back when
+    // the engine stops — which is what happens when the room closes.
     let mut snapshots = session.handle().subscribe();
+    let slot_for_watch = Arc::clone(&state.session);
     tauri::async_runtime::spawn(async move {
         while snapshots.changed().await.is_ok() {
             let snapshot = snapshots.borrow_and_update().clone();
             if app.emit("snapshot", snapshot).is_err() {
                 break;
             }
+        }
+        // The engine is already gone; this closes the ports it brought up — the
+        // hosted relay, the file server — so the next connect can bind them again.
+        if let Some(session) = slot_for_watch.lock().await.take() {
+            let _ = session.shutdown().await;
         }
         let _ = app.emit("closed", ());
     });
@@ -383,23 +434,26 @@ fn main() {
         .init();
 
     let (config, config_path) = match Config::load(None) {
-        Ok((config, path)) => (config, path.display().to_string()),
+        Ok(pair) => pair,
         Err(err) => {
             // A broken config must not stop the window from opening: the page
             // shows the problem and where to fix it.
             tracing::error!("{err:#}");
-            (Config::default(), String::new())
+            (
+                Config::default(),
+                Config::default_path().unwrap_or_default(),
+            )
         }
     };
 
     tauri::Builder::default()
         .setup(move |app| {
             app.manage(AppState {
-                config,
+                config: std::sync::Mutex::new(config),
                 config_path,
                 api: Mutex::new(None),
                 cache: Mutex::new(None),
-                session: Mutex::new(None),
+                session: SessionSlot::default(),
             });
             Ok(())
         })

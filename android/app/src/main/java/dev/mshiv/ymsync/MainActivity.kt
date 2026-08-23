@@ -147,28 +147,30 @@ private fun App(settings: Settings) {
 
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(
-                        onClick = {
-                            if (running) {
-                                SyncService.stop(context)
-                            } else {
-                                val absent = settings.missing
-                                if (absent.isEmpty()) {
-                                    SyncService.start(context, settings.configJson())
-                                } else {
-                                    SyncHolder.say("не заполнено: ${absent.joinToString(", ")}")
-                                    showSettings = true
-                                }
-                            }
-                        },
-                    ) { Text(if (running) "Отключиться" else "Подключиться") }
-
-                    Spacer(Modifier.width(8.dp))
+                    if (running) {
+                        Button(onClick = { SyncService.stop(context) }) { Text("Отключиться") }
+                    }
                     TextButton(onClick = { showSettings = !showSettings }) { Text("Настройки") }
                 }
             }
 
             item { StatusLine(snapshot, message) }
+
+            // Two ways into a room, and the same two fields for both: a room is a
+            // name and a password. Which button you press decides who holds it.
+            if (!running) {
+                item {
+                    RoomCard(settings) { host ->
+                        val absent = settings.missing
+                        if (absent.isEmpty()) {
+                            SyncService.start(context, settings.configJson(host), host)
+                        } else {
+                            SyncHolder.say("не заполнено: ${absent.joinToString(", ")}")
+                            if (settings.yandexToken.isBlank()) showSettings = true
+                        }
+                    }
+                }
+            }
 
             if (showSettings) {
                 item { SettingsCard(settings) }
@@ -237,8 +239,10 @@ private fun App(settings: Settings) {
                             enabled = canDrive,
                             mark = markFor(snapshot, track.trackId),
                         ) {
+                            // The row already holds the whole track, so nothing is
+                            // asked of Yandex here — see `Commands.queueTracks`.
                             scope.launch {
-                                Commands.queueFrom("track", track.trackId, replace = false)
+                                Commands.queueTracks(listOf(track))
                                     .onFailure { error -> SyncHolder.say(error.message) }
                             }
                         }
@@ -289,6 +293,32 @@ private fun App(settings: Settings) {
                 val downloaded = library?.tracks ?: emptyList()
                 if (downloaded.isNotEmpty()) {
                     item { SectionTitle("На устройстве · ${downloaded.size} · ${librarySize(library)}") }
+                    item {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // Playing the whole library is how you listen with no
+                            // internet: every one of these comes off the disk.
+                            OutlinedButton(
+                                enabled = canDrive,
+                                onClick = {
+                                    scope.launch {
+                                        Commands.queueTracks(
+                                            downloaded.map { it.track },
+                                            replace = true,
+                                        ).onFailure { SyncHolder.say(it.message) }
+                                    }
+                                },
+                            ) { Text("Играть всё") }
+                            OutlinedButton(
+                                enabled = canDrive,
+                                onClick = {
+                                    scope.launch {
+                                        Commands.queueTracks(downloaded.map { it.track })
+                                            .onFailure { SyncHolder.say(it.message) }
+                                    }
+                                },
+                            ) { Text("В очередь") }
+                        }
+                    }
                     items(downloaded.size, key = { "c${downloaded[it].track.trackId}" }) { index ->
                         val entry = downloaded[index]
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -300,8 +330,10 @@ private fun App(settings: Settings) {
                                 modifier = Modifier.weight(1f),
                                 trailing = formatSize(entry.bytes),
                             ) {
+                                // The metadata was stored beside the audio, so this
+                                // needs neither Yandex nor a network at all.
                                 scope.launch {
-                                    Commands.queueFrom("track", entry.track.trackId, replace = false)
+                                    Commands.queueTracks(listOf(entry.track))
                                         .onFailure { error -> SyncHolder.say(error.message) }
                                 }
                             }
@@ -387,16 +419,18 @@ private fun StatusLine(snapshot: Snapshot?, message: String?) {
     }
 }
 
+/**
+ * Getting into a room: the name and the password, then the two ways in.
+ *
+ * «Подключиться» dials the address; «Хостить» runs the room's relay on this phone,
+ * which is also what listening with no internet looks like — the queue and the
+ * playhead need an authority, and with nothing to dial the phone becomes it.
+ */
 @Composable
-private fun SettingsCard(settings: Settings) {
-    var relay by remember { mutableStateOf(settings.relay) }
+private fun RoomCard(settings: Settings, onEnter: (Boolean) -> Unit) {
     var room by remember { mutableStateOf(settings.room) }
-    var roomToken by remember { mutableStateOf(settings.roomToken) }
-    var yandexToken by remember { mutableStateOf(settings.yandexToken) }
-    var bias by remember { mutableStateOf(settings.positionBiasMs.toString()) }
-    var hostRoom by remember { mutableStateOf(settings.hostRoom) }
-    var autoCache by remember { mutableStateOf(settings.autoCache) }
-    var cacheLimit by remember { mutableStateOf(settings.cacheLimitGb.toString()) }
+    var password by remember { mutableStateOf(settings.password) }
+    var relay by remember { mutableStateOf(settings.relay) }
     var searching by remember { mutableStateOf(false) }
     var found by remember { mutableStateOf(emptyList<FoundRoom>()) }
     val scope = rememberCoroutineScope()
@@ -407,44 +441,63 @@ private fun SettingsCard(settings: Settings) {
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             OutlinedTextField(
-                value = relay,
-                onValueChange = { relay = it; settings.relay = it },
-                label = { Text("релей") },
+                value = room,
+                onValueChange = { room = it; settings.room = it },
+                label = { Text("название комнаты") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
-                value = room,
-                onValueChange = { room = it; settings.room = it },
-                label = { Text("комната") },
+                value = password,
+                onValueChange = { password = it; settings.password = it },
+                label = { Text("пароль комнаты") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "Название и пароль должны совпадать у всех участников.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            HorizontalDivider()
+
+            OutlinedTextField(
+                value = relay,
+                onValueChange = { relay = it; settings.relay = it },
+                label = { Text("адрес комнаты") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
 
-            // Fills the two fields above from the network, so nobody has to read
-            // an IP address off another screen and type it in.
-            OutlinedButton(
-                enabled = !searching,
-                onClick = {
-                    searching = true
-                    scope.launch {
-                        Commands.findRooms()
-                            .onSuccess { rooms ->
-                                found = rooms
-                                SyncHolder.say(
-                                    if (rooms.isEmpty()) {
-                                        "в сети никто не отвечает — комнату держит " +
-                                            "ymsync-relay или участник с включённым хостингом"
-                                    } else {
-                                        "нашлось комнат: ${rooms.size}"
-                                    },
-                                )
-                            }
-                            .onFailure { SyncHolder.say(it.message) }
-                        searching = false
-                    }
-                },
-            ) { Text(if (searching) "Ищу…" else "Найти комнаты в сети") }
+            // Fills the address in from the network, so nobody has to read an IP
+            // off another screen and type it in.
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    enabled = !searching,
+                    onClick = {
+                        searching = true
+                        scope.launch {
+                            Commands.findRooms()
+                                .onSuccess { rooms ->
+                                    found = rooms
+                                    SyncHolder.say(
+                                        if (rooms.isEmpty()) {
+                                            "в сети никто не отвечает — комнату держит " +
+                                                "ymsync-relay или участник, нажавший «Хостить»"
+                                        } else {
+                                            "нашлось комнат: ${rooms.size}"
+                                        },
+                                    )
+                                }
+                                .onFailure { SyncHolder.say(it.message) }
+                            searching = false
+                        }
+                    },
+                ) { Text(if (searching) "Ищу…" else "Найти в сети") }
+
+                Button(onClick = { onEnter(false) }) { Text("Подключиться") }
+            }
 
             found.forEach { candidate ->
                 TextButton(
@@ -455,14 +508,11 @@ private fun SettingsCard(settings: Settings) {
                         relay = candidate.relay
                         settings.relay = candidate.relay
                         // An empty name means that relay holds no rooms yet, so
-                        // the one already configured here is what will be created.
+                        // the name in the field is what will be created.
                         if (candidate.room.isNotEmpty()) {
                             room = candidate.room
                             settings.room = candidate.room
                         }
-                        // Joining somebody's room and holding your own are opposites.
-                        hostRoom = false
-                        settings.hostRoom = false
                         SyncHolder.say("вписал ${candidate.relay}")
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -479,42 +529,42 @@ private fun SettingsCard(settings: Settings) {
                     )
                 }
             }
-            OutlinedTextField(
-                value = roomToken,
-                onValueChange = { roomToken = it; settings.roomToken = it },
-                label = { Text("токен комнаты") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+
+            HorizontalDivider()
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Комнату будет держать этот телефон: адрес для остальных " +
+                        "появится в строке состояния. Так же выглядит и " +
+                        "прослушивание скачанного без интернета.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = { onEnter(true) }) { Text("Хостить") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsCard(settings: Settings) {
+    var yandexToken by remember { mutableStateOf(settings.yandexToken) }
+    var autoCache by remember { mutableStateOf(settings.autoCache) }
+    var cacheLimit by remember { mutableStateOf(settings.cacheLimitGb.toString()) }
+
+    Card {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             OutlinedTextField(
                 value = yandexToken,
                 onValueChange = { yandexToken = it; settings.yandexToken = it },
                 label = { Text("токен Яндекса (этого устройства)") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = bias,
-                onValueChange = { typed ->
-                    bias = typed.filter { it.isDigit() || it == '-' }
-                    val ms = bias.toIntOrNull() ?: 0
-                    settings.positionBiasMs = ms
-                    // Also pushed into a running session: the core reads the
-                    // config only when it starts, so without this the figure
-                    // could only be calibrated through a reconnect — which is
-                    // exactly when you want to watch the drift react.
-                    scope.launch { Commands.send("bias") { put("ms", ms) } }
-                },
-                label = { Text("поправка позиции, мс") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                "ExoPlayer сообщает позицию с постоянным отставанием. Посмотрите, " +
-                    "на какой величине стоит рассинхрон, и впишите её с обратным " +
-                    "знаком: «−400 мс» → 400.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 "В эмуляторе релей на компьютере доступен как 10.0.2.2",
@@ -524,13 +574,6 @@ private fun SettingsCard(settings: Settings) {
 
             HorizontalDivider()
 
-            SettingSwitch(
-                label = "держать комнату на этом телефоне",
-                hint = "релей не нужен: остальные вписывают адрес, который покажет строка " +
-                    "состояния. Так же выглядит и прослушивание скачанного без интернета.",
-                checked = hostRoom,
-                onChange = { hostRoom = it; settings.hostRoom = it },
-            )
             SettingSwitch(
                 label = "оставлять всё, что играет",
                 hint = "иначе на телефоне остаётся только скачанное кнопками «↓».",
@@ -550,7 +593,7 @@ private fun SettingsCard(settings: Settings) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                "Эти три применятся при следующем подключении: ядро читает настройки " +
+                "Эти два применятся при следующем подключении: ядро читает настройки " +
                     "при старте. Файлы лежат в ${settings.cacheDir} и удаляются вместе " +
                     "с приложением.",
                 style = MaterialTheme.typography.bodySmall,

@@ -13,10 +13,16 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1.0.104"
 jni = "0.21"
+# The JavaVM and app context, handed to `cpal`: its AAudio backend asks
+# `android.media.AudioTrack` for buffer sizes over JNI and panics without them.
+ndk-context = "0.1.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
-ymsync = { version = "0.1.0", path = "../app", default-features = false, features = ["tls-rustls"] }
+# `audio-rodio`: the phone plays with the same decoder and the same sink as the
+# desktop. `cpal` reaches the speakers through AAudio, which needs no C++ toolchain
+# — hence `--platform 26` when building, since AAudio arrived in API 26.
+ymsync = { version = "0.1.0", path = "../app", default-features = false, features = ["audio-rodio", "tls-rustls"] }
 ymsync-proto = { version = "0.1.0", path = "../proto" }
 
 [dev-dependencies]

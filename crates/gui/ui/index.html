@@ -10,19 +10,38 @@
 
 <body>
   <header>
-    <div class="brand">ym&#8209;sync</div>
-    <div class="connect">
-      <label class="tick" title="поднять релей в этом же процессе: остальные подключаются к адресу, который появится рядом">
-        <input id="host" type="checkbox" />
-        <span>комната здесь</span>
-      </label>
-      <input id="advertise" class="addr hidden" placeholder="192.168.1.10" title="какой адрес сообщать остальным; заполните, если определился не тот — например на машине с VPN" />
-      <button id="find-rooms" title="спросить сеть, кто держит комнату">Комнаты</button>
-      <select id="rooms" class="rooms hidden" title="найденные в сети комнаты"></select>
-      <button id="connect" class="primary">Подключиться</button>
+    <div class="top">
+      <div class="brand">ym&#8209;sync</div>
+      <button id="disconnect" class="hidden">Отключиться</button>
+      <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>
+      <div id="status" class="status">не подключено</div>
     </div>
-    <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>
-    <div id="status" class="status">не подключено</div>
+
+    <!-- Two ways into a room, and the same two fields for both: a room is a name
+         and a password. Which button you press decides who runs the relay. -->
+    <div id="setup" class="setup">
+      <div class="line">
+        <label for="room">комната</label>
+        <input id="room" placeholder="home" title="имя комнаты; у всех участников оно должно совпадать" />
+        <label for="password">пароль</label>
+        <input id="password" placeholder="общий секрет комнаты" title="общий секрет: без него в комнату не войти, и он должен совпадать у всех" />
+      </div>
+
+      <div class="line">
+        <label for="relay">адрес комнаты</label>
+        <input id="relay" placeholder="ws://192.168.1.10:8787" title="адрес того, кто держит комнату" />
+        <button id="find-rooms" title="спросить сеть, кто держит комнату">Комнаты</button>
+        <select id="rooms" class="rooms hidden" title="найденные в сети комнаты"></select>
+        <button id="connect" class="primary">Подключиться</button>
+      </div>
+
+      <div class="line">
+        <label for="advertise">адрес этого ПК</label>
+        <input id="advertise" placeholder="определю сам" title="какой адрес сообщать остальным, когда комнату держит этот ПК; заполните, если определился не тот — например на машине с VPN" />
+        <span class="hint inline">комнату будет держать этот ПК</span>
+        <button id="host">Хостить</button>
+      </div>
+    </div>
   </header>
 
   <main>

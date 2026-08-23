@@ -5,10 +5,11 @@
 //! ```kotlin
 //! object Native {
 //!     init { System.loadLibrary("ymsync_android") }
-//!     external fun start(configJson: String): String
-//!     external fun poll(handle: Long, playerStateJson: String): String
+//!     external fun start(configJson: String, context: Any): String
+//!     external fun snapshot(handle: Long): String
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
+//!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun library(handle: Long): String
 //!     external fun findRooms(waitMs: Int): String
@@ -22,15 +23,17 @@
 //!
 //! All of them take a session handle except `findRooms`, which is what you call
 //! before you know where to connect.
+//!
+//! `start` takes the app context as well: the audio backend reaches
+//! `android.media.AudioTrack` over JNI — see [`crate::install_android_context`].
 
 use std::fmt::Display;
 use std::time::Duration;
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 
-use crate::PlayerState;
 use crate::session::{Request, Session};
 
 /// Reconstructs a borrowed session from a handle.
@@ -74,36 +77,39 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_start(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
+    context: JObject,
 ) -> jstring {
     let text = match read(&mut env, &config_json) {
-        Ok(config) => match Session::start(&config) {
-            Ok(session) => {
-                let handle = Box::into_raw(Box::new(session)) as jlong;
-                ok(serde_json::json!({ "handle": handle }))
-            }
-            Err(err) => failed(err),
-        },
         Err(err) => failed(err),
+        // Before the session, because building it opens the audio device, and the
+        // audio device is reached through the JVM.
+        Ok(config) => match crate::install_android_context(&mut env, &context) {
+            Err(err) => failed(err),
+            Ok(()) => match Session::start(&config) {
+                Ok(session) => {
+                    let handle = Box::into_raw(Box::new(session)) as jlong;
+                    ok(serde_json::json!({ "handle": handle }))
+                }
+                Err(err) => failed(err),
+            },
+        },
     };
     reply(&mut env, &text)
 }
 
+/// What to draw right now.
+///
+/// Kotlin calls this on a timer. Nothing is handed in: since the player lives in
+/// Rust, the engine no longer has to be told what the audio is doing.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_mshiv_ymsync_Native_poll(
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_snapshot(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
-    player_state_json: JString,
 ) -> jstring {
-    let text = match read(&mut env, &player_state_json) {
-        Err(err) => failed(err),
-        Ok(json) => match serde_json::from_str::<PlayerState>(&json) {
-            Err(err) => failed(err),
-            Ok(state) => match unsafe { borrow(handle) } {
-                None => failed("сессия не запущена"),
-                Some(session) => ok(session.poll(state)),
-            },
-        },
+    let text = match unsafe { borrow(handle) } {
+        None => failed("сессия не запущена"),
+        Some(session) => ok(session.snapshot()),
     };
     reply(&mut env, &text)
 }
@@ -145,6 +151,33 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_search(
             None => failed("сессия не запущена"),
             Some(session) => match session.search(&query, limit.max(1) as usize) {
                 Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// Queues tracks the screen already holds in full.
+///
+/// Separate from `queueFrom` because a search result and a downloaded track need
+/// nothing looked up: tapping one used to cost a Yandex request for metadata that
+/// was already on screen — and for a track on this disk, a trip to the internet to
+/// play something that was already here.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_queueTracks(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    tracks_json: JString,
+    replace: jboolean,
+) -> jstring {
+    let text = match read(&mut env, &tracks_json) {
+        Err(err) => failed(err),
+        Ok(json) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.queue_tracks(&json, replace != 0) {
+                Ok(length) => ok(serde_json::json!({ "queued": length })),
                 Err(err) => failed(err),
             },
         },

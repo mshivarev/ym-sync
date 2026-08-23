@@ -47,9 +47,8 @@ android {
 
     buildTypes {
         release {
-            // Shrinking is off: R8 has no rules for the JNI entry points or for
-            // reflection inside Media3 here, and a broken release is worse than a
-            // larger one.
+            // Shrinking is off: R8 has no rules for the JNI entry points here, and
+            // a broken release is worse than a larger one.
             isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release")
         }
@@ -81,8 +80,6 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.0")
-    implementation("androidx.media3:media3-exoplayer:1.7.1")
-    implementation("androidx.media3:media3-session:1.7.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

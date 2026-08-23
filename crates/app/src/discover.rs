@@ -44,9 +44,8 @@ pub struct FoundRoom {
 
 /// Asks the network which rooms are out there.
 ///
-/// Both a broadcast and a loopback copy of the question go out: a relay running
-/// on this very machine is the most likely thing to find, and a broadcast does
-/// not always come back to its own host.
+/// The question goes to every network this machine is on, plus a loopback copy —
+/// see [`targets`] for why that is not one datagram but several.
 pub async fn find_rooms(wait: Duration) -> Result<Vec<FoundRoom>> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
@@ -60,12 +59,8 @@ pub async fn find_rooms(wait: Duration) -> Result<Vec<FoundRoom>> {
     })
     .context("encoding the discovery query")?;
 
-    let targets = [
-        SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT)),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, DISCOVERY_PORT)),
-    ];
     let mut sent = 0;
-    for target in targets {
+    for target in targets() {
         match socket.send_to(&question, target).await {
             Ok(_) => sent += 1,
             // A machine with no network at all cannot broadcast; the loopback
@@ -80,14 +75,76 @@ pub async fn find_rooms(wait: Duration) -> Result<Vec<FoundRoom>> {
     Ok(collect(&socket, wait).await)
 }
 
+/// Every address the question is sent to.
+///
+/// `255.255.255.255` is not enough on its own, and this is what made a phone
+/// holding a room invisible from the desktop. The limited broadcast leaves
+/// through exactly one interface, chosen by the routing table, and on a machine
+/// with a VPN, a Hyper-V switch, Wi-Fi and Ethernet all at once that is very
+/// often not the network the phone is on. A *directed* broadcast — `192.168.3.255`
+/// — names the network instead, so the kernel sends it out of the interface that
+/// owns it. One per interface therefore goes out as well.
+///
+/// The loopback copy is for a relay running on this very machine: a broadcast
+/// does not always come back to its own host.
+fn targets() -> Vec<SocketAddr> {
+    let mut targets = vec![
+        SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, DISCOVERY_PORT)),
+    ];
+    for address in directed_broadcasts() {
+        targets.push(SocketAddr::from((address, DISCOVERY_PORT)));
+    }
+    targets
+}
+
+/// The broadcast address of every IPv4 network this machine is attached to.
+///
+/// Failure is not fatal: without this list the limited broadcast still goes out,
+/// which is what every earlier version relied on.
+fn directed_broadcasts() -> Vec<Ipv4Addr> {
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces,
+        Err(err) => {
+            debug!(%err, "cannot enumerate interfaces; broadcasting blind");
+            return Vec::new();
+        }
+    };
+
+    let mut addresses = Vec::new();
+    for interface in interfaces {
+        let if_addrs::IfAddr::V4(v4) = interface.addr else {
+            continue;
+        };
+        if v4.ip.is_loopback() {
+            continue;
+        }
+        // Windows fills `broadcast` in; on Android it comes back empty, and the
+        // netmask is then what says how wide the network is.
+        let address = v4.broadcast.unwrap_or_else(|| broadcast_of(v4.ip, v4.netmask));
+        if address.is_unspecified() || address.is_broadcast() || addresses.contains(&address) {
+            continue;
+        }
+        addresses.push(address);
+    }
+    addresses
+}
+
+/// The broadcast address of the network `ip` sits in: every host bit set.
+fn broadcast_of(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
+}
+
 /// Gathers answers until the deadline, keeping one entry per room.
 async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
     let deadline = tokio::time::Instant::now() + wait;
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     // Keyed by the answering process and the room name, not by address: a relay on
-    // this machine answers both the broadcast and the loopback copy, and those two
-    // are one relay at two addresses rather than two relays.
-    let mut found: HashMap<(u64, String), FoundRoom> = HashMap::new();
+    // this machine answers once per network it can be reached on, and those are one
+    // relay at several addresses rather than several relays.
+    let mut found: HashMap<(u64, String), Answer> = HashMap::new();
+    // Which of our own addresses is the one the world uses; see [`rank_address`].
+    let ours = crate::net::lan_address();
 
     loop {
         let received = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await;
@@ -118,6 +175,7 @@ async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
         // addresses. Only the port is taken on trust, because discovery has one
         // well-known port and the relay may listen on another.
         let relay = relay_url(from.ip(), port);
+        let rank = rank_address(from.ip(), ours);
         let compatible = protocol == PROTOCOL_VERSION;
 
         // A relay holding nothing is still the answer to "куда подключаться": a
@@ -126,6 +184,7 @@ async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
             remember(
                 &mut found,
                 (id, String::new()),
+                rank,
                 FoundRoom {
                     relay,
                     room: String::new(),
@@ -141,6 +200,7 @@ async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
             remember(
                 &mut found,
                 (id, brief.name.clone()),
+                rank,
                 FoundRoom {
                     relay: relay.clone(),
                     room: brief.name,
@@ -152,7 +212,7 @@ async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
         }
     }
 
-    let mut rooms: Vec<FoundRoom> = found.into_values().collect();
+    let mut rooms: Vec<FoundRoom> = found.into_values().map(|answer| answer.room).collect();
     // Usable rooms first, then the busiest, then by name so the list holds still
     // between two searches.
     rooms.sort_by(|a, b| {
@@ -165,22 +225,47 @@ async fn collect(socket: &UdpSocket, wait: Duration) -> Vec<FoundRoom> {
     rooms
 }
 
-/// Records an answer, preferring an address other machines could also use.
-///
-/// The same relay is reached at both its LAN address and loopback, and only the
-/// first of those is worth showing: it is the one that goes in a config file and
-/// the one that still works from the next room.
-fn remember(found: &mut HashMap<(u64, String), FoundRoom>, key: (u64, String), room: FoundRoom) {
+/// One room as somebody answered for it, with how good that answer's address is.
+struct Answer {
+    rank: u8,
+    room: FoundRoom,
+}
+
+/// Records an answer, keeping the best address for each relay and room.
+fn remember(
+    found: &mut HashMap<(u64, String), Answer>,
+    key: (u64, String),
+    rank: u8,
+    room: FoundRoom,
+) {
     match found.get(&key) {
-        Some(kept) if !is_loopback_url(&kept.relay) => {}
+        Some(kept) if kept.rank >= rank => {}
         _ => {
-            found.insert(key, room);
+            found.insert(key, Answer { rank, room });
         }
     }
 }
 
-fn is_loopback_url(relay: &str) -> bool {
-    relay.contains("//127.") || relay.contains("//[::1]")
+/// How useful an address is to hand to somebody else. Higher wins.
+///
+/// A relay on this very machine answers once per network it can be reached on:
+/// loopback, the Wi-Fi or Ethernet, and every virtual switch that Docker, WSL and
+/// Hyper-V left behind. Only one of those is worth putting in a config file or
+/// reading out to another device, and it is the address on the network that
+/// carries the default route — a `172.21.x.x` from a virtual switch reaches this
+/// machine and nothing else.
+///
+/// `ours` is this machine's address as the routing table sees it, so the match
+/// only ever fires for a relay running here; answers from other devices are all
+/// equally good, and the first one is kept.
+fn rank_address(ip: IpAddr, ours: Option<Ipv4Addr>) -> u8 {
+    if ip.is_loopback() {
+        return 0;
+    }
+    match (ip, ours) {
+        (IpAddr::V4(ip), Some(ours)) if ip == ours => 2,
+        _ => 1,
+    }
 }
 
 fn relay_url(ip: IpAddr, port: u16) -> String {
@@ -288,6 +373,51 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    /// The netmask decides how wide the network is, and a phone reports no
+    /// broadcast address of its own, so this is the arithmetic the search relies
+    /// on to reach it.
+    #[test]
+    fn a_broadcast_address_is_derived_from_the_netmask() {
+        assert_eq!(
+            broadcast_of(
+                Ipv4Addr::new(192, 168, 3, 50),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Ipv4Addr::new(192, 168, 3, 255)
+        );
+        assert_eq!(
+            broadcast_of(Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(255, 255, 0, 0)),
+            Ipv4Addr::new(10, 1, 255, 255)
+        );
+        // A single-host route has no room to broadcast into, and must not turn
+        // into the limited broadcast by accident.
+        assert_eq!(
+            broadcast_of(
+                Ipv4Addr::new(192, 168, 3, 50),
+                Ipv4Addr::new(255, 255, 255, 255)
+            ),
+            Ipv4Addr::new(192, 168, 3, 50)
+        );
+    }
+
+    /// Whatever the interfaces look like, the two addresses that worked before
+    /// this feature existed are still asked.
+    #[test]
+    fn the_question_always_goes_to_the_broadcast_and_to_loopback() {
+        let targets = targets();
+        assert!(targets.contains(&SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))));
+        assert!(targets.contains(&SocketAddr::from((Ipv4Addr::LOCALHOST, DISCOVERY_PORT))));
+        // Every target is the well-known port: a relay answers there and nowhere
+        // else.
+        assert!(targets.iter().all(|target| target.port() == DISCOVERY_PORT));
+        // Asking the same network twice would produce duplicate answers from one
+        // relay, which the `id` in the reply is not there to paper over.
+        let mut seen = targets.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), targets.len(), "{targets:?}");
+    }
+
     #[test]
     fn a_relay_url_is_built_for_the_address_family() {
         assert_eq!(
@@ -300,19 +430,26 @@ mod tests {
         );
     }
 
-    /// A relay on this machine answers both the broadcast and the loopback copy.
-    /// It is one relay, and the address worth keeping is the one that also works
-    /// from another machine.
+    /// A relay on this machine answers once per network it can be reached on. It
+    /// is one relay, and the address worth keeping is the one that also works from
+    /// another machine.
     #[test]
-    fn one_relay_at_two_addresses_is_listed_once() {
+    fn one_relay_at_several_addresses_is_listed_once() {
+        let ours = Ipv4Addr::new(192, 168, 1, 10);
         let mut found = HashMap::new();
         let key = (7, "home".to_string());
-        for relay in ["ws://127.0.0.1:8787", "ws://192.168.1.10:8787"] {
+        for ip in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            // A virtual switch: reaches this machine and nothing else.
+            IpAddr::from([172, 21, 176, 1]),
+            IpAddr::from(ours),
+        ] {
             remember(
                 &mut found,
                 key.clone(),
+                rank_address(ip, Some(ours)),
                 FoundRoom {
-                    relay: relay.to_string(),
+                    relay: relay_url(ip, 8787),
                     room: "home".into(),
                     listeners: 1,
                     protocol: PROTOCOL_VERSION,
@@ -321,28 +458,49 @@ mod tests {
             );
         }
         assert_eq!(found.len(), 1);
-        assert_eq!(found[&key].relay, "ws://192.168.1.10:8787");
+        assert_eq!(found[&key].room.relay, "ws://192.168.1.10:8787");
     }
 
-    /// The order the two answers arrive in must not decide which address is kept.
+    /// The order the answers arrive in must not decide which address is kept: the
+    /// virtual switch usually answers first, being the shorter path.
     #[test]
     fn the_routable_address_wins_whichever_arrives_first() {
-        let mut found = HashMap::new();
-        let key = (7, String::new());
-        for relay in ["ws://192.168.1.10:8787", "ws://127.0.0.1:8787"] {
-            remember(
-                &mut found,
-                key.clone(),
-                FoundRoom {
-                    relay: relay.to_string(),
-                    room: String::new(),
-                    listeners: 0,
-                    protocol: PROTOCOL_VERSION,
-                    compatible: true,
-                },
-            );
+        let ours = Ipv4Addr::new(192, 168, 1, 10);
+        for order in [
+            [IpAddr::from(ours), IpAddr::from([172, 21, 176, 1])],
+            [IpAddr::from([172, 21, 176, 1]), IpAddr::from(ours)],
+        ] {
+            let mut found = HashMap::new();
+            let key = (7, String::new());
+            for ip in order {
+                remember(
+                    &mut found,
+                    key.clone(),
+                    rank_address(ip, Some(ours)),
+                    FoundRoom {
+                        relay: relay_url(ip, 8787),
+                        room: String::new(),
+                        listeners: 0,
+                        protocol: PROTOCOL_VERSION,
+                        compatible: true,
+                    },
+                );
+            }
+            assert_eq!(found[&key].room.relay, "ws://192.168.1.10:8787", "{order:?}");
         }
-        assert_eq!(found[&key].relay, "ws://192.168.1.10:8787");
+    }
+
+    /// Answers from other devices carry addresses this machine knows nothing
+    /// about, and any of them is better than loopback.
+    #[test]
+    fn a_stranger_beats_loopback_and_ties_with_a_stranger() {
+        let ours = Some(Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(rank_address(IpAddr::from(Ipv4Addr::LOCALHOST), ours), 0);
+        assert_eq!(rank_address(IpAddr::from([192, 168, 1, 55]), ours), 1);
+        assert_eq!(rank_address(IpAddr::from([192, 168, 1, 10]), ours), 2);
+        // With no network of our own there is nothing to compare against, and the
+        // answer still has to be usable.
+        assert_eq!(rank_address(IpAddr::from([192, 168, 1, 55]), None), 1);
     }
 
     /// Two relays that both hold a room called «home» are two entries, which is
@@ -354,6 +512,7 @@ mod tests {
             remember(
                 &mut found,
                 (id, "home".to_string()),
+                1,
                 FoundRoom {
                     relay: relay.to_string(),
                     room: "home".into(),

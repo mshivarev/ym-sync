@@ -1,7 +1,7 @@
 //! One live sync session, owned by the JNI layer.
 //!
-//! Holds the tokio runtime the engine runs on, so the whole thing dies together
-//! when Kotlin calls `stop`.
+//! Holds the tokio runtime the engine runs on and the audio sink, so the whole
+//! thing dies together when Kotlin calls `stop`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +12,9 @@ use ymsync::api::{self, Track, YandexMusic};
 use ymsync::config::Config;
 use ymsync::engine::{Command, Handle};
 use ymsync::playback::Playback;
+use ymsync::player::Player;
 use ymsync::session::{self as core, Session as CoreSession};
 use ymsync_proto::TrackRef;
-
-use crate::{ExternalPlayback, PlayerState};
 
 /// A playback request from the UI. Mirrors [`engine::Command`], minus the parts
 /// the Android UI has no business sending.
@@ -31,8 +30,6 @@ pub enum Request {
     Index { index: usize },
     /// Stops feeding the wave. What is already queued still plays.
     StopWave,
-    /// Recalibrates ExoPlayer's reporting lag without a reconnect.
-    Bias { ms: i64 },
     /// Keeps music on this device: the whole queue, or just what is playing.
     Download { queue: bool },
     /// Forgets everything still waiting to be downloaded.
@@ -58,7 +55,6 @@ impl Request {
             Request::Volume { value } => Command::SetVolume(value),
             Request::Index { index } => Command::PlayIndex(index),
             Request::StopWave => Command::StopStation,
-            Request::Bias { ms } => Command::SetPositionBias(ms),
             Request::CancelDownloads => Command::CancelDownloads,
             Request::Forget { track_id } => Command::Forget { track_id },
             Request::Download { .. } => return None,
@@ -72,8 +68,7 @@ pub struct Session {
     /// room, and the file server offering its downloads to the others.
     core: CoreSession,
     api: Arc<YandexMusic>,
-    playback: Arc<ExternalPlayback>,
-    /// Queue revision Kotlin has already been given; see [`Session::poll`].
+    /// Queue revision Kotlin has already been given; see [`Session::snapshot`].
     sent_revision: AtomicU64,
     /// Same idea for the list of downloaded ids.
     sent_cache_revision: AtomicU64,
@@ -95,14 +90,17 @@ impl Session {
             .context("создание рантайма")?;
 
         let api = Arc::new(YandexMusic::new(cfg.require_yandex_token()?)?);
-        let playback = Arc::new(ExternalPlayback::new(cfg.volume));
+        // Opening the audio device blocks; this call already runs on a Kotlin
+        // background thread. The same player as the desktop: the track is decoded
+        // from memory, so seeking costs a decoder reset instead of a re-buffer.
+        let player = Arc::new(Player::new(cfg.volume).context("не удалось открыть звук")?);
         // Kotlin passes an app-private path in `cache.dir`, which is the only
         // place this process may write without asking for a permission.
         let cache = core::open_cache(&cfg)?;
         let core = runtime.block_on(core::start(
             &cfg,
             Arc::clone(&api),
-            Arc::clone(&playback) as Arc<dyn Playback>,
+            player as Arc<dyn Playback>,
             cache,
         ))?;
 
@@ -110,7 +108,6 @@ impl Session {
             runtime,
             core,
             api,
-            playback,
             // Revisions start at 1, so the first queue is always sent.
             sent_revision: AtomicU64::new(0),
             // The cache revision does start at 0, so this one has to begin
@@ -123,15 +120,12 @@ impl Session {
         self.core.handle()
     }
 
-    /// The one call Kotlin makes on a timer: hand in the player's state, take out
-    /// the engine snapshot and whatever the engine wants the player to do.
+    /// The one call Kotlin makes on a timer: what to draw.
     ///
     /// The queue is left out unless it changed. «Мне нравится» runs to well over
     /// a thousand tracks, and serialising that five times a second would cost
     /// more than the playback itself.
-    pub fn poll(&self, state: PlayerState) -> serde_json::Value {
-        self.playback.report(state);
-
+    pub fn snapshot(&self) -> serde_json::Value {
         let snapshot = self.engine().snapshot();
         let revision = snapshot.queue_revision;
         let known = self.sent_revision.swap(revision, Ordering::Relaxed) == revision;
@@ -150,11 +144,7 @@ impl Session {
                 object.remove("cached");
             }
         }
-
-        serde_json::json!({
-            "snapshot": snapshot,
-            "commands": self.playback.drain(),
-        })
+        snapshot
     }
 
     pub fn send(&self, request: Request) {
@@ -197,6 +187,23 @@ impl Session {
             .runtime
             .block_on(self.api.search_tracks(query.trim(), limit.clamp(1, 50)))?;
         Ok(found.iter().map(Track::to_track_ref).collect())
+    }
+
+    /// Queues tracks the screen already holds in full.
+    ///
+    /// This is how a row is played: a search result and a downloaded track both
+    /// arrive complete — title, artist, length — so asking Yandex to describe them
+    /// again would be a pointless request, and for a track on this disk it would
+    /// mean going to the internet to play something that is already here. The
+    /// engine then resolves the audio itself, in its own order: this disk, then a
+    /// peer on the local network, then Yandex.
+    pub fn queue_tracks(&self, tracks_json: &str, replace: bool) -> Result<usize> {
+        let tracks: Vec<TrackRef> =
+            serde_json::from_str(tracks_json).context("разбор списка треков")?;
+        if tracks.is_empty() {
+            bail!("пустой список треков");
+        }
+        Ok(self.queue(tracks, replace))
     }
 
     /// Resolves a source into tracks and hands them to the engine. Returns how
@@ -296,7 +303,6 @@ mod tests {
             ),
             (r#"{"action":"index","index":3}"#, Command::PlayIndex(3)),
             (r#"{"action":"stop_wave"}"#, Command::StopStation),
-            (r#"{"action":"bias","ms":400}"#, Command::SetPositionBias(400)),
             (
                 r#"{"action":"cancel_downloads"}"#,
                 Command::CancelDownloads,
@@ -330,5 +336,20 @@ mod tests {
     #[test]
     fn an_unknown_action_is_rejected() {
         assert!(serde_json::from_str::<Request>(r#"{"action":"launch_rocket"}"#).is_err());
+    }
+
+    /// The shape the screen sends when a row is tapped. Nothing here may need the
+    /// network: that is the whole point of the call.
+    #[test]
+    fn a_row_from_the_screen_parses_into_tracks() {
+        let json = r#"[
+            {"track_id":"42","title":"T","artist":"A","duration_ms":1000},
+            {"track_id":"43","album_id":"7","title":"U","artist":"B","duration_ms":2000}
+        ]"#;
+        let tracks: Vec<TrackRef> = serde_json::from_str(json).expect("tracks");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].track_id, "42");
+        assert_eq!(tracks[1].album_id.as_deref(), Some("7"));
+        assert_eq!(tracks[1].duration_ms, 2000);
     }
 }

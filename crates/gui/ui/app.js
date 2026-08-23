@@ -5,11 +5,16 @@ const { listen } = window.__TAURI__.event;
 
 const el = (id) => document.getElementById(id);
 const ui = {
+  setup: el("setup"),
+  room: el("room"),
+  password: el("password"),
+  relay: el("relay"),
+  advertise: el("advertise"),
   connect: el("connect"),
+  host: el("host"),
+  disconnect: el("disconnect"),
   status: el("status"),
   hosting: el("hosting"),
-  host: el("host"),
-  advertise: el("advertise"),
   findRooms: el("find-rooms"),
   rooms: el("rooms"),
   kind: el("kind"),
@@ -70,9 +75,6 @@ let autoCache = false;
 /// Ids that cost no internet: on this disk, or on somebody else's in the room.
 let cachedIds = new Set();
 let lanIds = new Set();
-/// A room picked out of the network: overrides the configured relay and room for
-/// the next connect only.
-let chosenRoom = null;
 
 function fmt(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
@@ -105,19 +107,16 @@ async function call(command, args) {
 
 function setConnected(value) {
   connected = value;
-  ui.connect.textContent = value ? "Отключиться" : "Подключиться";
-  ui.connect.classList.toggle("primary", !value);
+  // The way into a room is only interesting when you are not in one: while
+  // connected the header carries the room's state instead.
+  ui.setup.classList.toggle("hidden", value);
+  ui.disconnect.classList.toggle("hidden", !value);
 
   // Protocol 3 has no roles: everyone in the room may drive it.
   for (const node of [ui.kind, ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek,
     ui.dlTrack, ui.dlQueue]) {
     node.disabled = !value;
   }
-  // Hosting is chosen before the relay is bound, so it cannot change mid-session.
-  ui.host.disabled = value;
-  ui.advertise.disabled = value;
-  ui.findRooms.disabled = value;
-  ui.rooms.disabled = value;
   updateLibraryButtons();
 
   if (!value) {
@@ -126,6 +125,10 @@ function setConnected(value) {
     libraryRevision = -1;
     cachedIds = new Set();
     lanIds = new Set();
+    ui.connect.textContent = "Подключиться";
+    ui.host.textContent = "Хостить";
+    ui.connect.disabled = false;
+    ui.host.disabled = false;
     ui.status.className = "status";
     ui.status.textContent = "не подключено";
     ui.drift.classList.add("hidden");
@@ -356,45 +359,39 @@ function render(snapshot) {
   }
 }
 
-ui.connect.addEventListener("click", async () => {
+/// Joins a room, or holds it here. The two buttons differ only in `host`.
+async function enter(button, host) {
   ui.connect.disabled = true;
-  try {
-    if (connected) {
-      await call("disconnect");
-      setConnected(false);
-      return;
-    }
-    ui.connect.textContent = "Подключаюсь…";
-    const snapshot = await call("connect", {
-      host: ui.host.checked,
-      advertise: ui.advertise.value,
-      relay: chosenRoom?.relay ?? "",
-      room: chosenRoom?.room ?? "",
-    });
-    if (snapshot) {
-      setConnected(true);
-      render(snapshot);
-    } else {
-      setConnected(false);
-    }
-  } finally {
-    ui.connect.disabled = false;
+  ui.host.disabled = true;
+  const label = button.textContent;
+  button.textContent = host ? "Поднимаю…" : "Подключаюсь…";
+
+  const snapshot = await call("connect", {
+    host,
+    advertise: ui.advertise.value,
+    relay: ui.relay.value,
+    room: ui.room.value,
+    password: ui.password.value,
+  });
+
+  button.textContent = label;
+  if (snapshot) {
+    setConnected(true);
+    render(snapshot);
+  } else {
+    setConnected(false);
   }
-});
-
-// The address only matters while hosting, and guessing wrong is the one thing
-// that cannot be worked out automatically — see `ymsync::net`.
-ui.host.addEventListener("change", () => {
-  ui.advertise.classList.toggle("hidden", !ui.host.checked);
-  // Holding the room yourself and joining somebody else's are opposites.
-  if (ui.host.checked) clearChosenRoom();
-});
-
-/// Forgets a room picked out of the network, going back to the configured one.
-function clearChosenRoom() {
-  chosenRoom = null;
-  ui.rooms.value = "";
 }
+
+ui.connect.addEventListener("click", () => enter(ui.connect, false));
+ui.host.addEventListener("click", () => enter(ui.host, true));
+
+ui.disconnect.addEventListener("click", async () => {
+  ui.disconnect.disabled = true;
+  await call("disconnect");
+  ui.disconnect.disabled = false;
+  setConnected(false);
+});
 
 // Discovery is a question to the network, not to the relay: it works before
 // anything is configured, which is the point — the answer is what to configure.
@@ -411,16 +408,15 @@ ui.findRooms.addEventListener("click", async () => {
 
   if (found.length === 0) {
     ui.rooms.classList.add("hidden");
-    clearChosenRoom();
-    toast("в сети никто не отвечает — комнату держит ymsync-relay или участник с «комната здесь»");
+    toast("в сети никто не отвечает — комнату держит ymsync-relay или участник, нажавший «Хостить»");
     return;
   }
 
   ui.rooms.replaceChildren(
     new Option("комната из сети…", ""),
     ...found.map((room, index) => {
-      // An empty name means the relay holds no rooms yet: pick it and the
-      // configured room name is used, which is what creates one.
+      // An empty name means the relay holds no rooms yet: pick it and the name
+      // in the field is what will be created.
       const name = room.room || "комнат пока нет";
       const listeners = room.listeners ? ` · ${room.listeners}` : "";
       const version = room.compatible ? "" : " · другая версия";
@@ -432,15 +428,13 @@ ui.findRooms.addEventListener("click", async () => {
     }),
   );
   ui.rooms.classList.remove("hidden");
+  // Picking a room fills the fields rather than remembering a choice of its own:
+  // what is on screen is then exactly what will be connected to.
   ui.rooms.onchange = () => {
     const room = found[Number(ui.rooms.value)];
-    chosenRoom = room ? { relay: room.relay, room: room.room } : null;
-    if (chosenRoom) {
-      // Joining somebody's room and hosting your own are mutually exclusive.
-      ui.host.checked = false;
-      ui.advertise.classList.add("hidden");
-      ui.status.textContent = `${chosenRoom.room || "комната из конфига"} · ${chosenRoom.relay}`;
-    }
+    if (!room) return;
+    ui.relay.value = room.relay;
+    if (room.room) ui.room.value = room.room;
   };
   toast(`нашлось: ${found.length}`);
 });
@@ -560,6 +554,9 @@ listen("closed", () => {
     setConnected(false);
   }
 }).catch(() => {});
+// Settings that could not be written back: the fields would look remembered and
+// come up empty next launch.
+listen("notice", (event) => toast(String(event.payload))).catch(() => {});
 
 (async function start() {
   ui.source.placeholder = PLACEHOLDERS[ui.kind.value];
@@ -569,26 +566,24 @@ listen("closed", () => {
   if (!settings) return;
 
   ui.volume.value = Math.round(settings.volume * 100);
-  // While hosting there is no relay to name: this app is the relay, and its
-  // address is only known once the socket is bound.
-  ui.status.textContent = settings.hosting
-    ? `${settings.room} · комнату держит это устройство`
-    : `${settings.room} · ${settings.relay}`;
-
-  // The file supplies the default; the tick can still be changed per run.
-  ui.host.checked = settings.hosting;
+  // The file supplies the defaults; both buttons then act on what is on screen,
+  // and whatever connects is written back.
+  ui.room.value = settings.room;
+  ui.password.value = settings.password;
+  ui.relay.value = settings.relay;
   ui.advertise.value = settings.advertise;
-  ui.advertise.classList.toggle("hidden", !settings.hosting);
+  ui.status.textContent = settings.hosting
+    ? `${settings.room} · в прошлый раз комнату держал этот ПК`
+    : `${settings.room} · ${settings.relay}`;
 
   cacheDir = settings.cache_dir;
   cacheLimit = settings.cache_limit_bytes;
   autoCache = settings.auto_cache;
   await refreshLibrary();
 
-  const missing = [];
-  if (!settings.has_yandex_token) missing.push("yandex_token");
-  if (!settings.has_room_token) missing.push("room_token");
-  if (missing.length) {
-    toast(`Заполните ${missing.join(" и ")} в ${settings.config_path}`);
+  // The room's password is a field now; the Yandex token is the one thing that
+  // still has to be put in the file by hand.
+  if (!settings.has_yandex_token) {
+    toast(`Впишите yandex_token в ${settings.config_path}`);
   }
 })();

@@ -74,6 +74,29 @@ object Commands {
     }
 
     /**
+     * Queues tracks the screen already holds in full: a search result, a row of
+     * the offline library.
+     *
+     * Costs no Yandex request — which is why tapping a downloaded track now plays
+     * off the disk instead of going to the internet for metadata that was already
+     * on screen. The core still decides where the audio comes from: this disk
+     * first, then somebody in the room, then Yandex.
+     */
+    suspend fun queueTracks(tracks: List<TrackInfo>, replace: Boolean = false): Result<Int> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        if (tracks.isEmpty()) return Result.success(0)
+        val payload = tracks.toJsonArray().toString()
+        val reply = withContext(Dispatchers.IO) {
+            parseReply(Native.queueTracks(handle, payload, replace))
+        }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.optInt("queued"))
+        }
+    }
+
+    /**
      * Loads a source into the queue. `replace` throws the current queue away;
      * otherwise the tracks go on the end of it.
      */
