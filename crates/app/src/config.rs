@@ -98,8 +98,13 @@ impl CacheConfig {
 pub struct ShareConfig {
     /// Whether to offer cached tracks to the others at all.
     pub enabled: bool,
-    /// Port for the file server. 0 asks the OS for a free one, which is right
-    /// unless a firewall rule has to name a fixed port.
+    /// Port for the file server.
+    ///
+    /// Fixed by default, and deliberately: a firewall rule has to name a port, and
+    /// on Windows an inbound connection to a program without one is dropped
+    /// silently. With a port that changed every run there was nothing to allow, so
+    /// the others saw the track on offer and could never fetch it. 0 still asks the
+    /// OS to pick, which is fine on a machine with no firewall in the way.
     pub port: u16,
 }
 
@@ -107,7 +112,9 @@ impl Default for ShareConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            port: 0,
+            // Next to the relay's 8787 and the discovery port, so all of ym-sync
+            // is two adjacent numbers to remember.
+            port: 8788,
         }
     }
 }
@@ -351,7 +358,7 @@ mod tests {
             "volume": 0.8,
             "sync": { "position_bias_ms": 400 },
             "cache": { "dir": "/data/user/0/dev.mshiv.ymsync/files/tracks", "limit_gb": 2.0 },
-            "share": { "enabled": true },
+            "share": { "enabled": true, "port": 0 },
             "host": { "enabled": true, "port": 8787, "advertise": "192.168.3.50" }
         }"#;
         let config: Config = serde_json::from_str(json).expect("android config");
@@ -366,6 +373,8 @@ mod tests {
         // Everything the client left out keeps its default.
         assert_eq!(config.sync.seek_threshold_ms, 300);
         assert_eq!(config.sync.correction_interval_ms, 250);
+        // The phone asks the system for a port on purpose: there is no firewall
+        // rule to name one, and a fixed port could already be taken by another app.
         assert_eq!(config.share.port, 0);
         assert_eq!(config.host.bind, "0.0.0.0");
     }
@@ -390,7 +399,14 @@ seek_threshold_ms = 300
         assert_eq!(parsed.cache.limit_gb, 8.0);
         assert!(!parsed.cache.auto, "automatic caching is opt-in");
         assert!(parsed.share.enabled);
+        // A fixed port is what a firewall rule can name; a config written before
+        // this existed picks it up without being edited.
+        assert_eq!(parsed.share.port, 8788);
         assert!(!parsed.host.enabled, "hosting is opt-in");
+        assert!(
+            parsed.host.discoverable,
+            "an older config still answers a search for rooms"
+        );
     }
 
     #[test]

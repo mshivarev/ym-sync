@@ -24,7 +24,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, warn};
 use ymsync_proto::{
     Correction, Event, PeerShare, PlaybackState, SyncParams, TrackRef, decide, target_position_ms,
     trust_clock,
@@ -45,6 +45,13 @@ const SEQ_RESTART_GAP: u64 = 64;
 /// requests per account, and networks blip — so a track is only written off
 /// after this many attempts.
 const MAX_LOAD_ATTEMPTS: u8 = 3;
+
+/// How long a track is left alone after a failure that may pass.
+///
+/// Long enough that a dead network is not hammered — every attempt costs the one
+/// network slot — and short enough that opening a firewall or walking back into
+/// Wi-Fi fixes the room without restarting anything.
+const DEFER_AFTER: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Shortest gap between telling the room what this machine has cached.
@@ -296,6 +303,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         refilling: false,
         remote: None,
         unavailable: HashSet::new(),
+        deferred: HashMap::new(),
         attempts: HashMap::new(),
         loading: None,
         prefetched: None,
@@ -338,7 +346,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
 enum Internal {
     Loaded {
         track_id: String,
-        error: Option<String>,
+        error: Option<LoadFailure>,
         /// Where the audio came from, so the user can see when the room supplied
         /// it instead of the internet.
         origin: Option<Origin>,
@@ -409,6 +417,72 @@ struct Station {
     replace_first: bool,
 }
 
+/// Why a track did not start.
+///
+/// The distinction decides what happens next, so it is worth keeping: one of
+/// these is an answer that will not change, and the other is a road that may
+/// reopen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadFailure {
+    /// Yandex says this account may not play the track, and nobody in the room
+    /// offered it either. Nothing to retry.
+    NotLicensed(String),
+    /// Everything else: no internet, a peer that announced the track but cannot
+    /// be reached, a player that refused the source. All of these may pass, so
+    /// the track is put aside for a while rather than written off.
+    Temporary(String),
+}
+
+impl LoadFailure {
+    fn message(&self) -> &str {
+        match self {
+            LoadFailure::NotLicensed(text) | LoadFailure::Temporary(text) => text,
+        }
+    }
+
+    /// The same failure with the track's name in front of it, for the notice line.
+    fn labelled(self, label: &str) -> Self {
+        match self {
+            LoadFailure::NotLicensed(text) => {
+                LoadFailure::NotLicensed(format!("{label}: {text}"))
+            }
+            LoadFailure::Temporary(text) => LoadFailure::Temporary(format!("{label}: {text}")),
+        }
+    }
+
+    /// Classifies a refusal from Yandex.
+    ///
+    /// Whether an account may play a track only settles the matter when nobody in
+    /// the room has it: a neighbour's copy plays regardless of licensing, so as
+    /// long as somebody offered it, the road may reopen and this is temporary.
+    fn from_yandex(err: &anyhow::Error, peer_error: Option<String>) -> Self {
+        match peer_error {
+            Some(peer) => LoadFailure::Temporary(format!(
+                "не удалось забрать у участника ({peer}); Яндекс тоже не ответил ({err:#})"
+            )),
+            None if err.downcast_ref::<NotLicensed>().is_some() => {
+                LoadFailure::NotLicensed(format!("{err:#}"))
+            }
+            None => LoadFailure::Temporary(format!("{err:#}")),
+        }
+    }
+}
+
+/// Yandex's answer that this account may not play a track.
+///
+/// A marker type rather than a message, so the difference between «нельзя» and
+/// «не дозвонился» survives the trip up through the context layers.
+#[derive(Debug)]
+struct NotLicensed;
+
+impl std::fmt::Display for NotLicensed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("недоступен на этом аккаунте")
+    }
+}
+
+impl std::error::Error for NotLicensed {}
+
 struct Engine {
     api: Arc<YandexMusic>,
     /// For pulling tracks off other players on the local network. Separate from
@@ -437,6 +511,14 @@ struct Engine {
     remote: Option<PlaybackState>,
     /// Tracks this account cannot play, so we stop retrying them.
     unavailable: HashSet<String>,
+    /// Tracks put aside after a failure that may pass — no internet, or a peer
+    /// that offered a track and could not be reached — and when to try again.
+    ///
+    /// Separate from [`Engine::unavailable`] on purpose: that one is a verdict
+    /// about the account, this one is about the moment. Without it a network
+    /// failure would either burn the track for the whole session or spin in a
+    /// retry loop holding the single network slot.
+    deferred: HashMap<String, std::time::Instant>,
     /// Failed attempts per track, cleared once one succeeds.
     attempts: HashMap<String, u8>,
 
@@ -732,10 +814,12 @@ impl Engine {
                 ..
             } = ready;
             tokio::spawn(async move {
+                // A player that refuses a source we already hold is a local
+                // problem, not a verdict on the track: worth another go.
                 let error = stage_track(&player, track, source)
                     .await
                     .err()
-                    .map(|err| format!("{label}: {err:#}"));
+                    .map(|err| LoadFailure::Temporary(format!("{label}: {err:#}")));
                 let _ = internal_tx.send(Internal::Loaded {
                     track_id,
                     error,
@@ -752,7 +836,7 @@ impl Engine {
         tokio::spawn(async move {
             let outcome = fetch_source(&fetch, &want).await;
             let (error, origin, stored) = match outcome {
-                Err(err) => (Some(format!("{label}: {err:#}")), None, false),
+                Err(failure) => (Some(failure.labelled(&label)), None, false),
                 Ok(Fetched {
                     track,
                     source,
@@ -762,7 +846,7 @@ impl Engine {
                     let error = stage_track(&player, track, source)
                         .await
                         .err()
-                        .map(|err| format!("{label}: {err:#}"));
+                        .map(|err| LoadFailure::Temporary(format!("{label}: {err:#}")));
                     (error, Some(origin), stored)
                 }
             };
@@ -816,6 +900,16 @@ impl Engine {
             .collect()
     }
 
+    /// Whether this track is still in its cool-down after a failure that may pass.
+    ///
+    /// See [`Engine::deferred`]: this is what stops a dead network from being
+    /// hammered without writing the track off for the session.
+    fn set_aside(&self, track_id: &str) -> bool {
+        self.deferred
+            .get(track_id)
+            .is_some_and(|until| std::time::Instant::now() < *until)
+    }
+
     /// The queue entry after the one the room is on.
     fn next_track(&self) -> Option<TrackRef> {
         let index = self.remote.as_ref()?.index;
@@ -854,6 +948,7 @@ impl Engine {
             .as_ref()
             .is_some_and(|held| held.track_id == next.track_id)
             || self.unavailable.contains(&next.track_id)
+            || self.set_aside(&next.track_id)
         {
             return;
         }
@@ -1082,14 +1177,15 @@ impl Engine {
                     self.refresh_cache_view();
                 }
 
-                if let Some(error) = error {
+                if let Some(failure) = error {
                     let attempts = self.attempts.entry(track_id.clone()).or_insert(0);
                     *attempts += 1;
                     let attempt = *attempts;
 
                     if attempt < MAX_LOAD_ATTEMPTS {
                         self.notice = Some(format!(
-                            "попытка {attempt} из {MAX_LOAD_ATTEMPTS} не удалась, повторю — {error}"
+                            "попытка {attempt} из {MAX_LOAD_ATTEMPTS} не удалась, повторю — {}",
+                            failure.message()
                         ));
                         let internal = internal.clone();
                         tokio::spawn(async move {
@@ -1099,17 +1195,36 @@ impl Engine {
                         return;
                     }
 
-                    // Accounts differ in what they may play. This peer sits the
-                    // track out in silence rather than skipping it for everyone:
-                    // the others can hear it perfectly well, and the relay will
-                    // move the room on when the track's time is up.
-                    self.unavailable.insert(track_id);
-                    self.notice = Some(format!("пропускаю на этом аккаунте — {error}"));
+                    match failure {
+                        // Accounts differ in what they may play. This peer sits the
+                        // track out in silence rather than skipping it for
+                        // everyone: the others can hear it perfectly well, and the
+                        // relay will move the room on when the track's time is up.
+                        LoadFailure::NotLicensed(message) => {
+                            self.unavailable.insert(track_id);
+                            self.notice = Some(format!("пропускаю на этом аккаунте — {message}"));
+                        }
+                        // Not the track's fault and not the account's: no internet,
+                        // or the participant who has it cannot be reached. Put
+                        // aside for a while instead of for the session, so a
+                        // firewall opened or Wi-Fi coming back fixes it without a
+                        // restart.
+                        LoadFailure::Temporary(message) => {
+                            self.deferred
+                                .insert(track_id.clone(), std::time::Instant::now() + DEFER_AFTER);
+                            self.attempts.remove(&track_id);
+                            self.notice = Some(format!(
+                                "не удалось получить трек, попробую снова через {} с — {message}",
+                                DEFER_AFTER.as_secs()
+                            ));
+                        }
+                    }
                     self.player.pause();
                     return;
                 }
 
                 self.attempts.remove(&track_id);
+                self.deferred.remove(&track_id);
                 self.notice = match origin {
                     // Worth saying: it means this track cost nothing and would
                     // have played with the internet unplugged.
@@ -1160,7 +1275,11 @@ impl Engine {
                     let staged = self.player.current_track_id();
                     let is_staged = staged.as_deref() == Some(track.track_id.as_str());
                     let is_loading = self.loading.as_deref() == Some(track.track_id.as_str());
-                    if !is_staged && !is_loading && !self.unavailable.contains(&track.track_id) {
+                    if !is_staged
+                        && !is_loading
+                        && !self.unavailable.contains(&track.track_id)
+                        && !self.set_aside(&track.track_id)
+                    {
                         self.notice = Some(format!("загружаю {track}"));
                         self.start_load(&track, internal);
                     }
@@ -1211,11 +1330,15 @@ impl Engine {
                 let newly_offered: Vec<String> = peers
                     .iter()
                     .flat_map(|share| share.tracks.iter())
-                    .filter(|id| self.unavailable.contains(id.as_str()))
+                    .filter(|id| {
+                        self.unavailable.contains(id.as_str())
+                            || self.deferred.contains_key(id.as_str())
+                    })
                     .cloned()
                     .collect();
                 for id in newly_offered {
                     self.unavailable.remove(&id);
+                    self.deferred.remove(&id);
                     self.attempts.remove(&id);
                 }
                 self.shares = peers;
@@ -1454,18 +1577,23 @@ struct Fetched {
 ///
 /// `want` is the track as the room's queue describes it, which is why step 2 needs
 /// no lookup either: a peer's file server carries audio, not metadata.
-async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched> {
+async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFailure> {
     let id = want.track_id.as_str();
 
     if let Some(cached) = fetch.cache.track(id) {
-        return Ok(Fetched {
-            track: cached,
-            source: from_cache(fetch, id).await?,
-            origin: Origin::Cache,
-            stored: false,
-        });
+        return match from_cache(fetch, id).await {
+            Ok(source) => Ok(Fetched {
+                track: cached,
+                source,
+                origin: Origin::Cache,
+                stored: false,
+            }),
+            Err(err) => Err(LoadFailure::Temporary(format!("{err:#}"))),
+        };
     }
 
+    // Somebody in the room says they hold this track.
+    let mut peer_error = None;
     if !fetch.peers.is_empty() {
         match from_peers(fetch, want).await {
             Ok((source, stored)) => {
@@ -1476,12 +1604,21 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched> {
                     stored,
                 });
             }
-            // Not fatal: the peer may have evicted it, or gone. Yandex is next.
-            Err(err) => debug!(track = id, "no luck on the local network: {err:#}"),
+            // Not fatal — the peer may have evicted it, or gone — but not to be
+            // swallowed either. With no internet this *is* the reason nothing
+            // played, and the fix is usually a firewall on the other machine, so
+            // it has to reach the person looking at the screen.
+            Err(err) => {
+                warn!(track = id, "не удалось забрать у участника: {err:#}");
+                peer_error = Some(format!("{err:#}"));
+            }
         }
     }
 
-    let (track, url) = yandex_stream(&fetch.api, id).await?;
+    let (track, url) = match yandex_stream(&fetch.api, id).await {
+        Ok(pair) => pair,
+        Err(err) => return Err(LoadFailure::from_yandex(&err, peer_error)),
+    };
 
     // Straight through, without ever holding the whole track, when nothing needs
     // the bytes: that is how a streaming backend normally plays.
@@ -1494,7 +1631,10 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched> {
         });
     }
 
-    let data = fetch.api.fetch_track(&url).await?;
+    let data = match fetch.api.fetch_track(&url).await {
+        Ok(data) => data,
+        Err(err) => return Err(LoadFailure::Temporary(format!("{err:#}"))),
+    };
     let stored = fetch.store && store(fetch, &track, &data).await.is_some();
 
     let source = if fetch.player.needs_bytes() {
@@ -1604,7 +1744,7 @@ async fn store(fetch: &Fetch, track: &TrackRef, data: &Bytes) -> Option<Insertio
 async fn yandex_stream(api: &YandexMusic, track_id: &str) -> Result<(TrackRef, String)> {
     let track = api.track(track_id).await?;
     if !track.available {
-        bail!("недоступен на этом аккаунте");
+        return Err(anyhow::Error::new(NotLicensed));
     }
     let url = api.stream_url(track_id).await?;
     Ok((track.to_track_ref(), url))
@@ -1686,6 +1826,60 @@ fn requested_position(audible_ms: u64, bias_ms: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report that prompted this: a phone with no internet, a PC in the room
+    /// holding the track, and a fetch from that PC that failed. Calling it
+    /// «недоступен на этом аккаунте» was wrong twice over — the account was fine,
+    /// and writing the track off for the session hid the real cause.
+    #[test]
+    fn a_peer_that_could_not_be_reached_is_a_temporary_failure() {
+        let failure = LoadFailure::from_yandex(
+            &anyhow!("сеть недоступна"),
+            Some("соединение отклонено".to_string()),
+        );
+        assert!(matches!(failure, LoadFailure::Temporary(_)), "{failure:?}");
+        // Both halves are named: the peer failure is the actionable one, and the
+        // Yandex failure explains why there was no fallback.
+        assert!(failure.message().contains("соединение отклонено"));
+        assert!(failure.message().contains("сеть недоступна"));
+    }
+
+    /// A licensing refusal only settles the matter when nobody in the room has the
+    /// track: a neighbour's copy plays whatever this account is allowed.
+    #[test]
+    fn licensing_is_final_only_when_nobody_offered_the_track() {
+        let alone = LoadFailure::from_yandex(&anyhow::Error::new(NotLicensed), None);
+        assert!(matches!(alone, LoadFailure::NotLicensed(_)), "{alone:?}");
+
+        let offered = LoadFailure::from_yandex(
+            &anyhow::Error::new(NotLicensed),
+            Some("таймаут".to_string()),
+        );
+        assert!(
+            matches!(offered, LoadFailure::Temporary(_)),
+            "somebody has it, so this may yet work: {offered:?}"
+        );
+    }
+
+    /// A dead network is not a verdict on the track, so it must not be confused
+    /// with one.
+    #[test]
+    fn an_unreachable_yandex_is_temporary() {
+        let failure = LoadFailure::from_yandex(&anyhow!("operation timed out"), None);
+        assert!(matches!(failure, LoadFailure::Temporary(_)), "{failure:?}");
+    }
+
+    /// The context survives the labelling, and so does the kind.
+    #[test]
+    fn labelling_keeps_the_kind_and_the_reason() {
+        let labelled = LoadFailure::Temporary("таймаут".to_string()).labelled("Кино — Группа крови");
+        assert!(matches!(labelled, LoadFailure::Temporary(_)));
+        assert_eq!(labelled.message(), "Кино — Группа крови: таймаут");
+
+        let denied = LoadFailure::NotLicensed("нельзя".to_string()).labelled("Трек");
+        assert!(matches!(denied, LoadFailure::NotLicensed(_)));
+        assert_eq!(denied.message(), "Трек: нельзя");
+    }
 
     #[test]
     fn the_first_snapshot_is_always_accepted() {
