@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -93,6 +94,8 @@ private fun App(settings: Settings) {
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
     var library by remember { mutableStateOf<Library?>(null) }
+    var likes by remember { mutableStateOf<Likes?>(null) }
+    var tab by remember { mutableStateOf(LibraryTab.ALL) }
 
     // A finished download changes the disk, and the cache revision is how the
     // core says so — cheaper than re-reading the list on every snapshot.
@@ -100,7 +103,16 @@ private fun App(settings: Settings) {
         library = if (running) Commands.library().getOrNull() else null
     }
 
-    // Media3 needs notification permission for its playback notification.
+    // The same idea for «Мне нравится»: the core re-reads it from Yandex on
+    // connecting and bumps this whenever it changes, so the list itself never has
+    // to travel in a snapshot — it runs to over a thousand tracks.
+    LaunchedEffect(running, snapshot?.likedRevision) {
+        likes = if (running) Commands.likes().getOrNull() else null
+    }
+    val likedIds = likes?.ids ?: emptySet()
+
+    // The player lives in the shade as well as on screen, and a notification needs
+    // permission from Android 13 on.
     val askNotifications = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
@@ -238,6 +250,13 @@ private fun App(settings: Settings) {
                             current = false,
                             enabled = canDrive,
                             mark = markFor(snapshot, track.trackId),
+                            liked = likedIds.contains(track.trackId),
+                            onLike = {
+                                val liked = likedIds.contains(track.trackId)
+                                scope.launch {
+                                    Commands.like(track, !liked)?.let { SyncHolder.say(it) }
+                                }
+                            },
                         ) {
                             // The row already holds the whole track, so nothing is
                             // asked of Yandex here — see `Commands.queueTracks`.
@@ -284,6 +303,14 @@ private fun App(settings: Settings) {
                             current = index == (snapshot?.index ?: -1),
                             enabled = canDrive,
                             mark = markFor(snapshot, queue[index].trackId),
+                            liked = likedIds.contains(queue[index].trackId),
+                            onLike = {
+                                val track = queue[index]
+                                val liked = likedIds.contains(track.trackId)
+                                scope.launch {
+                                    Commands.like(track, !liked)?.let { SyncHolder.say(it) }
+                                }
+                            },
                         ) {
                             scope.launch { Commands.send("index") { put("index", index) } }
                         }
@@ -291,62 +318,167 @@ private fun App(settings: Settings) {
                 }
 
                 val downloaded = library?.tracks ?: emptyList()
-                if (downloaded.isNotEmpty()) {
-                    item { SectionTitle("На устройстве · ${downloaded.size} · ${librarySize(library)}") }
-                    item {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            // Playing the whole library is how you listen with no
-                            // internet: every one of these comes off the disk.
-                            OutlinedButton(
-                                enabled = canDrive,
-                                onClick = {
-                                    scope.launch {
-                                        Commands.queueTracks(
-                                            downloaded.map { it.track },
-                                            replace = true,
-                                        ).onFailure { SyncHolder.say(it.message) }
-                                    }
-                                },
-                            ) { Text("Играть всё") }
-                            OutlinedButton(
-                                enabled = canDrive,
-                                onClick = {
-                                    scope.launch {
-                                        Commands.queueTracks(downloaded.map { it.track })
-                                            .onFailure { SyncHolder.say(it.message) }
-                                    }
-                                },
-                            ) { Text("В очередь") }
+                val likedTracks = likes?.tracks ?: emptyList()
+                val shown: List<TrackInfo> = when (tab) {
+                    LibraryTab.LIKES -> likedTracks
+                    else -> downloaded.map { it.track }
+                }
+
+                item {
+                    SectionTitle(
+                        when (tab) {
+                            LibraryTab.LIKES -> "Скачанное · мне нравится · ${likedTracks.size}"
+                            else -> "Скачанное · ${downloaded.size} · ${librarySize(library)}"
+                        },
+                    )
+                }
+
+                // Three views of the same panel: everything on this disk, what
+                // this account has hearted, and the disk grouped by album.
+                item {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (option in LibraryTab.entries) {
+                            FilterChip(
+                                selected = tab == option,
+                                onClick = { tab = option },
+                                label = { Text(option.label) },
+                            )
                         }
                     }
-                    items(downloaded.size, key = { "c${downloaded[it].track.trackId}" }) { index ->
-                        val entry = downloaded[index]
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                }
+
+                item {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // Playing the whole library is how you listen with no
+                        // internet: every one of these comes off the disk.
+                        OutlinedButton(
+                            enabled = canDrive && shown.isNotEmpty(),
+                            onClick = {
+                                scope.launch {
+                                    Commands.queueTracks(shown, replace = true)
+                                        .onFailure { SyncHolder.say(it.message) }
+                                }
+                            },
+                        ) { Text("Играть всё") }
+                        OutlinedButton(
+                            enabled = canDrive && shown.isNotEmpty(),
+                            onClick = {
+                                scope.launch {
+                                    Commands.queueTracks(shown)
+                                        .onFailure { SyncHolder.say(it.message) }
+                                }
+                            },
+                        ) { Text("В очередь") }
+                        // Only «Мне нравится» has anything to re-read: the other
+                        // two views are this disk, and the core watches that.
+                        if (tab == LibraryTab.LIKES) {
+                            TextButton(
+                                enabled = canDrive,
+                                onClick = {
+                                    scope.launch {
+                                        Commands.send("refresh_likes")
+                                            ?.let { SyncHolder.say(it) }
+                                    }
+                                },
+                            ) { Text("↻ с Яндекса") }
+                        }
+                    }
+                }
+
+                when (tab) {
+                    LibraryTab.ALL -> items(
+                        downloaded.size,
+                        key = { "c${downloaded[it].track.trackId}" },
+                    ) { index ->
+                        DownloadedRow(
+                            position = index + 1,
+                            entry = downloaded[index],
+                            enabled = canDrive,
+                            liked = likedIds.contains(downloaded[index].track.trackId),
+                            scope = scope,
+                            onChanged = { library = it },
+                        )
+                    }
+
+                    LibraryTab.LIKES -> {
+                        if (likedTracks.isEmpty()) {
+                            item {
+                                Text(
+                                    "список пуст или ещё не загружен — «↻ с Яндекса», когда будет интернет",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        itemsIndexed(
+                            likedTracks,
+                            key = { index, track -> "l${track.trackId}$index" },
+                        ) { index, track ->
                             TrackRow(
                                 position = index + 1,
-                                track = entry.track,
+                                track = track,
                                 current = false,
                                 enabled = canDrive,
-                                modifier = Modifier.weight(1f),
-                                trailing = formatSize(entry.bytes),
+                                mark = markFor(snapshot, track.trackId),
+                                liked = true,
+                                onLike = {
+                                    scope.launch {
+                                        Commands.like(track, false)?.let { SyncHolder.say(it) }
+                                    }
+                                },
                             ) {
-                                // The metadata was stored beside the audio, so this
-                                // needs neither Yandex nor a network at all.
                                 scope.launch {
-                                    Commands.queueTracks(listOf(entry.track))
+                                    Commands.queueTracks(listOf(track))
                                         .onFailure { error -> SyncHolder.say(error.message) }
                                 }
                             }
-                            TextButton(
-                                onClick = {
-                                    scope.launch {
-                                        Commands.send("forget") {
-                                            put("track_id", entry.track.trackId)
+                        }
+                    }
+
+                    LibraryTab.ALBUMS -> {
+                        for ((album, entries) in albumGroups(downloaded)) {
+                            item(key = "a$album") {
+                                // The header queues the album; that is what makes
+                                // this view worth having over a flat list.
+                                TextButton(
+                                    enabled = canDrive,
+                                    onClick = {
+                                        scope.launch {
+                                            Commands.queueTracks(entries.map { it.track })
+                                                .onFailure { SyncHolder.say(it.message) }
                                         }
-                                        library = Commands.library().getOrNull()
-                                    }
-                                },
-                            ) { Text("×") }
+                                    },
+                                ) {
+                                    Text(
+                                        "$album · ${entries.size}",
+                                        color = Accent,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                            itemsIndexed(
+                                entries,
+                                key = { _, entry -> "ac${entry.track.trackId}" },
+                            ) { index, entry ->
+                                DownloadedRow(
+                                    position = index + 1,
+                                    entry = entry,
+                                    enabled = canDrive,
+                                    liked = likedIds.contains(entry.track.trackId),
+                                    scope = scope,
+                                    onChanged = { library = it },
+                                )
+                            }
+                        }
+                        if (downloaded.any { it.track.album == null }) {
+                            item {
+                                Text(
+                                    "у части треков название альбома ещё не загружено — нужен интернет",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }
@@ -354,6 +486,75 @@ private fun App(settings: Settings) {
         }
     }
 }
+
+/// The three views of the library panel.
+private enum class LibraryTab(val label: String) {
+    ALL("всё скачанное"),
+    LIKES("мне нравится"),
+    ALBUMS("по альбомам"),
+}
+
+/// A downloaded track: plays off the disk, can be hearted, and carries the delete
+/// that the other lists have no business offering.
+@Composable
+private fun DownloadedRow(
+    position: Int,
+    entry: CachedTrack,
+    enabled: Boolean,
+    liked: Boolean,
+    scope: kotlinx.coroutines.CoroutineScope,
+    onChanged: (Library?) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        TrackRow(
+            position = position,
+            track = entry.track,
+            current = false,
+            enabled = enabled,
+            modifier = Modifier.weight(1f),
+            trailing = formatSize(entry.bytes),
+            liked = liked,
+            onLike = {
+                scope.launch {
+                    Commands.like(entry.track, !liked)?.let { SyncHolder.say(it) }
+                }
+            },
+        ) {
+            // The metadata was stored beside the audio, so this
+            // needs neither Yandex nor a network at all.
+            scope.launch {
+                Commands.queueTracks(listOf(entry.track))
+                    .onFailure { error -> SyncHolder.say(error.message) }
+            }
+        }
+        TextButton(
+            onClick = {
+                scope.launch {
+                    Commands.send("forget") { put("track_id", entry.track.trackId) }
+                    onChanged(Commands.library().getOrNull())
+                }
+            },
+        ) { Text("×") }
+    }
+}
+
+/// Downloads grouped by album: named albums first in alphabetical order, then
+/// everything whose album name is not known yet, in one group at the end.
+///
+/// One group, not one per album id: with no name they would all be headed
+/// «без названия альбома», and a dozen identical headers say less than a single
+/// pile does. The names arrive with the next connection and they sort themselves.
+private fun albumGroups(tracks: List<CachedTrack>): List<Pair<String, List<CachedTrack>>> {
+    val groups = LinkedHashMap<String, MutableList<CachedTrack>>()
+    for (entry in tracks) {
+        groups.getOrPut(entry.track.album ?: UNNAMED_ALBUM) { mutableListOf() }.add(entry)
+    }
+    return groups.entries
+        .map { (album, list) -> album to list.toList() }
+        .sortedWith(compareBy({ if (it.first == UNNAMED_ALBUM) 1 else 0 }, { it.first }))
+}
+
+private const val UNNAMED_ALBUM = "без названия альбома"
 
 /// Where a track would come from, when that costs no internet: this device's own
 /// disk, or somebody else's in the room.
@@ -696,34 +897,60 @@ private fun TrackRow(
     mark: String = "",
     /// Replaces the duration on the right, where size matters more.
     trailing: String? = null,
+    /// Whether this track is in «Мне нравится». `null` leaves the heart off, for
+    /// the one place it would be meaningless.
+    liked: Boolean? = null,
+    onLike: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
-    TextButton(onClick = onClick, enabled = enabled, modifier = modifier.fillMaxWidth()) {
-        Text(
-            "$position",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(28.dp),
-        )
-        Text(
-            "${track.artist} — ${track.title}",
-            color = if (current) Accent else MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        if (mark.isNotEmpty()) {
+    // The heart is its own button beside the row rather than inside it: a row is
+    // already a button, and one inside another is neither valid nor tappable.
+    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onClick = onClick, enabled = enabled, modifier = Modifier.weight(1f)) {
             Text(
-                mark,
+                "$position",
                 style = MaterialTheme.typography.bodySmall,
-                color = Good,
-                modifier = Modifier.padding(end = 6.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.width(28.dp),
+            )
+            Text(
+                "${track.artist} — ${track.title}",
+                color = if (current) Accent else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (mark.isNotEmpty()) {
+                Text(
+                    mark,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Good,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+            }
+            Text(
+                trailing ?: formatMs(track.durationMs),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        if (liked != null && onLike != null) {
+            Heart(liked = liked, onClick = onLike)
+        }
+    }
+}
+
+/// «Мне нравится» for one track. Per account, not per room: pressing it changes
+/// what Yandex holds for this token and nothing for the other listeners.
+@Composable
+private fun Heart(liked: Boolean, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+    ) {
         Text(
-            trailing ?: formatMs(track.durationMs),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            if (liked) "♥" else "♡",
+            color = if (liked) Bad else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -744,12 +971,25 @@ private fun PlayerBar(snapshot: Snapshot?, canDrive: Boolean) {
 
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-            Text(
-                snapshot?.track?.let { "${it.artist} — ${it.title}" } ?: "—",
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyMedium,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    snapshot?.track?.let { "${it.artist} — ${it.title}" } ?: "—",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                // Beside the title rather than with the transport: the transport
+                // acts on the room, this acts on the track and on this account.
+                snapshot?.track?.let { track ->
+                    Heart(liked = snapshot.trackLiked) {
+                        scope.launch {
+                            Commands.like(track, !snapshot.trackLiked)
+                                ?.let { SyncHolder.say(it) }
+                        }
+                    }
+                }
+            }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(

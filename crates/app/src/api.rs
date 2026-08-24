@@ -29,12 +29,18 @@ pub const WAVE_STATION: &str = "user:onyourwave";
 /// Every account's «Мне нравится» is playlist 3 of that account.
 const LIKES_KIND: &str = "3";
 
+/// How many album ids go into one `/albums` request.
+const ALBUM_BATCH: usize = 100;
+
 /// How much of an unexpected response body to quote in an error.
 const ERROR_EXCERPT: usize = 400;
 
 pub struct YandexMusic {
     http: reqwest::Client,
     token: String,
+    /// This account's numeric id, asked for once. Every «Мне нравится» call needs
+    /// it, and it cannot change under a fixed token.
+    uid: tokio::sync::OnceCell<i64>,
 }
 
 /// The platform TLS stack (schannel on Windows) needs no help.
@@ -75,6 +81,7 @@ impl YandexMusic {
         Ok(Self {
             http,
             token: token.into(),
+            uid: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -148,12 +155,81 @@ impl YandexMusic {
     /// `/likes/tracks` returns bare ids and would need a second round of
     /// requests to say what they are.
     pub async fn liked_tracks(&self) -> Result<Vec<Track>> {
-        let status = self.account_status().await?;
-        let uid = status
+        let uid = self.uid().await?;
+        self.playlist_tracks(&uid.to_string(), LIKES_KIND).await
+    }
+
+    /// This account's numeric id.
+    ///
+    /// Asked for once and kept: every «Мне нравится» call needs it, and a like is
+    /// a button press — paying for an extra round trip on each one would show.
+    async fn uid(&self) -> Result<i64> {
+        if let Some(uid) = self.uid.get() {
+            return Ok(*uid);
+        }
+        let uid = self
+            .account_status()
+            .await?
             .account
             .uid
             .context("Яндекс не сообщил uid аккаунта — «Мне нравится» не найти")?;
-        self.playlist_tracks(&uid.to_string(), LIKES_KIND).await
+        let _ = self.uid.set(uid);
+        Ok(uid)
+    }
+
+    /// Puts the track into this account's «Мне нравится», or takes it out.
+    ///
+    /// Two endpoints rather than one toggle, because the API has no toggle: the
+    /// caller says which state it wants. Deciding here from a cached "is it
+    /// liked?" would mean a stale answer silently unliking what the listener
+    /// meant to like.
+    ///
+    /// Likes belong to an account, not to the room: each participant listens on
+    /// their own, so this changes nothing for anybody else.
+    pub async fn set_liked(&self, track_id: &str, liked: bool) -> Result<()> {
+        let uid = self.uid().await?;
+        // `add` takes one id, `remove` takes a list — that asymmetry is the API's.
+        let (path, field) = if liked {
+            (format!("/users/{uid}/likes/tracks/add"), "track-id")
+        } else {
+            (format!("/users/{uid}/likes/tracks/remove"), "track-ids")
+        };
+        self.post_form(&path, &[(field, track_id)])
+            .await
+            .with_context(|| {
+                if liked {
+                    format!("не удалось добавить трек {track_id} в «Мне нравится»")
+                } else {
+                    format!("не удалось убрать трек {track_id} из «Мне нравится»")
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Names for a batch of album ids, as `id -> title`.
+    ///
+    /// A hundred ids per request: this is here to fill in names for tracks that
+    /// never carried one, and a library of a thousand downloads would otherwise
+    /// mean a thousand round trips. Albums the API says nothing about are simply
+    /// missing from the answer.
+    pub async fn album_titles(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut titles = std::collections::HashMap::new();
+        for chunk in ids.chunks(ALBUM_BATCH) {
+            let joined = chunk.join(",");
+            let albums: Vec<Album> = self
+                .get_result("/albums", &[("album-ids", joined.as_str())])
+                .await
+                .context("запрос названий альбомов")?;
+            for album in albums {
+                if let Some(title) = album.title.filter(|title| !title.trim().is_empty()) {
+                    titles.insert(album.id.0, title);
+                }
+            }
+        }
+        Ok(titles)
     }
 
     /// One batch from an endless station; [`WAVE_STATION`] is «Моя волна».
@@ -278,22 +354,43 @@ impl YandexMusic {
     }
 
     async fn get_body(&self, url: &str, query: &[(&str, &str)]) -> Result<String> {
-        let response = self
-            .http
-            .get(url)
-            .query(query)
+        self.send(self.authorized(self.http.get(url)).query(query), url)
+            .await
+    }
+
+    /// A form POST. The two «Мне нравится» endpoints are the only writes this
+    /// client makes, and they answer with a revision number nothing here needs.
+    async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<String> {
+        let url = format!("{API_BASE}{path}");
+        self.send(self.authorized(self.http.post(&url)).form(form), &url)
+            .await
+    }
+
+    /// The three headers every call needs. The client header matters: without it
+    /// some endpoints answer as if the request came from a browser.
+    fn authorized(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder
             .header("Authorization", format!("OAuth {}", self.token))
             .header("X-Yandex-Music-Client", CLIENT_HEADER)
             .header("Accept-Language", "ru")
+    }
+
+    /// Sends a prepared request and turns anything but success into a diagnostic.
+    ///
+    /// One place for that on purpose: an expired token and a missing Плюс both
+    /// come back as 401/403, and that is the one failure worth explaining rather
+    /// than reporting as a status code.
+    async fn send(&self, request: reqwest::RequestBuilder, url: &str) -> Result<String> {
+        let response = request
             .send()
             .await
-            .with_context(|| format!("GET {}", redact_url(url)))?;
+            .with_context(|| format!("запрос {}", redact_url(url)))?;
 
         let status = response.status();
         let body = response
             .text()
             .await
-            .with_context(|| format!("reading the body of GET {}", redact_url(url)))?;
+            .with_context(|| format!("чтение ответа {}", redact_url(url)))?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             bail!(
@@ -304,7 +401,7 @@ impl YandexMusic {
         }
         if !status.is_success() {
             bail!(
-                "GET {} вернул HTTP {status}: {}",
+                "{} вернул HTTP {status}: {}",
                 redact_url(url),
                 excerpt(&body)
             );
@@ -475,10 +572,23 @@ impl Track {
         self.albums.first().map(|a| a.id.0.clone())
     }
 
+    /// The album's name, when the payload carried one.
+    ///
+    /// Search results and playlists include it; a track resolved by id sometimes
+    /// does not, and a track that arrived from another peer never does. Whoever
+    /// needs the name for those falls back to [`YandexMusic::album_titles`].
+    pub fn album_title(&self) -> Option<String> {
+        self.albums
+            .first()
+            .and_then(|a| a.title.clone())
+            .filter(|title| !title.trim().is_empty())
+    }
+
     pub fn to_track_ref(&self) -> TrackRef {
         TrackRef {
             track_id: self.id.0.clone(),
             album_id: self.album_id(),
+            album: self.album_title(),
             title: self.title.clone(),
             artist: self.artist_names(),
             duration_ms: self.duration_ms,
@@ -495,6 +605,10 @@ pub struct Artist {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Album {
     pub id: Id,
+    /// Present in search results and playlist payloads; absent often enough that
+    /// nothing may depend on it.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// An id that the API returns sometimes as a string and sometimes as a number.

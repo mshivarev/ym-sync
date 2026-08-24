@@ -12,6 +12,7 @@
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun library(handle: Long): String
+//!     external fun likes(handle: Long): String
 //!     external fun findRooms(waitMs: Int): String
 //!     external fun stop(handle: Long): String
 //! }
@@ -216,6 +217,24 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_library(
     let text = match unsafe { borrow(handle) } {
         None => failed("сессия не запущена"),
         Some(session) => ok(session.library()),
+    };
+    reply(&mut env, &text)
+}
+
+/// This account's «Мне нравится».
+///
+/// Reads the stored list, so it costs no network and no Yandex request — the
+/// hearts on every screen are drawn from it. Refreshing it from Yandex is a
+/// `send({"action":"refresh_likes"})` instead, because that one does.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_likes(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let text = match unsafe { borrow(handle) } {
+        None => failed("сессия не запущена"),
+        Some(session) => ok(session.likes()),
     };
     reply(&mut env, &text)
 }

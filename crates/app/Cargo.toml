@@ -43,7 +43,9 @@ hex = "0.4.3"
 if-addrs = "0.13.4"
 md-5 = "0.11.0"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "charset", "system-proxy", "query"] }
+# `form` is for the two «Мне нравится» endpoints: they are the only writes this
+# app makes, and Yandex takes them as a urlencoded form rather than as JSON.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "charset", "system-proxy", "query", "form"] }
 rodio = { version = "0.21.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 # `rc` so a snapshot can carry its cached-track list behind an `Arc`: the list
@@ -64,4 +66,9 @@ ymsync-proto = { version = "0.1.0", path = "../proto" }
 # Hosting a room in this process, which is also what makes offline play work: a
 # machine with no internet is the authority for its own room. Default features
 # off — the embedded relay needs neither clap nor a signal handler.
+ymsync-relay = { version = "0.1.0", path = "../relay", default-features = false }
+
+[dev-dependencies]
+# The integration tests put a real relay behind a real `Link`, which is the only
+# way to cover what the client is told when it joins a room already in progress.
 ymsync-relay = { version = "0.1.0", path = "../relay", default-features = false }

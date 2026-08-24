@@ -25,6 +25,7 @@ use crate::api::YandexMusic;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::engine::{self, Handle, Wiring};
+use crate::likes::Likes;
 use crate::playback::Playback;
 use crate::{net, share};
 
@@ -84,12 +85,22 @@ pub fn open_cache(cfg: &Config) -> Result<Arc<Cache>> {
     Ok(Arc::new(cache))
 }
 
+/// Opens the stored «Мне нравится», which lives beside the downloads.
+///
+/// Separate from [`start`] for the same reason as the cache: the list and the
+/// hearts drawn from it are wanted on screen before anything connects, and both
+/// come off the disk.
+pub fn open_likes(cache: &Cache) -> Arc<Likes> {
+    Likes::open(cache.directory())
+}
+
 /// Brings up hosting, sharing and the engine.
 pub async fn start(
     cfg: &Config,
     api: Arc<YandexMusic>,
     player: Arc<dyn Playback>,
     cache: Arc<Cache>,
+    likes: Arc<Likes>,
 ) -> Result<Session> {
     let room_token = cfg.require_room_token()?.to_string();
 
@@ -141,6 +152,7 @@ pub async fn start(
             api,
             player,
             cache,
+            likes,
             relay_url,
             share_port,
             hosting: join_url.clone(),

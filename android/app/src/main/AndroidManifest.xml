@@ -31,9 +31,9 @@
         </activity>
 
         <!-- Playback outlives the activity, so it runs in a foreground service.
-             The audio itself comes out of the Rust core, so there is no player
-             object here for a media session to wrap: the service exists for the
-             notification, the wake lock and the multicast lock. -->
+             The audio itself comes out of the Rust core; the service holds the
+             media session Android draws the player in the shade from, along with
+             the wake lock and the multicast lock. -->
         <service
             android:name=".SyncService"
             android:exported="false"

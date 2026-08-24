@@ -149,6 +149,7 @@ fn track(id: &str) -> TrackRef {
     TrackRef {
         track_id: id.to_string(),
         album_id: Some("7".to_string()),
+        album: Some("Album".to_string()),
         title: format!("Title {id}"),
         artist: "Artist".to_string(),
         duration_ms: 200_000,
@@ -527,8 +528,11 @@ async fn the_station_goes_to_whoever_claims_it_first() {
     }
 }
 
+/// A wave has to outlive whoever started it, or a room whose feeder walked away
+/// plays out what is queued and then sits in silence for good — which is what
+/// happened in real use after leaving and rejoining a room.
 #[tokio::test]
-async fn a_station_claim_dies_with_the_peer_that_held_it() {
+async fn a_station_survives_the_peer_that_fed_it_and_is_free_to_take() {
     let relay = Relay::start().await;
     let mut watcher = relay.join().await;
 
@@ -542,17 +546,44 @@ async fn a_station_claim_dies_with_the_peer_that_held_it() {
         )
         .await;
         match recv_ignoring_peers(&mut watcher).await {
-            ServerMsg::State { state } => assert_eq!(state.station.as_deref(), Some("wave")),
+            ServerMsg::State { state } => {
+                assert_eq!(state.station.as_deref(), Some("wave"));
+                assert!(!state.station_unfed, "somebody is feeding it");
+            }
             other => panic!("expected the station in state, got {other:?}"),
         }
         // Dropping the socket ends the feeder's session.
     }
 
-    // The wave stops topping up rather than leaving the queue to run dry with
-    // nobody able to refill it.
+    // The room still follows the wave; what it lacks is somebody to resolve the
+    // next batch, and that is what the rest of the room is told.
     match recv_ignoring_peers(&mut watcher).await {
-        ServerMsg::State { state } => assert_eq!(state.station, None),
-        other => panic!("expected the station to be dropped, got {other:?}"),
+        ServerMsg::State { state } => {
+            assert_eq!(state.station.as_deref(), Some("wave"));
+            assert!(state.station_unfed, "the wave is waiting for a feeder");
+        }
+        other => panic!("expected an unfed station, got {other:?}"),
+    }
+
+    // And the peer that stayed can pick it up — no election, whoever asks first.
+    command(
+        &mut watcher,
+        Command::SetStation {
+            id: Some("wave".into()),
+        },
+    )
+    .await;
+    let mut fed = false;
+    let mut mine = false;
+    while !fed || !mine {
+        match recv_ignoring_peers(&mut watcher).await {
+            ServerMsg::State { state } => {
+                assert_eq!(state.station.as_deref(), Some("wave"));
+                fed = !state.station_unfed;
+            }
+            ServerMsg::Station { yours, .. } => mine = yours,
+            other => panic!("expected the claim to be granted, got {other:?}"),
+        }
     }
 }
 

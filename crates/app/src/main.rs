@@ -239,7 +239,8 @@ async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
     };
 
     let player = Arc::new(Player::new(cfg.volume)?);
-    let session = session::start(cfg, Arc::clone(&api), player, cache).await?;
+    let likes = session::open_likes(&cache);
+    let session = session::start(cfg, Arc::clone(&api), player, cache, likes).await?;
     let handle = session.handle();
 
     let start = handle.snapshot();
@@ -336,6 +337,19 @@ async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
                             }),
                             None => println!("сейчас ничего не играет"),
                         },
+                        // The heart is a toggle on screen but not in the protocol:
+                        // the wanted state is read off the snapshot, so two
+                        // presses in a row cannot end up meaning the same thing.
+                        Action::Like => {
+                            let snapshot = handle.snapshot();
+                            match snapshot.track {
+                                Some(track) => handle.send(EngineCommand::Like {
+                                    track,
+                                    liked: !snapshot.track_liked,
+                                }),
+                                None => println!("сейчас ничего не играет"),
+                            }
+                        }
                         Action::Cache => print_cache(&handle.snapshot()),
                         Action::Unknown(text) => {
                             println!("не понял: {text} (введите ? для подсказки)");
@@ -438,8 +452,9 @@ fn print_status(snapshot: &Snapshot) {
     };
 
     print!(
-        "{} {title}{place}  {position}{origin}  участников {}",
+        "{} {}{title}{place}  {position}{origin}  участников {}",
         if snapshot.playing { "▶" } else { "⏸" },
+        if snapshot.track_liked { "♥ " } else { "" },
         snapshot.peers
     );
     if let Some(drift_ms) = snapshot.drift_ms {
@@ -496,6 +511,8 @@ enum Action {
     },
     /// Delete the current track from this device.
     Forget,
+    /// Add the current track to «Мне нравится», or take it out.
+    Like,
     /// Report the offline library and what the room can supply over the network.
     Cache,
     Unknown(String),
@@ -518,6 +535,8 @@ fn parse_input(line: &str) -> Action {
         "da" => return Action::Download { whole_queue: true },
         "dc" => return Action::Engine(EngineCommand::CancelDownloads),
         "f" | "forget" => return Action::Forget,
+        "l" | "like" => return Action::Like,
+        "lr" => return Action::Engine(EngineCommand::RefreshLikes),
         "c" | "cache" => return Action::Cache,
         _ => {}
     }
@@ -569,6 +588,9 @@ fn print_controls() {
     println!(
         "офлайн:  d — оставить трек на устройстве · da — всю очередь · dc — отменить скачивание · \
          f — удалить трек с устройства · c — что на диске"
+    );
+    println!(
+        "лайки:   l — ♥ текущий трек (и снять) · lr — перечитать «Мне нравится» с Яндекса"
     );
 }
 

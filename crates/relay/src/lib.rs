@@ -409,7 +409,11 @@ struct RoomState {
     at_server_ms: i64,
     /// The station being fed into this queue, and the peer feeding it. Only that
     /// peer can resolve more tracks, since the relay holds no credentials.
-    station: Option<(String, u64)>,
+    ///
+    /// The owner is optional because the station outlives it: when the feeder
+    /// leaves, the room still follows the wave and simply has nobody topping it
+    /// up, which is what [`PlaybackState::station_unfed`] tells everyone.
+    station: Option<(String, Option<u64>)>,
 }
 
 impl RoomState {
@@ -423,6 +427,7 @@ impl RoomState {
             playing: self.playing,
             at_server_ms: self.at_server_ms,
             station: self.station.as_ref().map(|(id, _)| id.clone()),
+            station_unfed: matches!(&self.station, Some((_, None))),
         }
     }
 
@@ -578,14 +583,27 @@ impl RoomState {
             }
             Command::SetStation { id } => match id {
                 Some(id) => {
-                    if self.station.as_ref().is_some_and(|(_, owner)| *owner != from) {
+                    // A station nobody feeds is free for the taking: that is how
+                    // a wave survives the peer that started it. Only a *live*
+                    // feeder makes the claim somebody else's.
+                    if self
+                        .station
+                        .as_ref()
+                        .is_some_and(|(_, owner)| owner.is_some_and(|owner| owner != from))
+                    {
                         return Err("station_taken");
                     }
-                    self.station = Some((id, from));
+                    self.station = Some((id, Some(from)));
                     Changed::STATE
                 }
                 None => {
-                    if self.station.as_ref().is_none_or(|(_, owner)| *owner != from) {
+                    // Only the feeder may switch the wave off. A peer that never
+                    // fed it saying "off" is a stale echo, not a decision.
+                    if self
+                        .station
+                        .as_ref()
+                        .is_none_or(|(_, owner)| *owner != Some(from))
+                    {
                         return Ok(Changed::NOTHING);
                     }
                     self.station = None;
@@ -855,14 +873,21 @@ async fn session(
             .remove(&id)
             .is_some_and(|peer| peer.share.is_some());
 
-        // A station with nobody to feed it would leave the queue to run dry in
-        // silence, so the claim dies with its owner. What is already queued
-        // still plays to the end.
-        let dropped_station = matches!(&room.state.station, Some((_, owner)) if *owner == id);
-        if dropped_station {
-            room.state.station = None;
-            room.state.seq += 1;
-            info!(peer = id, room = %room_name, "station feeder left; wave stops topping up");
+        // The wave outlives its feeder. Dropping the claim outright used to mean
+        // the room played out what was queued and then sat in silence for good —
+        // and rejoining did not help, because nothing said the wave was still
+        // meant to be on. The station stays, marked as needing a feeder, and the
+        // next peer to notice picks it up.
+        let orphaned_station = match &mut room.state.station {
+            Some((_, owner)) if *owner == Some(id) => {
+                *owner = None;
+                room.state.seq += 1;
+                true
+            }
+            _ => false,
+        };
+        if orphaned_station {
+            info!(peer = id, room = %room_name, "station feeder left; wave waits for another");
         }
 
         let peers = room.peers.len();
@@ -870,7 +895,7 @@ async fn session(
             joined: false,
             peers,
         });
-        if dropped_station {
+        if orphaned_station {
             room.publish(Changed::STATE);
         }
         if was_sharing {
@@ -1055,6 +1080,7 @@ mod tests {
         TrackRef {
             track_id: id.into(),
             album_id: None,
+            album: None,
             title: format!("t{id}"),
             artist: "a".into(),
             duration_ms,
@@ -1314,6 +1340,58 @@ mod tests {
             Ok(Changed::NOTHING)
         );
         assert!(state.station.is_some());
+    }
+
+    /// The state a room is left in when its feeder disconnects, and what any peer
+    /// may then do about it: the wave is still on, so somebody has to be able to
+    /// take over resolving its batches.
+    #[test]
+    fn a_station_without_a_feeder_is_free_to_take() {
+        let mut state = RoomState::default();
+        state
+            .apply(
+                Command::SetStation {
+                    id: Some("wave".into()),
+                },
+                1,
+                0,
+            )
+            .unwrap();
+        assert!(!state.snapshot().station_unfed);
+
+        // What the leave path does when the feeder's socket closes.
+        state.station = Some(("wave".to_string(), None));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.station.as_deref(), Some("wave"));
+        assert!(snapshot.station_unfed, "the room still follows the wave");
+
+        state
+            .apply(
+                Command::SetStation {
+                    id: Some("wave".into()),
+                },
+                2,
+                0,
+            )
+            .expect("a wave nobody feeds is not taken");
+        assert_eq!(state.station, Some(("wave".to_string(), Some(2))));
+        assert!(!state.snapshot().station_unfed);
+    }
+
+    /// Only whoever actually feeds the wave may switch it off. A peer that has
+    /// just been refused the claim also sends `None` on its way out, and that
+    /// must not turn the wave off for the room.
+    #[test]
+    fn a_peer_that_never_fed_the_station_cannot_switch_it_off() {
+        let mut state = RoomState {
+            station: Some(("wave".to_string(), None)),
+            ..RoomState::default()
+        };
+        assert_eq!(
+            state.apply(Command::SetStation { id: None }, 7, 0),
+            Ok(Changed::NOTHING)
+        );
+        assert!(state.station.is_some(), "an unfed wave is still on");
     }
 
     #[test]

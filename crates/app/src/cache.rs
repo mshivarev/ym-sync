@@ -300,6 +300,37 @@ impl Cache {
         }
     }
 
+    /// Writes album names into the metadata of the downloads they belong to.
+    /// Blocking: one small file per track that changed.
+    ///
+    /// This is what makes grouping the library by album work offline — the names
+    /// are fetched once, while there is a connection, and then live beside the
+    /// audio like the rest of a track's metadata. Returns how many tracks changed.
+    pub fn name_albums(&self, titles: &HashMap<String, String>) -> Result<usize> {
+        // The sidecars are collected under the lock and written outside it: the
+        // index is read by the engine on every tick.
+        let updated: Vec<(String, Sidecar)> = {
+            let mut index = self.lock();
+            index
+                .iter_mut()
+                .filter_map(|(id, entry)| {
+                    let album_id = entry.sidecar.track.album_id.as_deref()?;
+                    let title = titles.get(album_id)?;
+                    if entry.sidecar.track.album.as_deref() == Some(title.as_str()) {
+                        return None;
+                    }
+                    entry.sidecar.track.album = Some(title.clone());
+                    Some((id.clone(), entry.sidecar.clone()))
+                })
+                .collect()
+        };
+
+        for (id, sidecar) in &updated {
+            self.write_sidecar(id, sidecar)?;
+        }
+        Ok(updated.len())
+    }
+
     /// Deletes a track from the cache. Blocking.
     pub fn remove(&self, id: &str) -> Result<()> {
         if !valid_id(id) {
@@ -532,6 +563,7 @@ mod tests {
         TrackRef {
             track_id: id.to_string(),
             album_id: Some("7".to_string()),
+            album: None,
             title: format!("Title {id}"),
             artist: "Artist".to_string(),
             duration_ms: 200_000,

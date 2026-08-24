@@ -85,7 +85,15 @@
     </section>
 
     <section class="panel">
-      <h2>На устройстве <span id="lib-count" class="dim"></span></h2>
+      <h2>Скачанное <span id="lib-count" class="dim"></span></h2>
+
+      <!-- Three views of one library: the flat list, what this account has
+           hearted, and the same downloads grouped by album. -->
+      <div class="tabs" id="tabs">
+        <button type="button" class="tab current" data-tab="all">всё скачанное</button>
+        <button type="button" class="tab" data-tab="likes">мне нравится</button>
+        <button type="button" class="tab" data-tab="albums">по альбомам</button>
+      </div>
 
       <div class="row">
         <button id="lib-play">Играть</button>
@@ -100,7 +108,10 @@
 
   <footer>
     <div class="now">
-      <div id="title" class="title">—</div>
+      <div class="title-line">
+        <button id="heart" class="heart" title="Мне нравится">&#9825;</button>
+        <div id="title" class="title">—</div>
+      </div>
       <div id="subtitle" class="dim"></div>
     </div>
 

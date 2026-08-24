@@ -30,9 +30,11 @@ use ymsync_proto::{
     trust_clock,
 };
 
+use crate::albums;
 use crate::api::{Track, YandexMusic};
 use crate::cache::{Cache, Insertion};
 use crate::config::Config;
+use crate::likes::Likes;
 use crate::link::Link;
 use crate::playback::{AudioSource, Playback};
 use crate::share;
@@ -122,6 +124,16 @@ pub enum Command {
     CancelDownloads,
     /// Deletes a downloaded track from this device.
     Forget { track_id: String },
+    /// Puts the track into this account's «Мне нравится», or takes it out.
+    ///
+    /// The whole track rather than an id, so that a like made from the player also
+    /// puts a playable row into the list. Likes belong to an account, not to the
+    /// room: this changes nothing for the other participants, who listen on their
+    /// own tokens.
+    Like { track: TrackRef, liked: bool },
+    /// Re-reads «Мне нравится» from Yandex. Done once on connecting; a front end
+    /// asks for it again when the listener wants to see changes made elsewhere.
+    RefreshLikes,
     Shutdown,
 }
 
@@ -160,6 +172,16 @@ pub struct Snapshot {
     pub cache_bytes: u64,
     /// 0 means no limit.
     pub cache_limit_bytes: u64,
+    /// Whether the track playing right now is in this account's «Мне нравится».
+    /// What the heart in the player and in the phone's notification shows.
+    pub track_liked: bool,
+    /// Bumped whenever «Мне нравится» changes, here or on Yandex.
+    ///
+    /// Only the number travels in the snapshot: the list itself is over a thousand
+    /// tracks, and shipping that four times a second to say "nothing happened"
+    /// would cost more than the playback. A front end sees the number move and
+    /// asks for the list.
+    pub liked_revision: u64,
     /// The track being downloaded for offline use, if any.
     pub downloading: Option<String>,
     /// How many more are waiting behind it.
@@ -185,6 +207,7 @@ pub struct Handle {
     commands: mpsc::UnboundedSender<Command>,
     snapshots: watch::Receiver<Snapshot>,
     cache: Arc<Cache>,
+    likes: Arc<Likes>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -211,6 +234,14 @@ impl Handle {
         &self.cache
     }
 
+    /// This account's «Мне нравится», as last seen.
+    ///
+    /// In memory and on disk, so a front end can list it and draw its hearts with
+    /// no network — see [`crate::likes`].
+    pub fn likes(&self) -> &Arc<Likes> {
+        &self.likes
+    }
+
     /// Waits for the loop to finish — after [`Command::Shutdown`], or when the
     /// relay connection dies.
     pub async fn join(self) -> Result<()> {
@@ -228,6 +259,9 @@ pub struct Wiring {
     pub api: Arc<YandexMusic>,
     pub player: Arc<dyn Playback>,
     pub cache: Arc<Cache>,
+    /// The account's «Мне нравится». Opened by the front end for the same reason
+    /// the cache is: both are wanted on screen before anything connects.
+    pub likes: Arc<Likes>,
     /// Where to connect. Not `cfg.relay` when this app hosts the room itself.
     pub relay_url: String,
     /// Port the local file server listens on, to be announced to the room.
@@ -242,6 +276,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         api,
         player,
         cache,
+        likes,
         relay_url,
         share_port,
         hosting,
@@ -279,6 +314,8 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         cache_revision: 0,
         cache_bytes: cache.total_bytes(),
         cache_limit_bytes: cache.limit_bytes(),
+        track_liked: false,
+        liked_revision: likes.revision(),
         downloading: None,
         download_queue: 0,
         sharing_peers: 0,
@@ -292,6 +329,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         api,
         http: share::client()?,
         cache: Arc::clone(&cache),
+        likes: Arc::clone(&likes),
         auto_cache: cfg.cache.auto,
         room_token,
         player,
@@ -301,6 +339,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         revision: 0,
         station: None,
         refilling: false,
+        quiet_station_refusal: false,
         remote: None,
         unavailable: HashSet::new(),
         deferred: HashMap::new(),
@@ -338,6 +377,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         commands,
         snapshots: snapshot_rx,
         cache,
+        likes,
         task,
     })
 }
@@ -380,6 +420,25 @@ enum Internal {
         /// downloaded deliberately.
         over_limit: bool,
     },
+    /// A heart was pressed and Yandex has answered.
+    Liked {
+        label: String,
+        liked: bool,
+        error: Option<String>,
+    },
+    /// «Мне нравится» was re-read from Yandex.
+    LikesRead {
+        count: usize,
+        error: Option<String>,
+        /// Somebody asked for this, rather than it being the read done on
+        /// connecting. Only then is the outcome worth putting on screen.
+        asked_for: bool,
+    },
+    /// Album names were filled in for downloads that had none.
+    AlbumsNamed {
+        updated: usize,
+        error: Option<String>,
+    },
 }
 
 /// Where a track's audio came from.
@@ -415,6 +474,10 @@ struct Station {
     claimed: bool,
     /// The first batch replaces the room's queue rather than joining it.
     replace_first: bool,
+    /// Picked up from a room that was following a wave with nobody feeding it,
+    /// rather than switched on here. Losing such a claim is somebody else doing
+    /// the same job, so it is not worth telling the user about.
+    adopted: bool,
 }
 
 /// Why a track did not start.
@@ -489,6 +552,9 @@ struct Engine {
     /// the Yandex client because a peer answers at once or not at all.
     http: reqwest::Client,
     cache: Arc<Cache>,
+    /// This account's «Мне нравится». Read on connecting and written when a heart
+    /// is pressed; the room never sees it.
+    likes: Arc<Likes>,
     /// Keep every track that plays, not just the ones asked for by name.
     auto_cache: bool,
     /// Also the credential the file server checks, so a peer fetch can present it.
@@ -505,6 +571,9 @@ struct Engine {
     station: Option<Station>,
     /// A request for more station tracks is in flight.
     refilling: bool,
+    /// Swallow the next `station_taken` refusal: it answers a claim this peer
+    /// made on its own initiative, on a wave that had lost its feeder.
+    quiet_station_refusal: bool,
 
     /// The room's state, as the relay last described it. This is the only
     /// authority on what should be playing.
@@ -569,6 +638,14 @@ impl Engine {
         tick: Duration,
     ) -> Result<()> {
         let (internal, mut internal_rx) = mpsc::unbounded_channel::<Internal>();
+
+        // Two things the network is needed for that nobody should have to press a
+        // button for: what this account has hearted, and the names of albums the
+        // downloads arrived without. Both are asked for once, here, and never on a
+        // tick — and both fail quietly, because they are how the library reads,
+        // not whether it plays.
+        self.read_likes(&internal, false);
+        self.name_albums(&internal);
 
         let mut tick = tokio::time::interval(tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -654,6 +731,7 @@ impl Engine {
                     after: None,
                     claimed: false,
                     replace_first: replace,
+                    adopted: false,
                 });
                 self.refilling = false;
                 self.request_station_tracks(internal);
@@ -755,9 +833,83 @@ impl Engine {
                 }
             }
 
+            Command::Like { track, liked } => {
+                let api = Arc::clone(&self.api);
+                let likes = Arc::clone(&self.likes);
+                let internal = internal.clone();
+                let label = track.to_string();
+                // In a task of its own: this is a Yandex round trip plus a write
+                // of the whole list, and the loop has a room to keep in time.
+                tokio::spawn(async move {
+                    let error = likes
+                        .set(&api, &track, liked)
+                        .await
+                        .err()
+                        .map(|err| format!("{err:#}"));
+                    let _ = internal.send(Internal::Liked {
+                        label,
+                        liked,
+                        error,
+                    });
+                });
+            }
+
+            Command::RefreshLikes => self.read_likes(internal, true),
+
             // Handled by the loop.
             Command::Shutdown => {}
         }
+    }
+
+    /// Re-reads «Мне нравится» from Yandex in the background.
+    ///
+    /// `asked_for` separates the read done on connecting from one the listener
+    /// pressed a button for: only the latter is worth reporting when it works.
+    fn read_likes(&mut self, internal: &mpsc::UnboundedSender<Internal>, asked_for: bool) {
+        let api = Arc::clone(&self.api);
+        let likes = Arc::clone(&self.likes);
+        let internal = internal.clone();
+        tokio::spawn(async move {
+            let message = match likes.refresh(&api).await {
+                Ok(count) => Internal::LikesRead {
+                    count,
+                    error: None,
+                    asked_for,
+                },
+                Err(err) => Internal::LikesRead {
+                    count: 0,
+                    error: Some(format!("{err:#}")),
+                    asked_for,
+                },
+            };
+            let _ = internal.send(message);
+        });
+    }
+
+    /// Fills in the album names the downloads on this disk are missing.
+    ///
+    /// Skipped entirely when there is nothing to ask about, which is the usual
+    /// case: everything downloaded since album names existed already has one.
+    fn name_albums(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        if albums::missing(&self.cache).is_empty() {
+            return;
+        }
+        let api = Arc::clone(&self.api);
+        let cache = Arc::clone(&self.cache);
+        let internal = internal.clone();
+        tokio::spawn(async move {
+            let message = match albums::fill(&cache, &api).await {
+                Ok(updated) => Internal::AlbumsNamed {
+                    updated,
+                    error: None,
+                },
+                Err(err) => Internal::AlbumsNamed {
+                    updated: 0,
+                    error: Some(format!("{err:#}")),
+                },
+            };
+            let _ = internal.send(message);
+        });
     }
 
     /// Asks the station for its next tracks, unless a request is already out.
@@ -1073,6 +1225,20 @@ impl Engine {
                     return;
                 }
 
+                // Somebody got to this wave first while the batch was in flight.
+                // Sending it now would push tracks the room's actual feeder is
+                // also about to push, so this peer steps aside instead.
+                if station.adopted
+                    && !station.claimed
+                    && self
+                        .remote
+                        .as_ref()
+                        .is_some_and(|state| state.station.is_some() && !state.station_unfed)
+                {
+                    self.station = None;
+                    return;
+                }
+
                 station.after = tracks.last().map(|t| t.track_id.clone());
                 let replace = std::mem::take(&mut station.replace_first);
                 let claim = if station.claimed {
@@ -1159,6 +1325,53 @@ impl Engine {
                     && track.track_id == track_id
                 {
                     self.start_load(&track, internal);
+                }
+            }
+
+            Internal::Liked {
+                label,
+                liked,
+                error,
+            } => {
+                // A refusal has to be said out loud: the heart is drawn from the
+                // stored list, which was left untouched, so it springs back — and
+                // silently springing back looks like the button is broken.
+                self.notice = Some(match error {
+                    Some(error) => format!("не получилось: {error}"),
+                    None if liked => format!("{label} — в «Мне нравится»"),
+                    None => format!("{label} — убрал из «Мне нравится»"),
+                });
+            }
+
+            Internal::LikesRead {
+                count,
+                error,
+                asked_for,
+            } => match error {
+                // Offline, the stored list is still on screen, so this is only
+                // worth saying when somebody actually asked for a fresh one.
+                Some(error) if asked_for => {
+                    self.notice = Some(format!("не удалось обновить «Мне нравится»: {error}"));
+                }
+                Some(error) => debug!("«Мне нравится» не обновилось: {error}"),
+                None if asked_for => {
+                    self.notice = Some(format!("«Мне нравится»: {count} треков"));
+                }
+                None => debug!(tracks = count, "«Мне нравится» прочитано"),
+            },
+
+            Internal::AlbumsNamed { updated, error } => {
+                if let Some(error) = error {
+                    // Cosmetic and self-explanatory: the library still lists
+                    // everything, it just cannot be grouped by name yet. The
+                    // album tab says so where it matters.
+                    debug!("названия альбомов не получены: {error}");
+                } else if updated > 0 {
+                    // The rows on screen have names they did not have. The ids did
+                    // not change, so the room needs no new announcement — which is
+                    // why this bumps the revision rather than calling
+                    // `refresh_cache_view`.
+                    self.cache_revision += 1;
                 }
             }
 
@@ -1271,6 +1484,35 @@ impl Engine {
                     self.notice = Some("волна выключена".to_string());
                 }
 
+                // A wave the room still follows but nobody feeds: whoever was
+                // resolving its batches has left. Picking it up is what keeps the
+                // room from going quiet once the last queued track ends — and it
+                // is why coming back to a room you were feeding resumes the wave.
+                //
+                // Any peer may, and the relay hands it to whoever asks first; the
+                // losers are told and go quiet, which is cheaper than electing
+                // one.
+                if state.station_unfed
+                    && self.station.is_none()
+                    && let Some(id) = state.station.clone()
+                {
+                    self.notice = Some("подхватываю волну".to_string());
+                    self.station = Some(Station {
+                        id,
+                        // The wave picks up wherever it likes; what matters is
+                        // that the queue keeps growing.
+                        after: None,
+                        claimed: false,
+                        // Joining the queue, never replacing it: the room is
+                        // playing, and a replacing queue would also clear the
+                        // very station being claimed.
+                        replace_first: false,
+                        adopted: true,
+                    });
+                    self.refilling = false;
+                    self.request_station_tracks(internal);
+                }
+
                 if let Some(track) = state.track.clone() {
                     let staged = self.player.current_track_id();
                     let is_staged = staged.as_deref() == Some(track.track_id.as_str());
@@ -1314,11 +1556,20 @@ impl Engine {
                     if let Some(station) = self.station.as_mut() {
                         station.claimed = true;
                     }
-                } else if self.station.take().is_some() {
-                    self.notice = Some(match id {
-                        Some(_) => "волну в этой комнате уже ведёт другой участник".to_string(),
-                        None => "волна выключена".to_string(),
-                    });
+                } else if let Some(lost) = self.station.take() {
+                    // Two peers noticing an unfed wave at once is the expected
+                    // way this goes; only one of them can win, and the loser has
+                    // nothing to report — somebody is doing the job.
+                    if lost.adopted {
+                        self.quiet_station_refusal = true;
+                    } else {
+                        self.notice = Some(match id {
+                            Some(_) => {
+                                "волну в этой комнате уже ведёт другой участник".to_string()
+                            }
+                            None => "волна выключена".to_string(),
+                        });
+                    }
                 }
             }
 
@@ -1345,6 +1596,11 @@ impl Engine {
             }
 
             Event::Error { code, message } => {
+                // The refusal that follows losing a wave we only picked up to be
+                // helpful. The `Station` frame arrives first and already said so.
+                if code == "station_taken" && std::mem::take(&mut self.quiet_station_refusal) {
+                    return;
+                }
                 self.notice = Some(format!("релей сообщил об ошибке ({code}): {message}"));
             }
         }
@@ -1475,6 +1731,11 @@ impl Engine {
 
         let track = self.wanted_track();
         let duration_ms = track.as_ref().map_or(0, |t| t.duration_ms);
+        // Read before the track is moved into the snapshot: the heart in the
+        // player and the one in the phone's notification are drawn from it.
+        let track_liked = track
+            .as_ref()
+            .is_some_and(|t| self.likes.contains(&t.track_id));
         // A drained sink can report slightly past the end; never show more than
         // the track actually has.
         let position_ms = match duration_ms {
@@ -1509,6 +1770,8 @@ impl Engine {
             cache_revision: self.cache_revision,
             cache_bytes: self.cache.total_bytes(),
             cache_limit_bytes: self.cache.limit_bytes(),
+            track_liked,
+            liked_revision: self.likes.revision(),
             downloading: self.downloading.clone(),
             download_queue: self.downloads.len(),
             sharing_peers: self

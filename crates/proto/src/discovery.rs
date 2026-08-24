@@ -93,7 +93,10 @@ mod tests {
             protocol: PROTOCOL_VERSION,
         };
         let text = serde_json::to_string(&msg).unwrap();
-        assert_eq!(text, r#"{"t":"query","protocol":4}"#);
+        assert_eq!(
+            text,
+            format!(r#"{{"t":"query","protocol":{PROTOCOL_VERSION}}}"#)
+        );
         assert_eq!(msg, serde_json::from_str::<Discovery>(&text).unwrap());
     }
 
@@ -132,7 +135,9 @@ mod tests {
         let text = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             text,
-            r#"{"t":"rooms","protocol":4,"id":7,"port":9000,"rooms":[]}"#
+            format!(
+                r#"{{"t":"rooms","protocol":{PROTOCOL_VERSION},"id":7,"port":9000,"rooms":[]}}"#
+            )
         );
         assert_eq!(msg, serde_json::from_str::<Discovery>(&text).unwrap());
     }

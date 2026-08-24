@@ -36,6 +36,11 @@ pub enum Request {
     CancelDownloads,
     /// Deletes one track from this device.
     Forget { track_id: String },
+    /// Puts a track into «Мне нравится», or takes it out. The screen sends the
+    /// whole track, so a like from a search result needs no lookup.
+    Like { track: TrackRef, liked: bool },
+    /// Re-reads «Мне нравится» from Yandex.
+    RefreshLikes,
 }
 
 impl Request {
@@ -57,6 +62,8 @@ impl Request {
             Request::StopWave => Command::StopStation,
             Request::CancelDownloads => Command::CancelDownloads,
             Request::Forget { track_id } => Command::Forget { track_id },
+            Request::Like { track, liked } => Command::Like { track, liked },
+            Request::RefreshLikes => Command::RefreshLikes,
             Request::Download { .. } => return None,
         })
     }
@@ -97,11 +104,15 @@ impl Session {
         // Kotlin passes an app-private path in `cache.dir`, which is the only
         // place this process may write without asking for a permission.
         let cache = core::open_cache(&cfg)?;
+        // «Мне нравится» lives beside the downloads, and like them it is read off
+        // the disk first, so the hearts are right before Yandex has answered.
+        let likes = core::open_likes(&cache);
         let core = runtime.block_on(core::start(
             &cfg,
             Arc::clone(&api),
             player as Arc<dyn Playback>,
             cache,
+            likes,
         ))?;
 
         Ok(Self {
@@ -176,6 +187,19 @@ impl Session {
             "bytes": cache.total_bytes(),
             "limit_bytes": cache.limit_bytes(),
             "directory": cache.directory().display().to_string(),
+        })
+    }
+
+    /// This account's «Мне нравится», as last read.
+    ///
+    /// Off the disk like [`Session::library`], so the screen can list it — and
+    /// draw its hearts — with no network at all. The engine refreshes it from
+    /// Yandex on connecting and whenever the phone asks.
+    pub fn likes(&self) -> serde_json::Value {
+        let likes = self.engine().likes();
+        serde_json::json!({
+            "tracks": likes.tracks().as_ref(),
+            "updated_ms": likes.updated_ms(),
         })
     }
 
@@ -313,10 +337,28 @@ mod tests {
                     track_id: "42".to_string(),
                 },
             ),
+            (r#"{"action":"refresh_likes"}"#, Command::RefreshLikes),
         ];
         for (json, expected) in cases {
             let request: Request = serde_json::from_str(json).expect(json);
             assert_eq!(request.command(), Some(expected), "{json}");
+        }
+    }
+
+    /// A heart carries the whole track, so liking a search result costs no lookup
+    /// — the same reason a row is played by sending its track rather than its id.
+    #[test]
+    fn a_like_carries_the_track_it_means() {
+        let json = r#"{"action":"like","liked":true,
+            "track":{"track_id":"42","album":"Легенда","title":"T","artist":"A","duration_ms":1000}}"#;
+        let request: Request = serde_json::from_str(json).expect(json);
+        match request.command() {
+            Some(Command::Like { track, liked }) => {
+                assert_eq!(track.track_id, "42");
+                assert_eq!(track.album.as_deref(), Some("Легенда"));
+                assert!(liked);
+            }
+            other => panic!("не лайк: {other:?}"),
         }
     }
 

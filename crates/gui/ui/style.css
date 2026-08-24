@@ -181,8 +181,9 @@ input[type="range"] {
 main {
   display: grid;
   /* The first panel carries the source controls, so it needs the widest column;
-     the other two hold lists that shorten gracefully. */
-  grid-template-columns: 1.7fr 1fr 1fr;
+     the library panel is second-widest because its rows carry the most: a name,
+     a size, a heart and a delete. */
+  grid-template-columns: 1.5fr 1fr 1.3fr;
   gap: 12px;
   padding: 12px 16px;
   min-height: 0;
@@ -258,10 +259,12 @@ h2 {
 
 .list .entry {
   display: flex;
-  gap: 10px;
+  /* Tight, because a row can carry five things: number, name, origin mark,
+     time and — outside the button — a heart and a delete. */
+  gap: 6px;
   align-items: baseline;
   width: 100%;
-  padding: 6px 8px;
+  padding: 6px 4px;
   border: 0;
   border-radius: 6px;
   background: none;
@@ -325,6 +328,29 @@ h2 {
   color: var(--accent);
 }
 
+/* Three views of the library panel: the downloads, what this account has
+   hearted, and the downloads grouped by album. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.tab {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: var(--dim);
+}
+
+.tab.current {
+  color: var(--text);
+  border-color: #6b5a20;
+  background: #241f13;
+}
+
 /* A library row carries its own delete button, so the row is not one big
    button the way queue and search rows are. */
 .list li.pair {
@@ -338,8 +364,56 @@ h2 {
   min-width: 0;
 }
 
+/* The album header in the grouped view: pressing it queues the whole album. */
+.list li.group {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.group-entry {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  padding: 4px 8px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.group-entry:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-radius: 6px;
+}
+
+/* «Мне нравится» is per account, not per room: pressing this changes what Yandex
+   holds for this token and nothing at all for the other listeners. */
+.heart {
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--dim);
+  line-height: 1;
+}
+
+.heart.on {
+  color: var(--bad);
+}
+
+.heart:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--bad);
+}
+
 .drop {
-  padding: 2px 8px;
+  padding: 2px 4px;
   border: 0;
   border-radius: 6px;
   background: none;
@@ -364,6 +438,15 @@ footer {
 }
 
 .now {
+  min-width: 0;
+}
+
+/* The heart sits with the title, not with the transport: it acts on the track,
+   while the transport acts on the room. */
+.title-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
 }
 

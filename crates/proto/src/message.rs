@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 ///   [`ClientMsg::Share`] announces which tracks a peer will serve and on what
 ///   port, and [`ServerMsg::Shares`] hands the room the resulting map. The bytes
 ///   themselves never touch the relay.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// * 5 — a station outlives its feeder: [`PlaybackState::station_unfed`] says the
+///   room still follows the wave but has nobody resolving batches for it, and
+///   any peer may take that over. Before this, the wave ended for good when
+///   whoever started it left the room. [`TrackRef::album`] also arrives with this
+///   version, so a downloaded library can be grouped by album with no network.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Identifies a track well enough for another account to resolve it.
 ///
@@ -27,6 +32,15 @@ pub struct TrackRef {
     pub track_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub album_id: Option<String>,
+    /// The album's name, when it is known.
+    ///
+    /// Optional because two things carry a track without it: an entry downloaded
+    /// before this field existed, and a payload where Yandex named only the
+    /// album's id. Both are filled in later from `/albums` rather than left to
+    /// show a number to the listener — grouping a library by "Альбом 31888058"
+    /// would be no better than not grouping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
     pub title: String,
     pub artist: String,
     pub duration_ms: u64,
@@ -86,10 +100,18 @@ pub struct PlaybackState {
     /// 2, where a master estimated relay time, this is read directly — so the
     /// anchor carries no clock-estimation error at all.
     pub at_server_ms: i64,
-    /// Set while some peer is feeding an endless station into the queue. Carried
-    /// so a joining peer can show that the wave is on; the id is the station's.
+    /// Set while the queue is being fed by an endless station. Carried so a
+    /// joining peer can show that the wave is on; the id is the station's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub station: Option<String>,
+    /// The station above has nobody feeding it: whoever was doing so has left.
+    ///
+    /// The claim used to die with its owner, which meant the room played out
+    /// whatever was already queued and then sat in silence — and coming back
+    /// did not help, because nothing said the wave was still meant to be on.
+    /// Now the room remembers, and any peer that sees this picks the wave up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub station_unfed: bool,
 }
 
 /// A mutation any peer may ask the relay to make.
@@ -227,6 +249,7 @@ mod tests {
         TrackRef {
             track_id: id.into(),
             album_id: Some("100".into()),
+            album: Some("Album".into()),
             title: format!("Title {id}"),
             artist: "Artist".into(),
             duration_ms: 210_000,
@@ -243,6 +266,7 @@ mod tests {
             playing: true,
             at_server_ms: 1_700_000_000_000,
             station: None,
+            station_unfed: false,
         }
     }
 

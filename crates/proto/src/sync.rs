@@ -104,6 +104,7 @@ mod tests {
             track: Some(TrackRef {
                 track_id: "1".into(),
                 album_id: None,
+                album: None,
                 title: "t".into(),
                 artist: "a".into(),
                 duration_ms: 300_000,
@@ -114,6 +115,7 @@ mod tests {
             playing,
             at_server_ms,
             station: None,
+            station_unfed: false,
         }
     }
 

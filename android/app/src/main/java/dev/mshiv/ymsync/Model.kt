@@ -11,6 +11,8 @@ data class TrackInfo(
     val durationMs: Long,
     /** Kept so a track queued from this screen loses nothing on the way. */
     val albumId: String? = null,
+    /** The album's name, when the core knows it. What the album view groups by. */
+    val album: String? = null,
 ) {
     /**
      * The shape `Native.queueTracks` takes: `ymsync_proto::TrackRef`.
@@ -24,7 +26,10 @@ data class TrackInfo(
             .put("title", title)
             .put("artist", artist)
             .put("duration_ms", durationMs)
-            .apply { albumId?.let { put("album_id", it) } }
+            .apply {
+                albumId?.let { put("album_id", it) }
+                album?.let { put("album", it) }
+            }
 }
 
 /** A list of tracks as the core expects it. */
@@ -47,6 +52,20 @@ data class Library(
     val limitBytes: Long,
     val directory: String,
 )
+
+/**
+ * This account's «Мне нравится», as the core last read it.
+ *
+ * Stored on disk, so it is on screen with no internet — and the ids in it are
+ * what every heart on every list is drawn from.
+ */
+data class Likes(
+    val tracks: List<TrackInfo>,
+    /** When Yandex was last asked, in Unix ms. 0 means never. */
+    val updatedMs: Long,
+) {
+    val ids: Set<String> = tracks.map { it.trackId }.toSet()
+}
 
 /** A room somebody on this network is holding. */
 data class FoundRoom(
@@ -81,6 +100,10 @@ data class Snapshot(
     /** Bumped whenever [cached] changes. */
     val cacheRevision: Long,
     val cacheBytes: Long,
+    /** Whether the track playing right now is in «Мне нравится». */
+    val trackLiked: Boolean,
+    /** Bumped whenever «Мне нравится» changes, here or on Yandex. */
+    val likedRevision: Long,
     /** Ids the room can supply over the local network, whoever holds them. */
     val onLan: Set<String>,
     /** How many peers are offering their downloads. */
@@ -119,6 +142,7 @@ fun JSONObject.toTrackInfo() =
         artist = optString("artist"),
         durationMs = optLong("duration_ms"),
         albumId = if (isNull("album_id")) null else optString("album_id"),
+        album = if (isNull("album")) null else optString("album"),
     )
 
 fun JSONArray.toTrackList(): List<TrackInfo> =
@@ -138,6 +162,12 @@ fun JSONObject.toLibrary() =
         bytes = optLong("bytes"),
         limitBytes = optLong("limit_bytes"),
         directory = optString("directory"),
+    )
+
+fun JSONObject.toLikes() =
+    Likes(
+        tracks = optJSONArray("tracks")?.toTrackList() ?: emptyList(),
+        updatedMs = optLong("updated_ms"),
     )
 
 fun JSONObject.toFoundRoom() =
@@ -179,6 +209,8 @@ fun JSONObject.toSnapshot(previous: Snapshot? = null) =
         cached = optJSONArray("cached")?.toIdSet() ?: previous?.cached ?: emptySet(),
         cacheRevision = optLong("cache_revision"),
         cacheBytes = optLong("cache_bytes"),
+        trackLiked = optBoolean("track_liked"),
+        likedRevision = optLong("liked_revision"),
         onLan = optJSONArray("on_lan")?.toIdSet() ?: emptySet(),
         sharingPeers = optInt("sharing_peers"),
         downloading = if (isNull("downloading")) null else optString("downloading"),

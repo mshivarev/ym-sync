@@ -114,6 +114,14 @@ impl Link {
         )
         .await?;
 
+        // Anything the relay says before the clock is ready. The room replay —
+        // the sharing map, the queue, the state — arrives immediately after the
+        // welcome, which is *during* the probes below, and dropping those frames
+        // is exactly what made a returning peer show an empty queue: the relay
+        // only resends a queue when it changes, and a station-fed room whose
+        // feeder has left never changes it again.
+        let mut replay: Vec<ServerMsg> = Vec::new();
+
         let peers_at_join = loop {
             match next_server_msg(&mut read, HANDSHAKE_TIMEOUT).await? {
                 ServerMsg::Welcome { protocol, peers, .. } => {
@@ -128,7 +136,7 @@ impl Link {
                 ServerMsg::Error { code, message } => {
                     bail!("релей отказал в подключении ({code}): {message}")
                 }
-                _ => {}
+                other => replay.push(other),
             }
         };
 
@@ -146,7 +154,7 @@ impl Link {
                     ServerMsg::Error { code, message } => {
                         bail!("релей сообщил об ошибке ({code}): {message}")
                     }
-                    _ => {}
+                    other => replay.push(other),
                 }
             }
             tokio::time::sleep(PRIMING_GAP).await;
@@ -160,6 +168,16 @@ impl Link {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMsg>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+        // Held back frames go in ahead of anything the reader will see, keeping
+        // the relay's order: the queue before the state that indexes into it.
+        for msg in replay {
+            if let Some(event) = as_event(msg)
+                && event_tx.send(event).is_err()
+            {
+                break;
+            }
+        }
 
         let writer = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
@@ -267,45 +285,41 @@ async fn read_loop(
         };
 
         match serde_json::from_str::<ServerMsg>(text.as_str()) {
+            // Clock replies never reach the sync loop: they are the clock.
             Ok(ServerMsg::TimeRes { c0, s }) => {
                 sampler.push(sample_from_roundtrip(c0, s, unix_ms()));
                 clock.publish_from(&sampler);
             }
-            Ok(ServerMsg::State { state }) => {
-                if events.send(Event::State(state)).is_err() {
+            Ok(msg) => {
+                if let Some(event) = as_event(msg)
+                    && events.send(event).is_err()
+                {
                     break;
                 }
             }
-            Ok(ServerMsg::Queue { revision, tracks }) => {
-                if events.send(Event::Queue { revision, tracks }).is_err() {
-                    break;
-                }
-            }
-            Ok(ServerMsg::Peer { joined, peers }) => {
-                if events.send(Event::Peer { joined, peers }).is_err() {
-                    break;
-                }
-            }
-            Ok(ServerMsg::Station { id, yours }) => {
-                if events.send(Event::Station { id, yours }).is_err() {
-                    break;
-                }
-            }
-            Ok(ServerMsg::Shares { peers }) => {
-                if events.send(Event::Shares { peers }).is_err() {
-                    break;
-                }
-            }
-            Ok(ServerMsg::Error { code, message }) => {
-                if events.send(Event::Error { code, message }).is_err() {
-                    break;
-                }
-            }
-            Ok(ServerMsg::Welcome { .. }) => {}
             Err(err) => debug!(%err, "undecodable frame from the relay"),
         }
     }
     // Dropping `events` here is what tells the sync loop the link is dead.
+}
+
+/// What the sync loop is told about a frame, if anything.
+///
+/// Shared with the handshake, which holds frames back until the event channel
+/// exists: two copies of this mapping would drift, and the one in the handshake
+/// is the one nobody notices — its frames only arrive when joining a room that is
+/// already playing.
+fn as_event(msg: ServerMsg) -> Option<Event> {
+    match msg {
+        ServerMsg::State { state } => Some(Event::State(state)),
+        ServerMsg::Queue { revision, tracks } => Some(Event::Queue { revision, tracks }),
+        ServerMsg::Peer { joined, peers } => Some(Event::Peer { joined, peers }),
+        ServerMsg::Station { id, yours } => Some(Event::Station { id, yours }),
+        ServerMsg::Shares { peers } => Some(Event::Shares { peers }),
+        ServerMsg::Error { code, message } => Some(Event::Error { code, message }),
+        // Handled where the connection is set up, and meaningless afterwards.
+        ServerMsg::Welcome { .. } | ServerMsg::TimeRes { .. } => None,
+    }
 }
 
 async fn send_msg(sink: &mut WsSink, msg: &ClientMsg) -> Result<()> {

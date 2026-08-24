@@ -143,4 +143,34 @@ object Commands {
                 Result.success(reply.value.optJSONArray("rooms")?.toFoundRooms() ?: emptyList())
         }
     }
+
+    /**
+     * This account's «Мне нравится», as last read.
+     *
+     * Like [library] this reads what the core already holds — the list is stored
+     * on disk — so it answers with no internet. Re-reading it from Yandex is
+     * `send("refresh_likes")`.
+     */
+    suspend fun likes(): Result<Likes> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.likes(handle)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.toLikes())
+        }
+    }
+
+    /**
+     * Puts a track into «Мне нравится», or takes it out.
+     *
+     * The whole track goes down, not its id: a like from a search result then costs
+     * no lookup, and the stored list gets a row that can be played. Likes belong to
+     * this account — the rest of the room sees nothing.
+     */
+    suspend fun like(track: TrackInfo, liked: Boolean): String? =
+        send("like") {
+            put("track", track.toJson())
+            put("liked", liked)
+        }
 }

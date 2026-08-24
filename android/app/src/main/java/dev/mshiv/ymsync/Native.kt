@@ -41,6 +41,15 @@ object Native {
     external fun library(handle: Long): String
 
     /**
+     * This account's «Мне нравится», as last read from Yandex.
+     *
+     * Comes off the disk, so it needs no network and no request — the hearts on
+     * every list are drawn from it. Re-reading it from Yandex is
+     * `send({"action":"refresh_likes"})`, which does.
+     */
+    external fun likes(handle: Long): String
+
+    /**
      * Asks the local network which rooms are out there.
      *
      * The one call that needs no session: it is what you do before you know where

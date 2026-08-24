@@ -488,6 +488,7 @@ mod tests {
         TrackRef {
             track_id: id.to_string(),
             album_id: None,
+            album: None,
             title: format!("Title {id}"),
             artist: "Artist".to_string(),
             duration_ms: 1_000,

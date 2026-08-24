@@ -19,6 +19,7 @@ use ymsync::cache::{Cache, CachedTrack};
 use ymsync::config::Config;
 use ymsync::discover::{self, FoundRoom};
 use ymsync::engine::{Command, Snapshot};
+use ymsync::likes::Likes;
 use ymsync::player::Player;
 use ymsync::session::{self, Session};
 use ymsync_proto::TrackRef;
@@ -41,6 +42,9 @@ struct AppState {
     /// Opened on first use and kept: the window lists the offline library before
     /// anything connects, and the engine then plays out of that same cache.
     cache: Mutex<Option<Arc<Cache>>>,
+    /// The account's «Мне нравится», read off the disk for the same reason: the
+    /// list and the hearts drawn from it are on screen before anything connects.
+    likes: Mutex<Option<Arc<Likes>>>,
     /// The engine plus whatever it brought up — a hosted relay, the file server
     /// for cached tracks. Held whole so that disconnecting closes those ports.
     session: SessionSlot,
@@ -73,6 +77,19 @@ impl AppState {
         let cache = session::open_cache(&self.config()).map_err(fail)?;
         *slot = Some(Arc::clone(&cache));
         Ok(cache)
+    }
+
+    /// The stored «Мне нравится». Lives beside the downloads, so it needs the
+    /// cache directory and nothing else — no token, no connection.
+    async fn likes(&self) -> Result<Arc<Likes>, String> {
+        let cache = self.cache().await?;
+        let mut slot = self.likes.lock().await;
+        if let Some(likes) = slot.as_ref() {
+            return Ok(Arc::clone(likes));
+        }
+        let likes = session::open_likes(&cache);
+        *slot = Some(Arc::clone(&likes));
+        Ok(likes)
     }
 
     /// Remembers the settings a successful connection was made with.
@@ -186,6 +203,7 @@ async fn connect(
 
     let api = state.api().await?;
     let cache = state.cache().await?;
+    let likes = state.likes().await?;
     let volume = cfg.volume;
     // Opening the audio device blocks briefly.
     let player = tokio::task::spawn_blocking(move || Player::new(volume))
@@ -195,7 +213,7 @@ async fn connect(
 
     // Hosting the room and serving cached tracks are both set up here, in the
     // order the engine needs them.
-    let session = session::start(&cfg, api, Arc::new(player), cache)
+    let session = session::start(&cfg, api, Arc::new(player), cache, likes)
         .await
         .map_err(fail)?;
     let snapshot = session.handle().snapshot();
@@ -387,6 +405,43 @@ async fn download(tracks: Vec<TrackRef>, state: State<'_, AppState>) -> Result<(
     send(&state, Command::Download { tracks }).await
 }
 
+/// This account's «Мне нравится», as last read.
+///
+/// Off the disk, like the offline library: no connection, no internet, and the
+/// hearts on every list are drawn from this.
+#[tauri::command]
+async fn likes(state: State<'_, AppState>) -> Result<Vec<TrackRef>, String> {
+    let likes = state.likes().await?;
+    Ok(likes.tracks().as_ref().clone())
+}
+
+/// Re-reads «Мне нравится» from Yandex. Returns how many there are.
+#[tauri::command]
+async fn refresh_likes(state: State<'_, AppState>) -> Result<usize, String> {
+    let api = state.api().await?;
+    state.likes().await?.refresh(&api).await.map_err(fail)
+}
+
+/// Puts a track into «Мне нравится», or takes it out.
+///
+/// Yandex first, then the stored list — so a refusal leaves the heart where it
+/// was rather than lighting it up locally and lying until the next refresh.
+/// Likes belong to this account, not to the room: nobody else's app changes.
+#[tauri::command]
+async fn like(
+    track: TrackRef,
+    liked: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let api = state.api().await?;
+    state
+        .likes()
+        .await?
+        .set(&api, &track, liked)
+        .await
+        .map_err(fail)
+}
+
 #[tauri::command]
 async fn cancel_downloads(state: State<'_, AppState>) -> Result<(), String> {
     send(&state, Command::CancelDownloads).await
@@ -453,6 +508,7 @@ fn main() {
                 config_path,
                 api: Mutex::new(None),
                 cache: Mutex::new(None),
+                likes: Mutex::new(None),
                 session: SessionSlot::default(),
             });
             Ok(())
@@ -467,6 +523,9 @@ fn main() {
             queue_tracks,
             control,
             library,
+            likes,
+            refresh_likes,
+            like,
             download,
             cancel_downloads,
             forget,

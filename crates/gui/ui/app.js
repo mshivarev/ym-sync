@@ -36,6 +36,8 @@ const ui = {
   libPlay: el("lib-play"),
   libQueue: el("lib-queue"),
   libRefresh: el("lib-refresh"),
+  tabs: el("tabs"),
+  heart: el("heart"),
   title: el("title"),
   subtitle: el("subtitle"),
   prev: el("prev"),
@@ -59,6 +61,9 @@ const PLACEHOLDERS = {
 /// Sources that are whole collections of their own: nothing to type in.
 const SELF_CONTAINED = new Set(["wave", "likes"]);
 
+/// Where the album view puts a download whose album name has not been fetched.
+const UNNAMED_ALBUM = "без названия альбома";
+
 let connected = false;
 let latest = null;
 let results = [];
@@ -72,6 +77,13 @@ let libraryRevision = -1;
 let cacheDir = "";
 let cacheLimit = 0;
 let autoCache = false;
+/// This account's «Мне нравится», read off the disk — so it is on screen, and its
+/// hearts are drawn, with no internet.
+let likes = [];
+let likedIds = new Set();
+let likesRevision = -1;
+/// Which view of the library is on screen: all / likes / albums.
+let tab = "all";
 /// Ids that cost no internet: on this disk, or on somebody else's in the room.
 let cachedIds = new Set();
 let lanIds = new Set();
@@ -105,6 +117,18 @@ async function call(command, args) {
   }
 }
 
+/// For commands that answer with nothing: `null` is their success, so it cannot
+/// double as the failure `call` reports with.
+async function attempt(command, args) {
+  try {
+    await invoke(command, args);
+    return true;
+  } catch (err) {
+    toast(String(err));
+    return false;
+  }
+}
+
 function setConnected(value) {
   connected = value;
   // The way into a room is only interesting when you are not in one: while
@@ -123,6 +147,7 @@ function setConnected(value) {
     latest = null;
     queueKey = "";
     libraryRevision = -1;
+    likesRevision = -1;
     cachedIds = new Set();
     lanIds = new Set();
     ui.connect.textContent = "Подключиться";
@@ -143,15 +168,36 @@ function setConnected(value) {
     ui.seek.value = 0;
     ui.position.textContent = "0:00";
     ui.duration.textContent = "0:00";
+    updateHeart();
   }
 }
 
 /// Playing the library means queueing it into the room, so it needs both the
 /// tracks and a connection.
 function updateLibraryButtons() {
-  const usable = connected && library.length > 0;
+  const usable = connected && visibleTracks().length > 0;
   ui.libPlay.disabled = !usable;
   ui.libQueue.disabled = !usable;
+  ui.libRefresh.title =
+    tab === "likes"
+      ? "перечитать «Мне нравится» с Яндекса"
+      : "перечитать папку с треками";
+}
+
+/// The heart beside the title in the player. The engine says whether the track
+/// playing right now is liked, so this agrees with the phone's notification.
+function updateHeart() {
+  const track = latest?.track;
+  const liked = latest?.track_liked ?? false;
+  ui.heart.className = liked ? "heart on" : "heart";
+  ui.heart.textContent = liked ? "\u2665" : "\u2661";
+  ui.heart.title = liked ? "убрать из «Мне нравится»" : "в «Мне нравится»";
+  ui.heart.disabled = !track;
+}
+
+function renderQueueAndResults() {
+  if (latest) renderQueue(latest);
+  renderResults();
 }
 
 /// Where a track would come from, when that costs no internet.
@@ -167,8 +213,13 @@ function origin(trackId) {
 
 /// Rows are real buttons: keyboard-reachable, and assistive tech (and UI
 /// automation) can activate them, which a bare `li` with a click handler cannot.
-function trackItem(track, index, { current, onClick, trailing }) {
+///
+/// Every row carries a heart, because the track you want to keep is as likely to
+/// be one you are queueing as the one already playing. It sits outside the row's
+/// own button: a button inside a button is not valid, and not clickable either.
+function trackItem(track, index, { current, onClick, trailing, extra }) {
   const item = document.createElement("li");
+  item.className = "pair";
 
   const entry = document.createElement("button");
   entry.type = "button";
@@ -194,8 +245,29 @@ function trackItem(track, index, { current, onClick, trailing }) {
 
   entry.append(number, name, mark, time);
   entry.addEventListener("click", onClick);
-  item.append(entry);
+  item.append(entry, heartButton(track));
+  if (extra) item.append(extra);
   return item;
+}
+
+/// The heart, drawn from the stored «Мне нравится».
+///
+/// Yandex is asked first and the list is re-read after, so a refusal leaves the
+/// heart where it was instead of lighting up and lying until the next refresh.
+function heartButton(track) {
+  const liked = likedIds.has(track.track_id);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = liked ? "heart on" : "heart";
+  button.textContent = liked ? "\u2665" : "\u2661";
+  button.title = liked ? "убрать из «Мне нравится»" : "в «Мне нравится»";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    const done = await attempt("like", { track, liked: !liked });
+    button.disabled = false;
+    if (done) await refreshLikes();
+  });
+  return button;
 }
 
 function renderQueue(snapshot) {
@@ -225,32 +297,153 @@ function renderResults() {
   );
 }
 
-/// The offline library. Rows carry a delete of their own, because this is the one
-/// list where the tracks belong to this device rather than to the room.
+/// The library panel, in whichever of its three views is on screen.
+///
+/// Two of them are this device's disk — flat, and grouped by album — and one is
+/// «Мне нравится» from the account. All three are drawn from lists already in
+/// memory, so switching tabs asks nothing of anybody.
 function renderLibrary() {
+  if (tab === "likes") {
+    renderLikes();
+  } else if (tab === "albums") {
+    renderAlbums();
+  } else {
+    renderDownloads();
+  }
+  updateLibraryButtons();
+  updateLibraryHint();
+}
+
+/// The flat list of downloads. Rows carry a delete of their own, because this is
+/// the one list where the tracks belong to this device rather than to the room.
+function renderDownloads() {
   ui.library.replaceChildren(
-    ...library.map((entry, index) => {
-      const item = trackItem(entry, index, {
+    ...library.map((entry, index) =>
+      trackItem(entry, index, {
         current: false,
         trailing: fmtSize(entry.bytes),
         onClick: () => call("queue_tracks", { tracks: [entry], start: 0, replace: false }),
-      });
-      item.className = "pair";
-
-      const drop = document.createElement("button");
-      drop.type = "button";
-      drop.className = "drop";
-      drop.textContent = "\u00D7";
-      drop.title = "удалить с этого устройства";
-      drop.addEventListener("click", async () => {
-        await call("forget", { id: entry.track_id });
-        await refreshLibrary();
-      });
-
-      item.append(drop);
-      return item;
-    }),
+        extra: dropButton(entry),
+      }),
+    ),
   );
+}
+
+/// «Мне нравится» from the account, newest first. Marked rows are the ones that
+/// are also on this disk and so cost no internet.
+function renderLikes() {
+  ui.library.replaceChildren(
+    ...likes.map((track, index) =>
+      trackItem(track, index, {
+        current: false,
+        onClick: () => call("queue_tracks", { tracks: [track], start: 0, replace: false }),
+      }),
+    ),
+  );
+}
+
+/// The downloads grouped by album, with a header per album that queues the whole
+/// of it. An album with no name yet is one whose title has not been fetched —
+/// that needs an internet connection, and the hint below says so.
+function renderAlbums() {
+  const nodes = [];
+  for (const group of albumGroups()) {
+    const header = document.createElement("li");
+    header.className = "group";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "group-entry";
+    button.title = "поставить альбом в очередь";
+    button.textContent = `${group.name} · ${group.tracks.length}`;
+    button.addEventListener("click", () =>
+      call("queue_tracks", { tracks: group.tracks, start: 0, replace: false }),
+    );
+
+    const size = document.createElement("span");
+    size.className = "time";
+    size.textContent = fmtSize(group.tracks.reduce((sum, entry) => sum + entry.bytes, 0));
+
+    header.append(button, size);
+    nodes.push(header);
+
+    group.tracks.forEach((entry, index) => {
+      nodes.push(
+        trackItem(entry, index, {
+          current: false,
+          onClick: () => call("queue_tracks", { tracks: [entry], start: 0, replace: false }),
+          extra: dropButton(entry),
+        }),
+      );
+    });
+  }
+  ui.library.replaceChildren(...nodes);
+}
+
+/// Downloads by album: named albums first in alphabetical order, then everything
+/// whose album name is not known yet, in one group at the end.
+///
+/// One group, not one per album id: without a name they would all be headed
+/// «без названия альбома», and fourteen identical headers say less than a single
+/// pile does. The name arrives with the next connection and they sort themselves.
+function albumGroups() {
+  const groups = new Map();
+  for (const entry of library) {
+    const key = entry.album || UNNAMED_ALBUM;
+    if (!groups.has(key)) groups.set(key, { name: key, tracks: [] });
+    groups.get(key).tracks.push(entry);
+  }
+  return [...groups.values()].sort((a, b) => {
+    const unnamed = (group) => (group.name === UNNAMED_ALBUM ? 1 : 0);
+    return unnamed(a) - unnamed(b) || a.name.localeCompare(b.name, "ru");
+  });
+}
+
+/// Deleting a download. Only for rows that are on this disk: a like is not a file.
+function dropButton(entry) {
+  const drop = document.createElement("button");
+  drop.type = "button";
+  drop.className = "drop";
+  drop.textContent = "\u00D7";
+  drop.title = "удалить с этого устройства";
+  drop.addEventListener("click", async () => {
+    await call("forget", { id: entry.track_id });
+    await refreshLibrary();
+  });
+  return drop;
+}
+
+/// What «Играть» and «В очередь» act on: whatever the open tab is showing.
+function visibleTracks() {
+  if (tab === "likes") return likes;
+  if (tab === "albums") return albumGroups().flatMap((group) => group.tracks);
+  return library;
+}
+
+function updateLibraryHint() {
+  if (tab === "likes") {
+    const marked = likes.filter((track) => cachedIds.has(track.track_id)).length;
+    ui.libHint.textContent = likes.length
+      ? `плейлист с Яндекса · ${likes.length} трек(ов), из них ${marked} на этом устройстве`
+      : "список пуст или ещё не загружен — нажмите ↻, когда будет интернет";
+    return;
+  }
+
+  const total = library.reduce((sum, entry) => sum + entry.bytes, 0);
+  const size = cacheLimit ? `${fmtSize(total)} из ${fmtSize(cacheLimit)}` : fmtSize(total);
+  const kept = autoCache ? "сохраняется всё, что играет" : "сохраняется только скачанное";
+  if (!library.length) {
+    ui.libHint.textContent = `пусто — «↓ трек» и «↓ очередь» оставляют музыку здесь · ${cacheDir}`;
+    return;
+  }
+  // Missing album names are the one thing this view cannot work around on its
+  // own: they are fetched when there is a connection and then live on disk.
+  const unnamed = library.filter((entry) => !entry.album).length;
+  const albums =
+    tab === "albums" && unnamed
+      ? ` · у ${unnamed} трек(ов) название альбома ещё не загружено, нужен интернет`
+      : "";
+  ui.libHint.textContent = `${size} · ${kept}${albums} · ${cacheDir}`;
 }
 
 /** Re-reads what is on disk. Works with no connection and no internet. */
@@ -261,16 +454,20 @@ async function refreshLibrary() {
   library = tracks;
   cachedIds = new Set(tracks.map((entry) => entry.track_id));
   ui.libCount.textContent = tracks.length ? `· ${tracks.length}` : "";
-
-  const total = tracks.reduce((sum, entry) => sum + entry.bytes, 0);
-  const size = cacheLimit ? `${fmtSize(total)} из ${fmtSize(cacheLimit)}` : fmtSize(total);
-  const kept = autoCache ? "сохраняется всё, что играет" : "сохраняется только скачанное";
-  ui.libHint.textContent = tracks.length
-    ? `${size} · ${kept} · ${cacheDir}`
-    : `пусто — «↓ трек» и «↓ очередь» оставляют музыку здесь · ${cacheDir}`;
-
   renderLibrary();
-  updateLibraryButtons();
+}
+
+/** Re-reads the stored «Мне нравится». No network: this is the list on disk. */
+async function refreshLikes() {
+  const tracks = await call("likes");
+  if (!tracks) return;
+
+  likes = tracks;
+  likedIds = new Set(tracks.map((track) => track.track_id));
+  // Every list draws hearts from this, so all of them are now stale.
+  renderQueueAndResults();
+  renderLibrary();
+  updateHeart();
 }
 
 function render(snapshot) {
@@ -281,6 +478,7 @@ function render(snapshot) {
 
   const track = snapshot.track;
   ui.title.textContent = track ? `${track.artist} — ${track.title}` : "—";
+  updateHeart();
 
   const place = snapshot.queue.length ? `${snapshot.index + 1} из ${snapshot.queue.length}` : "";
   const note = snapshot.loading ? "загрузка…" : (snapshot.notice || "");
@@ -356,6 +554,13 @@ function render(snapshot) {
   if (snapshot.cache_revision !== libraryRevision) {
     libraryRevision = snapshot.cache_revision;
     refreshLibrary();
+  }
+
+  // And the same for «Мне нравится»: the engine re-reads it on connecting and
+  // bumps this whenever it changes, here or on Yandex.
+  if (snapshot.liked_revision !== likesRevision) {
+    likesRevision = snapshot.liked_revision;
+    refreshLikes();
   }
 }
 
@@ -514,14 +719,54 @@ ui.dlQueue.addEventListener("click", () => {
 ui.dlCancel.addEventListener("click", () => call("cancel_downloads"));
 
 // Replacing the queue with the library is how you listen with no internet: every
-// one of these plays off the disk.
+// one of these plays off the disk. On the «мне нравится» tab it is the playlist
+// instead, which is the same act with a different list.
 ui.libPlay.addEventListener("click", () =>
-  call("queue_tracks", { tracks: library, start: 0, replace: true }),
+  call("queue_tracks", { tracks: visibleTracks(), start: 0, replace: true }),
 );
 ui.libQueue.addEventListener("click", () =>
-  call("queue_tracks", { tracks: library, start: 0, replace: false }),
+  call("queue_tracks", { tracks: visibleTracks(), start: 0, replace: false }),
 );
-ui.libRefresh.addEventListener("click", () => refreshLibrary());
+
+// Re-reading means two different things: the folder on this disk, or the playlist
+// on Yandex. Which one depends on what is on screen.
+ui.libRefresh.addEventListener("click", async () => {
+  if (tab !== "likes") {
+    await refreshLibrary();
+    return;
+  }
+  ui.libRefresh.disabled = true;
+  const count = await call("refresh_likes");
+  ui.libRefresh.disabled = false;
+  if (typeof count === "number") {
+    await refreshLikes();
+    toast(`«Мне нравится»: ${count} трек(ов)`);
+  }
+});
+
+// Three views of the same panel. Nothing is fetched on a switch: all three lists
+// are already in memory.
+ui.tabs.addEventListener("click", (event) => {
+  const button = event.target.closest(".tab");
+  if (!button) return;
+  tab = button.dataset.tab;
+  for (const node of ui.tabs.querySelectorAll(".tab")) {
+    node.classList.toggle("current", node === button);
+  }
+  renderLibrary();
+});
+
+ui.heart.addEventListener("click", async () => {
+  const track = latest?.track;
+  if (!track) {
+    toast("сейчас ничего не играет");
+    return;
+  }
+  ui.heart.disabled = true;
+  const done = await attempt("like", { track, liked: !latest.track_liked });
+  ui.heart.disabled = false;
+  if (done) await refreshLikes();
+});
 
 ui.seek.addEventListener("pointerdown", () => {
   dragging = true;
@@ -580,6 +825,9 @@ listen("notice", (event) => toast(String(event.payload))).catch(() => {});
   cacheLimit = settings.cache_limit_bytes;
   autoCache = settings.auto_cache;
   await refreshLibrary();
+  // Both lists come off the disk, so the panel is populated — hearts and all —
+  // before anything is connected and even with no internet at all.
+  await refreshLikes();
 
   // The room's password is a field now; the Yandex token is the one thing that
   // still has to be put in the file by hand.
