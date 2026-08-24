@@ -20,6 +20,16 @@
     <!-- Two ways into a room, and the same two fields for both: a room is a name
          and a password. Which button you press decides who runs the relay. -->
     <div id="setup" class="setup">
+      <!-- Only on screen while the config has no token. It is the one setting the
+           window could not offer, so a fresh install had to go and edit TOML. -->
+      <div id="token-line" class="line hidden">
+        <label for="token">токен Яндекса</label>
+        <input id="token" type="password" placeholder="y0_… — токен аккаунта этого ПК"
+          title="OAuth-токен аккаунта ИМЕННО этого ПК; где его взять — раздел «Токен Яндекса» в README" />
+        <button id="save-token" class="primary">Сохранить</button>
+        <span class="hint inline">у каждого устройства свой аккаунт с Плюсом</span>
+      </div>
+
       <div class="line">
         <label for="room">комната</label>
         <input id="room" placeholder="home" title="имя комнаты; у всех участников оно должно совпадать" />

@@ -6,6 +6,9 @@ const { listen } = window.__TAURI__.event;
 const el = (id) => document.getElementById(id);
 const ui = {
   setup: el("setup"),
+  tokenLine: el("token-line"),
+  token: el("token"),
+  saveToken: el("save-token"),
   room: el("room"),
   password: el("password"),
   relay: el("relay"),
@@ -591,6 +594,35 @@ async function enter(button, host) {
 ui.connect.addEventListener("click", () => enter(ui.connect, false));
 ui.host.addEventListener("click", () => enter(ui.host, true));
 
+/// Stores the Yandex token. The line disappears once there is one.
+///
+/// A refusal from Yandex leaves the field as typed — the token is probably a
+/// mistyped paste, and clearing it would mean starting over.
+ui.saveToken.addEventListener("click", async () => {
+  if (!ui.token.value.trim()) {
+    toast("впишите токен — где его взять, написано в README");
+    return;
+  }
+
+  ui.saveToken.disabled = true;
+  const label = ui.saveToken.textContent;
+  ui.saveToken.textContent = "Проверяю…";
+
+  const verdict = await call("save_token", { token: ui.token.value });
+
+  ui.saveToken.textContent = label;
+  ui.saveToken.disabled = false;
+  if (verdict === null) return;
+
+  ui.token.value = "";
+  ui.tokenLine.classList.add("hidden");
+  toast(verdict);
+});
+
+ui.token.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") ui.saveToken.click();
+});
+
 ui.disconnect.addEventListener("click", async () => {
   ui.disconnect.disabled = true;
   await call("disconnect");
@@ -829,9 +861,11 @@ listen("notice", (event) => toast(String(event.payload))).catch(() => {});
   // before anything is connected and even with no internet at all.
   await refreshLikes();
 
-  // The room's password is a field now; the Yandex token is the one thing that
-  // still has to be put in the file by hand.
+  // The Yandex token is the one thing a fresh install has nowhere to come from,
+  // so the field appears exactly while it is missing. It stays out of the way
+  // afterwards: the file is the place to change a token that already works.
+  ui.tokenLine.classList.toggle("hidden", settings.has_yandex_token);
   if (!settings.has_yandex_token) {
-    toast(`Впишите yandex_token в ${settings.config_path}`);
+    toast(`Впишите токен Яндекса в поле сверху — или в ${settings.config_path}`);
   }
 })();

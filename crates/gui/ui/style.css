@@ -140,6 +140,7 @@ header {
 button,
 select,
 input[type="text"],
+input[type="password"],
 input:not([type]) {
   font: inherit;
   color: var(--text);

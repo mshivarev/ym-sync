@@ -393,11 +393,13 @@ impl YandexMusic {
             .with_context(|| format!("чтение ответа {}", redact_url(url)))?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            bail!(
-                "Яндекс отклонил токен (HTTP {status}) — он отсутствует, истёк или \
-                 у аккаунта нет Плюса: {}",
-                excerpt(&body)
-            );
+            return Err(anyhow::Error::new(TokenRejected {
+                message: format!(
+                    "Яндекс отклонил токен (HTTP {status}) — он отсутствует, истёк или \
+                     у аккаунта нет Плюса: {}",
+                    excerpt(&body)
+                ),
+            }));
         }
         if !status.is_success() {
             bail!(
@@ -414,6 +416,26 @@ impl YandexMusic {
 struct Envelope<T> {
     result: T,
 }
+
+/// Yandex's answer that this token will not do: HTTP 401 or 403 from any call.
+///
+/// A marker type rather than a message to match on, for the same reason as the
+/// engine's `NotLicensed`. It matters where a token is being *saved*: a refusal
+/// says the token is wrong, while an unreachable Yandex says nothing about it at
+/// all, and the two cannot be told apart from the text alone.
+#[derive(Debug)]
+pub struct TokenRejected {
+    /// The whole diagnostic, including the status and what Yandex said.
+    pub message: String,
+}
+
+impl std::fmt::Display for TokenRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TokenRejected {}
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {

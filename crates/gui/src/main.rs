@@ -245,6 +245,54 @@ async fn connect(
     Ok(snapshot)
 }
 
+/// Saves the Yandex token typed into the window, checking it first.
+///
+/// Yandex is asked before anything is written, so a wrong token is caught while it
+/// is still on screen instead of surfacing as a puzzling failure on connect. Only
+/// an outright refusal counts against the token: when Yandex cannot be reached the
+/// check is skipped and the token stored with a warning, because a machine with no
+/// internet has to be configurable too — and an unreachable server says nothing
+/// about whether the token is any good.
+///
+/// Returns what to tell the user: whose account it is, and whether it has Плюс.
+#[tauri::command]
+async fn save_token(token: String, state: State<'_, AppState>) -> Result<String, String> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("впишите токен — где его взять, написано в README".to_string());
+    }
+
+    let api = Arc::new(YandexMusic::new(&token).map_err(fail)?);
+    let verdict = match api.account_status().await {
+        Ok(status) => {
+            let who = if status.account.display_name.is_empty() {
+                status.account.login.clone()
+            } else {
+                status.account.display_name.clone()
+            };
+            let has_plus = status.plus.as_ref().is_some_and(|plus| plus.has_plus);
+            if has_plus {
+                format!("токен принят: {who}")
+            } else {
+                format!("токен принят: {who} — но у аккаунта нет Плюса, полные треки недоступны")
+            }
+        }
+        // Yandex answered, and the answer was no: keep the field as typed.
+        Err(err) if err.downcast_ref::<api::TokenRejected>().is_some() => {
+            return Err(fail(err));
+        }
+        Err(err) => format!("токен сохранён, но проверить не удалось: {err:#}"),
+    };
+
+    let mut cfg = state.config();
+    cfg.yandex_token = token;
+    state.remember(cfg)?;
+    // Reuse the client just built, and replace an older one: the window may have
+    // been running with a token that has since expired.
+    *state.api.lock().await = Some(api);
+    Ok(verdict)
+}
+
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(session) = state.session.lock().await.take() {
@@ -516,6 +564,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             settings,
             connect,
+            save_token,
             disconnect,
             snapshot,
             search,
