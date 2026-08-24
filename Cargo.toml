@@ -6,6 +6,7 @@ members = ["crates/proto", "crates/relay", "crates/app", "crates/gui", "crates/a
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
+license = "GPL-3.0-only"
 publish = false
 
 [profile.release]
