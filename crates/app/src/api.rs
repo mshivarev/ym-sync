@@ -572,6 +572,8 @@ pub struct Track {
     pub artists: Vec<Artist>,
     #[serde(default)]
     pub albums: Vec<Album>,
+    #[serde(default)]
+    pub cover_uri: Option<String>,
 }
 
 fn yes() -> bool {
@@ -606,6 +608,14 @@ impl Track {
             .filter(|title| !title.trim().is_empty())
     }
 
+    /// The cover template: the track's own, else its album's.
+    pub fn cover_uri(&self) -> Option<String> {
+        self.cover_uri
+            .clone()
+            .or_else(|| self.albums.first().and_then(|a| a.cover_uri.clone()))
+            .filter(|uri| !uri.trim().is_empty())
+    }
+
     pub fn to_track_ref(&self) -> TrackRef {
         TrackRef {
             track_id: self.id.0.clone(),
@@ -614,6 +624,7 @@ impl Track {
             title: self.title.clone(),
             artist: self.artist_names(),
             duration_ms: self.duration_ms,
+            cover_uri: self.cover_uri(),
         }
     }
 }
@@ -625,12 +636,15 @@ pub struct Artist {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Album {
     pub id: Id,
     /// Present in search results and playlist payloads; absent often enough that
     /// nothing may depend on it.
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub cover_uri: Option<String>,
 }
 
 /// An id that the API returns sometimes as a string and sometimes as a number.
@@ -811,6 +825,25 @@ mod tests {
     fn ids_decode_from_strings_and_numbers() {
         assert_eq!(serde_json::from_str::<Id>("\"123\"").unwrap(), Id("123".into()));
         assert_eq!(serde_json::from_str::<Id>("123").unwrap(), Id("123".into()));
+    }
+
+    #[test]
+    fn cover_comes_from_the_track_else_from_its_album() {
+        let own: Track = serde_json::from_str(
+            r#"{"id": 1, "coverUri": "avatars.yandex.net/t/%%",
+                "albums": [{"id": 2, "coverUri": "avatars.yandex.net/a/%%"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(own.to_track_ref().cover_uri.as_deref(), Some("avatars.yandex.net/t/%%"));
+
+        let borrowed: Track = serde_json::from_str(
+            r#"{"id": 1, "albums": [{"id": 2, "coverUri": "avatars.yandex.net/a/%%"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(borrowed.to_track_ref().cover_uri.as_deref(), Some("avatars.yandex.net/a/%%"));
+
+        let none: Track = serde_json::from_str(r#"{"id": 1, "coverUri": ""}"#).unwrap();
+        assert_eq!(none.to_track_ref().cover_uri, None);
     }
 
     #[test]

@@ -25,11 +25,17 @@ const ui = {
   load: el("load"),
   play: el("play"),
   wave: el("wave"),
+  wavePlay: el("wave-play"),
+  likesTile: el("likes-tile"),
+  likesTileMeta: el("likes-tile-meta"),
+  offlineTile: el("offline-tile"),
+  offlineTileMeta: el("offline-tile-meta"),
   query: el("query"),
   find: el("find"),
   results: el("results"),
   queue: el("queue"),
   queueCount: el("queue-count"),
+  navQueue: el("nav-queue"),
   dlTrack: el("dl-track"),
   dlQueue: el("dl-queue"),
   dlCancel: el("dl-cancel"),
@@ -39,10 +45,23 @@ const ui = {
   libPlay: el("lib-play"),
   libQueue: el("lib-queue"),
   libRefresh: el("lib-refresh"),
+  libArt: el("lib-art"),
+  libTitle: el("lib-title"),
   tabs: el("tabs"),
+  nav: el("nav"),
+  sideRoom: el("side-room"),
+  sideDot: el("side-dot"),
+  sideRoomName: el("side-room-name"),
+  sideRoomMeta: el("side-room-meta"),
   heart: el("heart"),
+  cover: el("cover"),
   title: el("title"),
+  artist: el("artist"),
   subtitle: el("subtitle"),
+  nowCover: el("now-cover"),
+  nowBackdrop: el("now-backdrop"),
+  nowTitle: el("now-title"),
+  nowArtist: el("now-artist"),
   prev: el("prev"),
   toggle: el("toggle"),
   next: el("next"),
@@ -67,6 +86,13 @@ const SELF_CONTAINED = new Set(["wave", "likes"]);
 /// Where the album view puts a download whose album name has not been fetched.
 const UNNAMED_ALBUM = "без названия альбома";
 
+/// How the collection page heads each of its three views.
+const TAB_HEADS = {
+  all: { title: "Скачанное", art: "", icon: "i-download" },
+  likes: { title: "Мне нравится", art: "likes", icon: "i-heart" },
+  albums: { title: "По альбомам", art: "albums", icon: "i-library" },
+};
+
 let connected = false;
 let latest = null;
 let results = [];
@@ -74,6 +100,8 @@ let queueKey = "";
 let dragging = false;
 let toastTimer = null;
 let volumeTimer = null;
+/// Which source the «по ссылке» card loads from.
+let kind = "search";
 /// This device's downloads, and where they live. Known before connecting.
 let library = [];
 let libraryRevision = -1;
@@ -90,6 +118,11 @@ let tab = "all";
 /// Ids that cost no internet: on this disk, or on somebody else's in the room.
 let cachedIds = new Set();
 let lanIds = new Set();
+/// What the room was called when we joined it, for the sidebar.
+let roomName = "";
+/// The cover last drawn in the player, so a snapshot four times a second does not
+/// reload the same picture.
+let coverKey = null;
 
 function fmt(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
@@ -100,6 +133,16 @@ function fmt(ms) {
 function fmtSize(bytes) {
   const mib = (bytes || 0) / (1024 * 1024);
   return mib >= 1024 ? `${(mib / 1024).toFixed(1)} ГиБ` : `${mib.toFixed(1)} МиБ`;
+}
+
+/** «1 трек», «3 трека», «25 треков». */
+function tracksWord(count) {
+  const tens = count % 100;
+  const ones = count % 10;
+  if (tens >= 11 && tens <= 14) return `${count} треков`;
+  if (ones === 1) return `${count} трек`;
+  if (ones >= 2 && ones <= 4) return `${count} трека`;
+  return `${count} треков`;
 }
 
 function toast(message) {
@@ -132,16 +175,93 @@ async function attempt(command, args) {
   }
 }
 
+// ---------- drawing helpers ----------
+
+const SVG = "http://www.w3.org/2000/svg";
+
+/** One icon from the sprite in index.html. */
+function icon(name) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("class", "i");
+  const use = document.createElementNS(SVG, "use");
+  use.setAttribute("href", `#${name}`);
+  svg.append(use);
+  return svg;
+}
+
+/** Swaps the icon inside a button that holds one. */
+function setIcon(node, name) {
+  const use = node.querySelector("use");
+  if (use && use.getAttribute("href") !== `#${name}`) use.setAttribute("href", `#${name}`);
+}
+
+/// Yandex hands out a template, `avatars.yandex.net/…/%%`, and each screen asks
+/// for the size it draws. Tracks downloaded before covers were stored have none,
+/// and neither does anything with no internet — those get the placeholder.
+function coverUrl(track, size) {
+  const uri = track?.cover_uri;
+  if (!uri) return null;
+  const sized = uri.replace("%%", `${size}x${size}`);
+  return /^[a-z]+:/i.test(sized) ? sized : `https://${sized}`;
+}
+
+/// Fills a cover box: the picture when there is one, a note glyph otherwise —
+/// and the glyph again if the picture fails, which it will with no internet.
+function fillCover(box, track, size) {
+  const url = coverUrl(track, size);
+  const glyph = icon("i-note");
+  box.replaceChildren(glyph);
+  if (!url) return;
+  const img = new Image();
+  img.alt = "";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.src = url;
+  img.addEventListener("error", () => img.remove());
+  box.append(img);
+}
+
+/** Keeps a slider's filled part in step with its value. */
+function paintRange(input) {
+  const span = Number(input.max) - Number(input.min) || 1;
+  input.style.setProperty("--fill", `${((input.value - input.min) / span) * 100}%`);
+}
+
+// ---------- navigation ----------
+
+function showView(name) {
+  for (const view of document.querySelectorAll(".view")) {
+    view.classList.toggle("hidden", view.dataset.view !== name);
+  }
+  for (const item of ui.nav.querySelectorAll(".nav-item")) {
+    item.classList.toggle("current", item.dataset.view === name);
+  }
+  document.querySelector(".main").scrollTop = 0;
+}
+
+ui.nav.addEventListener("click", (event) => {
+  const item = event.target.closest(".nav-item");
+  if (item) showView(item.dataset.view);
+});
+ui.sideRoom.addEventListener("click", () => showView("room"));
+ui.cover.addEventListener("click", () => showView("queue"));
+ui.offlineTile.addEventListener("click", () => {
+  selectTab("all");
+  showView("library");
+});
+
+// ---------- state ----------
+
 function setConnected(value) {
   connected = value;
   // The way into a room is only interesting when you are not in one: while
-  // connected the header carries the room's state instead.
+  // connected the room page carries the room's state instead.
   ui.setup.classList.toggle("hidden", value);
   ui.disconnect.classList.toggle("hidden", !value);
 
   // Protocol 3 has no roles: everyone in the room may drive it.
-  for (const node of [ui.kind, ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek,
-    ui.dlTrack, ui.dlQueue]) {
+  for (const node of [ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek,
+    ui.dlTrack, ui.dlQueue, ui.wavePlay, ui.likesTile, ...ui.kind.querySelectorAll(".seg")]) {
     node.disabled = !value;
   }
   updateLibraryButtons();
@@ -149,6 +269,7 @@ function setConnected(value) {
   if (!value) {
     latest = null;
     queueKey = "";
+    coverKey = null;
     libraryRevision = -1;
     likesRevision = -1;
     cachedIds = new Set();
@@ -159,16 +280,28 @@ function setConnected(value) {
     ui.host.disabled = false;
     ui.status.className = "status";
     ui.status.textContent = "не подключено";
+    ui.sideDot.className = "dot";
+    ui.sideRoomName.textContent = "не подключено";
+    ui.sideRoomMeta.textContent = "нажмите, чтобы войти в комнату";
     ui.drift.classList.add("hidden");
     ui.wave.classList.add("hidden");
     ui.hosting.classList.add("hidden");
     ui.dlCancel.classList.add("hidden");
-    ui.queue.replaceChildren();
+    ui.queue.replaceChildren(emptyRow("Очередь пуста — поставьте что-нибудь с главной"));
     ui.queueCount.textContent = "";
+    ui.navQueue.textContent = "";
     ui.title.textContent = "—";
+    ui.artist.textContent = "";
     ui.subtitle.textContent = "";
-    ui.toggle.textContent = "\u25B6";
+    ui.nowTitle.textContent = "Тишина";
+    ui.nowArtist.textContent = "поставьте что-нибудь в очередь";
+    ui.nowBackdrop.style.backgroundImage = "";
+    fillCover(ui.cover, null, 100);
+    fillCover(ui.nowCover, null, 400);
+    document.body.classList.remove("playing");
+    setIcon(ui.toggle, "i-play");
     ui.seek.value = 0;
+    paintRange(ui.seek);
     ui.position.textContent = "0:00";
     ui.duration.textContent = "0:00";
     updateHeart();
@@ -193,7 +326,7 @@ function updateHeart() {
   const track = latest?.track;
   const liked = latest?.track_liked ?? false;
   ui.heart.className = liked ? "heart on" : "heart";
-  ui.heart.textContent = liked ? "\u2665" : "\u2661";
+  setIcon(ui.heart, liked ? "i-heart" : "i-heart-outline");
   ui.heart.title = liked ? "убрать из «Мне нравится»" : "в «Мне нравится»";
   ui.heart.disabled = !track;
 }
@@ -206,12 +339,27 @@ function renderQueueAndResults() {
 /// Where a track would come from, when that costs no internet.
 function origin(trackId) {
   if (cachedIds.has(trackId)) {
-    return { text: "\u2913", cls: "mark disk", title: "есть на этом устройстве" };
+    return { icon: "i-disk", cls: "mark disk", title: "есть на этом устройстве" };
   }
   if (lanIds.has(trackId)) {
-    return { text: "\u21C4", cls: "mark lan", title: "есть у кого-то в комнате" };
+    return { icon: "i-lan", cls: "mark lan", title: "есть у кого-то в комнате" };
   }
   return null;
+}
+
+function emptyRow(text) {
+  const item = document.createElement("li");
+  item.className = "empty";
+  item.textContent = text;
+  return item;
+}
+
+/// The playing row's equaliser.
+function equaliser() {
+  const eq = document.createElement("span");
+  eq.className = "eq";
+  eq.append(document.createElement("span"), document.createElement("span"), document.createElement("span"));
+  return eq;
 }
 
 /// Rows are real buttons: keyboard-reachable, and assistive tech (and UI
@@ -222,31 +370,47 @@ function origin(trackId) {
 /// own button: a button inside a button is not valid, and not clickable either.
 function trackItem(track, index, { current, onClick, trailing, extra }) {
   const item = document.createElement("li");
-  item.className = "pair";
+  if (current) item.className = "current";
 
   const entry = document.createElement("button");
   entry.type = "button";
-  entry.className = current ? "entry current" : "entry";
+  entry.className = "entry";
 
   const number = document.createElement("span");
   number.className = "num";
   number.textContent = String(index + 1);
 
+  const art = document.createElement("span");
+  art.className = "art";
+  fillCover(art, track, 100);
+  const overlay = document.createElement("span");
+  overlay.className = "overlay";
+  overlay.append(current ? equaliser() : icon("i-play"));
+  art.append(overlay);
+
+  const meta = document.createElement("span");
+  meta.className = "meta";
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = `${track.artist} — ${track.title}`;
+  name.textContent = track.title;
+  const by = document.createElement("span");
+  by.className = "by";
+  by.textContent = track.artist;
+  meta.append(name, by);
 
   const flag = origin(track.track_id);
   const mark = document.createElement("span");
   mark.className = flag ? flag.cls : "mark";
-  mark.textContent = flag ? flag.text : "";
-  if (flag) mark.title = flag.title;
+  if (flag) {
+    mark.append(icon(flag.icon));
+    mark.title = flag.title;
+  }
 
   const time = document.createElement("span");
   time.className = "time";
   time.textContent = trailing ?? fmt(track.duration_ms);
 
-  entry.append(number, name, mark, time);
+  entry.append(number, art, meta, mark, time);
   entry.addEventListener("click", onClick);
   item.append(entry, heartButton(track));
   if (extra) item.append(extra);
@@ -262,7 +426,7 @@ function heartButton(track) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = liked ? "heart on" : "heart";
-  button.textContent = liked ? "\u2665" : "\u2661";
+  button.append(icon(liked ? "i-heart" : "i-heart-outline"));
   button.title = liked ? "убрать из «Мне нравится»" : "в «Мне нравится»";
   button.addEventListener("click", async () => {
     button.disabled = true;
@@ -274,7 +438,13 @@ function heartButton(track) {
 }
 
 function renderQueue(snapshot) {
-  ui.queueCount.textContent = snapshot.queue.length ? `· ${snapshot.queue.length}` : "";
+  const count = snapshot.queue.length;
+  ui.queueCount.textContent = count ? `· ${tracksWord(count)}` : "";
+  ui.navQueue.textContent = count ? String(count) : "";
+  if (!count) {
+    ui.queue.replaceChildren(emptyRow("Очередь пуста — поставьте что-нибудь с главной"));
+    return;
+  }
   ui.queue.replaceChildren(
     ...snapshot.queue.map((track, index) =>
       trackItem(track, index, {
@@ -300,12 +470,17 @@ function renderResults() {
   );
 }
 
-/// The library panel, in whichever of its three views is on screen.
+/// The library page, in whichever of its three views is on screen.
 ///
 /// Two of them are this device's disk — flat, and grouped by album — and one is
 /// «Мне нравится» from the account. All three are drawn from lists already in
 /// memory, so switching tabs asks nothing of anybody.
 function renderLibrary() {
+  const head = TAB_HEADS[tab];
+  ui.libTitle.textContent = head.title;
+  ui.libArt.className = `playlist-art ${head.art}`;
+  setIcon(ui.libArt, head.icon);
+
   if (tab === "likes") {
     renderLikes();
   } else if (tab === "albums") {
@@ -315,11 +490,16 @@ function renderLibrary() {
   }
   updateLibraryButtons();
   updateLibraryHint();
+  updateTiles();
 }
 
 /// The flat list of downloads. Rows carry a delete of their own, because this is
 /// the one list where the tracks belong to this device rather than to the room.
 function renderDownloads() {
+  if (!library.length) {
+    ui.library.replaceChildren(emptyRow("Здесь пока пусто — скачивайте треки со страницы очереди"));
+    return;
+  }
   ui.library.replaceChildren(
     ...library.map((entry, index) =>
       trackItem(entry, index, {
@@ -335,6 +515,10 @@ function renderDownloads() {
 /// «Мне нравится» from the account, newest first. Marked rows are the ones that
 /// are also on this disk and so cost no internet.
 function renderLikes() {
+  if (!likes.length) {
+    ui.library.replaceChildren(emptyRow("Список пуст или ещё не загружен"));
+    return;
+  }
   ui.library.replaceChildren(
     ...likes.map((track, index) =>
       trackItem(track, index, {
@@ -358,7 +542,20 @@ function renderAlbums() {
     button.type = "button";
     button.className = "group-entry";
     button.title = "поставить альбом в очередь";
-    button.textContent = `${group.name} · ${group.tracks.length}`;
+
+    const art = document.createElement("span");
+    art.className = "art";
+    fillCover(art, group.tracks.find((entry) => entry.cover_uri) ?? null, 100);
+
+    const name = document.createElement("span");
+    name.className = "group-name";
+    name.textContent = group.name;
+
+    const count = document.createElement("span");
+    count.className = "group-count";
+    count.textContent = tracksWord(group.tracks.length);
+
+    button.append(art, name, count);
     button.addEventListener("click", () =>
       call("queue_tracks", { tracks: group.tracks, start: 0, replace: false }),
     );
@@ -380,7 +577,7 @@ function renderAlbums() {
       );
     });
   }
-  ui.library.replaceChildren(...nodes);
+  ui.library.replaceChildren(...(nodes.length ? nodes : [emptyRow("Здесь пока пусто")]));
 }
 
 /// Downloads by album: named albums first in alphabetical order, then everything
@@ -407,7 +604,7 @@ function dropButton(entry) {
   const drop = document.createElement("button");
   drop.type = "button";
   drop.className = "drop";
-  drop.textContent = "\u00D7";
+  drop.append(icon("i-close"));
   drop.title = "удалить с этого устройства";
   drop.addEventListener("click", async () => {
     await call("forget", { id: entry.track_id });
@@ -426,17 +623,19 @@ function visibleTracks() {
 function updateLibraryHint() {
   if (tab === "likes") {
     const marked = likes.filter((track) => cachedIds.has(track.track_id)).length;
+    ui.libCount.textContent = likes.length ? `${tracksWord(likes.length)} · ${marked} на этом устройстве` : "";
     ui.libHint.textContent = likes.length
-      ? `плейлист с Яндекса · ${likes.length} трек(ов), из них ${marked} на этом устройстве`
-      : "список пуст или ещё не загружен — нажмите ↻, когда будет интернет";
+      ? "плейлист с Яндекса — отмеченные значком играют без интернета"
+      : "нажмите ↻, когда будет интернет";
     return;
   }
 
   const total = library.reduce((sum, entry) => sum + entry.bytes, 0);
   const size = cacheLimit ? `${fmtSize(total)} из ${fmtSize(cacheLimit)}` : fmtSize(total);
+  ui.libCount.textContent = library.length ? `${tracksWord(library.length)} · ${size}` : "";
   const kept = autoCache ? "сохраняется всё, что играет" : "сохраняется только скачанное";
   if (!library.length) {
-    ui.libHint.textContent = `пусто — «↓ трек» и «↓ очередь» оставляют музыку здесь · ${cacheDir}`;
+    ui.libHint.textContent = `кнопки «Трек» и «Всю очередь» на странице очереди оставляют музыку здесь · ${cacheDir}`;
     return;
   }
   // Missing album names are the one thing this view cannot work around on its
@@ -446,7 +645,23 @@ function updateLibraryHint() {
     tab === "albums" && unnamed
       ? ` · у ${unnamed} трек(ов) название альбома ещё не загружено, нужен интернет`
       : "";
-  ui.libHint.textContent = `${size} · ${kept}${albums} · ${cacheDir}`;
+  ui.libHint.textContent = `${kept}${albums} · ${cacheDir}`;
+}
+
+/// The counts on the home page's two tiles.
+function updateTiles() {
+  ui.likesTileMeta.textContent = likes.length ? tracksWord(likes.length) : "пока пусто";
+  ui.offlineTileMeta.textContent = library.length
+    ? `${tracksWord(library.length)} · ${fmtSize(library.reduce((sum, entry) => sum + entry.bytes, 0))}`
+    : "пока пусто";
+}
+
+function selectTab(name) {
+  tab = name;
+  for (const node of ui.tabs.querySelectorAll(".tab")) {
+    node.classList.toggle("current", node.dataset.tab === name);
+  }
+  renderLibrary();
 }
 
 /** Re-reads what is on disk. Works with no connection and no internet. */
@@ -456,7 +671,6 @@ async function refreshLibrary() {
 
   library = tracks;
   cachedIds = new Set(tracks.map((entry) => entry.track_id));
-  ui.libCount.textContent = tracks.length ? `· ${tracks.length}` : "";
   renderLibrary();
 }
 
@@ -473,14 +687,29 @@ async function refreshLikes() {
   updateHeart();
 }
 
+/// The player bar's left end and the queue page's hero: both show the track.
+function renderNow(track) {
+  ui.title.textContent = track ? track.title : "—";
+  ui.artist.textContent = track ? track.artist : "";
+  ui.nowTitle.textContent = track ? track.title : "Тишина";
+  ui.nowArtist.textContent = track ? track.artist : "поставьте что-нибудь в очередь";
+
+  const key = track ? `${track.track_id}|${track.cover_uri ?? ""}` : "";
+  if (key === coverKey) return;
+  coverKey = key;
+  fillCover(ui.cover, track, 100);
+  fillCover(ui.nowCover, track, 400);
+  const backdrop = coverUrl(track, 200);
+  ui.nowBackdrop.style.backgroundImage = backdrop ? `url("${backdrop}")` : "";
+}
+
 function render(snapshot) {
   latest = snapshot;
   // Recomputed before anything is drawn: both lists mark their rows with it.
   cachedIds = new Set(snapshot.cached || []);
   lanIds = new Set(snapshot.on_lan || []);
 
-  const track = snapshot.track;
-  ui.title.textContent = track ? `${track.artist} — ${track.title}` : "—";
+  renderNow(snapshot.track);
   updateHeart();
 
   const place = snapshot.queue.length ? `${snapshot.index + 1} из ${snapshot.queue.length}` : "";
@@ -493,13 +722,15 @@ function render(snapshot) {
   ui.subtitle.textContent = [place, note, fetching].filter(Boolean).join(" · ");
   ui.dlCancel.classList.toggle("hidden", snapshot.download_queue === 0);
 
-  ui.toggle.textContent = snapshot.playing ? "\u23F8" : "\u25B6";
-  ui.position.textContent = fmt(snapshot.position_ms);
+  document.body.classList.toggle("playing", Boolean(snapshot.playing));
+  setIcon(ui.toggle, snapshot.playing ? "i-pause" : "i-play");
+  ui.position.textContent = snapshot.loading ? "…" : fmt(snapshot.position_ms);
   ui.duration.textContent = fmt(snapshot.duration_ms);
   if (!dragging) {
     ui.seek.value = snapshot.duration_ms
       ? Math.round((snapshot.position_ms / snapshot.duration_ms) * 1000)
       : 0;
+    paintRange(ui.seek);
   }
 
   const rtt = snapshot.rtt_ms === null ? "?" : snapshot.rtt_ms;
@@ -508,6 +739,12 @@ function render(snapshot) {
   ui.status.textContent =
     `участников ${snapshot.peers} · rtt ${rtt} мс · смещение ${offset} мс${sharing}`;
   ui.status.className = `status ${snapshot.connected ? "live" : "broken"}`;
+
+  ui.sideDot.className = `dot ${snapshot.connected ? "live" : "broken"}`;
+  ui.sideRoomName.textContent = roomName || "комната";
+  ui.sideRoomMeta.textContent = snapshot.connected
+    ? `участников ${snapshot.peers}${snapshot.hosting ? " · здесь" : ""}`
+    : "связь потеряна";
 
   // The address others must type in, and the reason this app has no `relay` of
   // its own to show while hosting.
@@ -522,7 +759,7 @@ function render(snapshot) {
   // say which of the two we are looking at.
   if (snapshot.station) {
     ui.wave.classList.remove("hidden");
-    ui.wave.textContent = snapshot.feeding ? "Волна · выключить" : "Волна (ведёт другой)";
+    ui.wave.textContent = snapshot.feeding ? "Волна играет · выключить" : "Волну ведёт другое устройство";
     ui.wave.disabled = !snapshot.feeding;
   } else {
     ui.wave.classList.add("hidden");
@@ -535,6 +772,7 @@ function render(snapshot) {
     const magnitude = Math.abs(drift);
     ui.drift.className = `drift ${magnitude < 100 ? "good" : magnitude < 300 ? "warn" : "bad"}`;
     ui.drift.textContent = `рассинхрон ${drift > 0 ? "+" : ""}${drift} мс`;
+    ui.drift.title = "насколько это устройство отстаёт от комнаты или опережает её";
   }
 
   // Rebuilding 85 list items four times a second would fight the scrollbar. The
@@ -553,7 +791,7 @@ function render(snapshot) {
     renderResults();
   }
 
-  // A download that finished changed the disk, so the library panel is stale.
+  // A download that finished changed the disk, so the library page is stale.
   if (snapshot.cache_revision !== libraryRevision) {
     libraryRevision = snapshot.cache_revision;
     refreshLibrary();
@@ -584,8 +822,10 @@ async function enter(button, host) {
 
   button.textContent = label;
   if (snapshot) {
+    roomName = ui.room.value;
     setConnected(true);
     render(snapshot);
+    showView("home");
   } else {
     setConnected(false);
   }
@@ -594,7 +834,7 @@ async function enter(button, host) {
 ui.connect.addEventListener("click", () => enter(ui.connect, false));
 ui.host.addEventListener("click", () => enter(ui.host, true));
 
-/// Stores the Yandex token. The line disappears once there is one.
+/// Stores the Yandex token. The card disappears once there is one.
 ///
 /// A refusal from Yandex leaves the field as typed — the token is probably a
 /// mistyped paste, and clearing it would mean starting over.
@@ -634,12 +874,9 @@ ui.disconnect.addEventListener("click", async () => {
 // anything is configured, which is the point — the answer is what to configure.
 ui.findRooms.addEventListener("click", async () => {
   ui.findRooms.disabled = true;
-  const label = ui.findRooms.textContent;
-  ui.findRooms.textContent = "Ищу…";
 
   const found = await call("find_rooms", { wait: 700 });
 
-  ui.findRooms.textContent = label;
   ui.findRooms.disabled = false;
   if (!found) return;
 
@@ -676,36 +913,39 @@ ui.findRooms.addEventListener("click", async () => {
   toast(`нашлось: ${found.length}`);
 });
 
-ui.kind.addEventListener("change", () => {
-  const kind = ui.kind.value;
-  // A station or «Мне нравится» needs no argument, so the field would only
-  // invite one that is ignored.
-  ui.source.hidden = SELF_CONTAINED.has(kind);
+ui.kind.addEventListener("click", (event) => {
+  const button = event.target.closest(".seg");
+  if (!button) return;
+  kind = button.dataset.kind;
+  for (const node of ui.kind.querySelectorAll(".seg")) {
+    node.classList.toggle("current", node === button);
+  }
   ui.source.placeholder = PLACEHOLDERS[kind] ?? "";
+  ui.source.focus();
 });
 
-/** Loads whatever the source row names. `replace` starts it instead of queueing. */
-async function loadSource(button, replace) {
-  const kind = ui.kind.value;
-  const value = ui.source.value.trim();
-  if (!value && !SELF_CONTAINED.has(kind)) return;
+/** Loads a source into the room. `replace` starts it instead of queueing. */
+async function loadSource(button, source, value, replace) {
+  if (!value && !SELF_CONTAINED.has(source)) return;
 
   button.disabled = true;
-  const length = await call("play_source", { kind, value, replace });
+  const length = await call("play_source", { kind: source, value, replace });
   button.disabled = false;
 
   if (typeof length !== "number") return;
-  if (kind === "wave") {
+  if (source === "wave") {
     toast(replace ? "волна включена" : "волна продолжит очередь");
   } else if (replace) {
-    toast(`играю: ${length} трек(ов)`);
+    toast(`играю: ${tracksWord(length)}`);
   } else {
-    toast(`добавлено в очередь: ${length}`);
+    toast(`добавлено в очередь: ${tracksWord(length)}`);
   }
 }
 
-ui.load.addEventListener("click", () => loadSource(ui.load, false));
-ui.play.addEventListener("click", () => loadSource(ui.play, true));
+ui.load.addEventListener("click", () => loadSource(ui.load, kind, ui.source.value.trim(), false));
+ui.play.addEventListener("click", () => loadSource(ui.play, kind, ui.source.value.trim(), true));
+ui.wavePlay.addEventListener("click", () => loadSource(ui.wavePlay, "wave", "", true));
+ui.likesTile.addEventListener("click", () => loadSource(ui.likesTile, "likes", "", true));
 ui.wave.addEventListener("click", () => call("control", { action: "stop_wave" }));
 
 ui.find.addEventListener("click", async () => {
@@ -772,20 +1012,15 @@ ui.libRefresh.addEventListener("click", async () => {
   ui.libRefresh.disabled = false;
   if (typeof count === "number") {
     await refreshLikes();
-    toast(`«Мне нравится»: ${count} трек(ов)`);
+    toast(`«Мне нравится»: ${tracksWord(count)}`);
   }
 });
 
-// Three views of the same panel. Nothing is fetched on a switch: all three lists
+// Three views of the same page. Nothing is fetched on a switch: all three lists
 // are already in memory.
 ui.tabs.addEventListener("click", (event) => {
   const button = event.target.closest(".tab");
-  if (!button) return;
-  tab = button.dataset.tab;
-  for (const node of ui.tabs.querySelectorAll(".tab")) {
-    node.classList.toggle("current", node === button);
-  }
-  renderLibrary();
+  if (button) selectTab(button.dataset.tab);
 });
 
 ui.heart.addEventListener("click", async () => {
@@ -803,6 +1038,7 @@ ui.heart.addEventListener("click", async () => {
 ui.seek.addEventListener("pointerdown", () => {
   dragging = true;
 });
+ui.seek.addEventListener("input", () => paintRange(ui.seek));
 ui.seek.addEventListener("change", async () => {
   const duration = latest?.duration_ms ?? 0;
   if (duration > 0) {
@@ -812,6 +1048,7 @@ ui.seek.addEventListener("change", async () => {
 });
 
 ui.volume.addEventListener("input", () => {
+  paintRange(ui.volume);
   // The slider fires continuously; only the settled value is worth sending.
   clearTimeout(volumeTimer);
   volumeTimer = setTimeout(
@@ -829,6 +1066,7 @@ listen("closed", () => {
   if (connected) {
     toast("соединение с релеем закрыто");
     setConnected(false);
+    showView("room");
   }
 }).catch(() => {});
 // Settings that could not be written back: the fields would look remembered and
@@ -836,13 +1074,17 @@ listen("closed", () => {
 listen("notice", (event) => toast(String(event.payload))).catch(() => {});
 
 (async function start() {
-  ui.source.placeholder = PLACEHOLDERS[ui.kind.value];
+  ui.source.placeholder = PLACEHOLDERS[kind];
   setConnected(false);
+  // Nothing plays until the window is in a room, so that is where it opens.
+  showView("room");
+  paintRange(ui.volume);
 
   const settings = await call("settings");
   if (!settings) return;
 
   ui.volume.value = Math.round(settings.volume * 100);
+  paintRange(ui.volume);
   // The file supplies the defaults; both buttons then act on what is on screen,
   // and whatever connects is written back.
   ui.room.value = settings.room;
@@ -857,8 +1099,8 @@ listen("notice", (event) => toast(String(event.payload))).catch(() => {});
   cacheLimit = settings.cache_limit_bytes;
   autoCache = settings.auto_cache;
   await refreshLibrary();
-  // Both lists come off the disk, so the panel is populated — hearts and all —
-  // before anything is connected and even with no internet at all.
+  // Both lists come off the disk, so the collection is populated — hearts and
+  // all — before anything is connected and even with no internet at all.
   await refreshLikes();
 
   // The Yandex token is the one thing a fresh install has nowhere to come from,
@@ -866,6 +1108,6 @@ listen("notice", (event) => toast(String(event.payload))).catch(() => {});
   // afterwards: the file is the place to change a token that already works.
   ui.tokenLine.classList.toggle("hidden", settings.has_yandex_token);
   if (!settings.has_yandex_token) {
-    toast(`Впишите токен Яндекса в поле сверху — или в ${settings.config_path}`);
+    toast(`Впишите токен Яндекса на странице «Комната» — или в ${settings.config_path}`);
   }
 })();

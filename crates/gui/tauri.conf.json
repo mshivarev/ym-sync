@@ -11,15 +11,15 @@
     "windows": [
       {
         "title": "ym-sync",
-        "width": 1000,
-        "height": 720,
+        "width": 1200,
+        "height": 800,
         "minWidth": 760,
         "minHeight": 540,
         "resizable": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' https://avatars.yandex.net"
     }
   },
   "bundle": {

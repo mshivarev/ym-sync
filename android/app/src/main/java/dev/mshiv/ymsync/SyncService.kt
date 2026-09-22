@@ -172,15 +172,20 @@ class SyncService : Service() {
 
         if (track != null && metadataFor != track.trackId) {
             metadataFor = track.trackId
-            session.setMetadata(
-                MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, track.title)
-                    .putString(MediaMetadata.METADATA_KEY_ARTIST, track.artist)
-                    .putString(MediaMetadata.METADATA_KEY_ALBUM, track.album ?: "")
-                    // Without a duration the system draws no seek bar at all.
-                    .putLong(MediaMetadata.METADATA_KEY_DURATION, track.durationMs)
-                    .build(),
-            )
+            val url = track.coverUrl(COVER_PX)
+            val known = Covers.peek(url)
+            session.setMetadata(metadata(track, known?.bitmap))
+            // The cover is fetched after the text, so a slow or absent network
+            // never holds up the title in the shade. It is written only if the
+            // track is still the same one by the time it arrives.
+            if (url != null && known == null) {
+                scope.launch {
+                    val cover = Covers.load(url) ?: return@launch
+                    if (metadataFor == track.trackId) {
+                        this@SyncService.session?.setMetadata(metadata(track, cover.bitmap))
+                    }
+                }
+            }
         }
 
         val state = when {
@@ -413,8 +418,20 @@ class SyncService : Service() {
     /// would restart the seek bar four times a second.
     private var metadataFor: String? = null
 
+    private fun metadata(track: TrackInfo, art: android.graphics.Bitmap?): MediaMetadata =
+        MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, track.title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, track.artist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, track.album ?: "")
+            // Without a duration the system draws no seek bar at all.
+            .putLong(MediaMetadata.METADATA_KEY_DURATION, track.durationMs)
+            .apply { art?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
+            .build()
+
     companion object {
         private const val POLL_INTERVAL_MS = 200L
+        /** The lock screen draws the cover large, so ask for more than a row does. */
+        private const val COVER_PX = 400
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "playback"
         /// A listening session that has run this long without being stopped is a

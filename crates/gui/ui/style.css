@@ -1,14 +1,20 @@
 :root {
-  --bg: #101218;
-  --panel: #171a22;
-  --panel-2: #1d212b;
-  --line: #272c38;
-  --text: #e7e9ee;
-  --dim: #8b93a7;
-  --accent: #ffc72c;
+  --bg: #0b0b0d;
+  --side: #000000;
+  --surface: #141417;
+  --surface-2: #1c1c21;
+  --surface-3: #26262d;
+  --line: #2a2a31;
+  --text: #f2f2f4;
+  --dim: #8e8e99;
+  --faint: #5d5d66;
+  --accent: #ffd52e;
+  --accent-ink: #1a1500;
   --good: #4ec97a;
   --warn: #ffc72c;
-  --bad: #ff6b6b;
+  --bad: #ff5a5f;
+  --radius: 14px;
+  --player-h: 88px;
 }
 
 * {
@@ -23,97 +29,1171 @@ body {
 
 body {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) var(--player-h);
+  grid-template-areas:
+    "side main"
+    "player player";
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* ---------- header ---------- */
-
-header {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
+.sprite {
+  display: none;
 }
 
-.top {
-  display: flex;
-  align-items: center;
-  gap: 16px;
+.i {
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+  flex: none;
 }
 
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--accent);
+.hidden {
+  display: none !important;
 }
 
-/* Getting into a room: the shared fields, then a line per way in. Two buttons
-   rather than a switch, because holding the room and joining one are two
-   different acts, not two states of the same one. */
-.setup {
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+/* ---------- controls ---------- */
+
+button,
+select,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 0;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.field {
+  width: 100%;
+  min-width: 10ch;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--text);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.field:hover {
+  background: var(--surface-3);
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+.field::placeholder {
+  color: var(--faint);
+}
+
+.field-label {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  font-size: 12px;
+  color: var(--dim);
 }
 
-.setup .line {
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.btn .i {
+  width: 18px;
+  height: 18px;
+}
+
+.btn:hover:not(:disabled) {
+  background: #33333b;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: #ffe066;
+}
+
+.btn.ghost {
+  background: rgb(255 255 255 / 8%);
+}
+
+.btn.ghost:hover:not(:disabled) {
+  background: rgb(255 255 255 / 14%);
+}
+
+.btn.danger {
+  background: rgb(255 90 95 / 14%);
+  color: #ff8a8e;
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: rgb(255 90 95 / 24%);
+}
+
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: var(--text);
+  transition: background 0.15s, color 0.15s;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: rgb(255 255 255 / 8%);
+}
+
+.icon-btn .i {
+  width: 24px;
+  height: 24px;
+}
+
+.pill {
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.chip-btn {
+  margin-top: 14px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 35%);
+  backdrop-filter: blur(8px);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.chip-btn:hover:not(:disabled) {
+  background: rgb(0 0 0 / 55%);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.row .field {
+  flex: 1;
+  width: auto;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  --fill: 0%;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--text) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+}
+
+input[type="range"]:hover::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--accent) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--text);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+input[type="range"]:hover::-webkit-slider-thumb,
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+input[type="range"]:disabled::-webkit-slider-thumb {
+  opacity: 0;
+}
+
+.hint,
+.dim {
+  color: var(--dim);
+}
+
+.hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  /* A cache path has no spaces to break at. */
+  overflow-wrap: anywhere;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgb(255 255 255 / 65%);
+}
+
+.card {
+  padding: 20px;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.card>.row,
+.card>.segmented,
+.card>.field-label,
+.card>select {
+  margin-top: 12px;
+}
+
+.card>h2+.segmented,
+.card>h2+.field-label,
+.card>h2+.row,
+.card>h2+.grid2 {
+  margin-top: 0;
+}
+
+/* ---------- sidebar ---------- */
+
+.side {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 22px 14px 16px;
+  background: var(--side);
+  min-height: 0;
+}
+
+.logo {
   display: flex;
   align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+}
+
+.logo-mark {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: conic-gradient(from 200deg, #ffd52e, #ff7a2e, #ff3d6e, #ffd52e);
+  color: #000;
+}
+
+.logo-mark .i {
+  width: 18px;
+  height: 18px;
+}
+
+.logo-text {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--accent);
+}
+
+.logo-text span {
+  color: var(--text);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--dim);
+  font-weight: 600;
+  text-align: left;
+  transition: color 0.15s, background 0.15s;
+}
+
+.nav-item:hover {
+  color: var(--text);
+  background: rgb(255 255 255 / 5%);
+}
+
+.nav-item.current {
+  color: var(--text);
+  background: rgb(255 255 255 / 8%);
+}
+
+.nav-item.current .i {
+  color: var(--accent);
+}
+
+.nav-badge {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.side-room {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface);
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.side-room:hover {
+  background: var(--surface-2);
+}
+
+.dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.dot.live {
+  background: var(--good);
+  box-shadow: 0 0 0 4px rgb(78 201 122 / 18%);
+}
+
+.dot.broken {
+  background: var(--bad);
+  box-shadow: 0 0 0 4px rgb(255 90 95 / 18%);
+}
+
+.side-room-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.side-room-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-room-meta {
+  font-size: 12px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- main ---------- */
+
+.main {
+  grid-area: main;
+  min-height: 0;
+  overflow-y: auto;
+  background: linear-gradient(180deg, #16161a 0, var(--bg) 320px);
+  border-radius: 16px 0 0 0;
+}
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 24px 32px 32px;
+}
+
+.searchbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px 6px 16px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid transparent;
+  transition: border-color 0.15s;
+}
+
+.searchbar:focus-within {
+  border-color: var(--accent);
+}
+
+.searchbar .i {
+  color: var(--dim);
+}
+
+.searchbar input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  font-size: 15px;
+}
+
+.searchbar input:focus {
+  outline: none;
+}
+
+.searchbar input::placeholder {
+  color: var(--faint);
+}
+
+/* «Моя волна»: a slow, blurred blob, as in the Yandex app. Purely decorative —
+   the animation stops when the window does not want motion. */
+.hero {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 280px;
+  border-radius: 20px;
+  overflow: hidden;
+  background: #09090b;
+  isolation: isolate;
+}
+
+.blob {
+  position: absolute;
+  width: 360px;
+  height: 360px;
+  border-radius: 50%;
+  filter: blur(60px);
+  opacity: 0.8;
+  z-index: -1;
+  animation: drift 16s ease-in-out infinite alternate;
+}
+
+.b1 {
+  background: #ff3d6e;
+  left: 18%;
+  top: -30%;
+}
+
+.b2 {
+  background: #ffb800;
+  right: 16%;
+  top: 10%;
+  animation-delay: -5s;
+}
+
+.b3 {
+  background: #8a3dff;
+  left: 38%;
+  bottom: -45%;
+  animation-delay: -10s;
+}
+
+body.playing .blob {
+  animation-duration: 7s;
+}
+
+@keyframes drift {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+
+  50% {
+    transform: translate(60px, 30px) scale(1.15);
+  }
+
+  100% {
+    transform: translate(-40px, -20px) scale(0.9);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blob {
+    animation: none;
+  }
+}
+
+.hero-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px;
+  text-align: center;
+}
+
+.hero-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 42px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: #fff;
+  text-shadow: 0 2px 24px rgb(0 0 0 / 35%);
+  transition: transform 0.15s;
+}
+
+.hero-title .i {
+  width: 40px;
+  height: 40px;
+}
+
+.hero-title:hover:not(:disabled) {
+  transform: scale(1.03);
+}
+
+.hero-sub {
+  margin: 8px 0 0;
+  max-width: 44ch;
+  color: rgb(255 255 255 / 75%);
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.tile {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.tile:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.tile-art {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+  color: #fff;
+}
+
+.tile-art .i {
+  width: 30px;
+  height: 30px;
+}
+
+.tile-art.likes {
+  background: linear-gradient(135deg, #ff5a6e, #b3122f);
+}
+
+.tile-art.offline {
+  background: linear-gradient(135deg, #3a7bff, #2439a8);
+}
+
+.tile-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tile-title {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.tile-title .chev {
+  width: 20px;
+  height: 20px;
+  color: var(--dim);
+}
+
+.tile-meta {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.segmented {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-.setup label {
-  font-size: 12px;
+.seg {
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: var(--surface-2);
   color: var(--dim);
-  white-space: nowrap;
+  font-weight: 600;
+  font-size: 13px;
+  transition: background 0.15s, color 0.15s;
 }
 
-.setup input {
-  flex: 1;
-  min-width: 10ch;
+.seg:hover:not(:disabled) {
+  color: var(--text);
 }
 
-/* Both buttons keep the same width, so the two lines read as a pair of choices
-   rather than as a form with one odd row. */
-.setup #connect,
-.setup #host {
-  min-width: 14ch;
-  white-space: nowrap;
+.seg.current {
+  background: var(--text);
+  color: #000;
 }
 
-.hint.inline {
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: -8px;
+}
+
+.section-head h2 {
   margin: 0;
+}
+
+/* ---------- track rows ---------- */
+
+.tracks {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tracks li {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 10px;
+  transition: background 0.12s;
+}
+
+.tracks li:hover {
+  background: rgb(255 255 255 / 6%);
+}
+
+.tracks li.current {
+  background: rgb(255 213 46 / 8%);
+}
+
+.entry {
+  display: flex;
   flex: 1;
+  align-items: center;
+  gap: 14px;
   min-width: 0;
+  padding: 6px 8px;
+  border-radius: 10px;
+  text-align: left;
+}
+
+.entry .num {
+  width: 2.2em;
+  text-align: center;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.art {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-3);
+  color: rgb(255 255 255 / 70%);
+}
+
+.art img,
+.cover img,
+.now-cover img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.art .i {
+  width: 20px;
+  height: 20px;
+}
+
+/* A hover over a row puts a play glyph over its cover, as music apps do. */
+.art .overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 55%);
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.tracks li:hover .art .overlay {
+  opacity: 1;
+}
+
+.tracks li.current .art .overlay {
+  opacity: 1;
+}
+
+.meta {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.meta .name,
+.meta .by {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Wide enough for «комната · ws://192.168.1.10:8787», capped so it cannot push
-   the buttons off the line. */
-.rooms {
-  max-width: 30ch;
-  font-size: 12px;
+.meta .name {
+  font-weight: 600;
+}
+
+.meta .by {
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.tracks li.current .name {
+  color: var(--accent);
+}
+
+.tracks li.skipped .name {
+  color: var(--dim);
+  text-decoration: line-through;
+}
+
+.entry .time {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  flex: none;
+}
+
+/* Where a track will come from: on this disk, or from somebody else on the local
+   network. Either way it costs no internet, which is the point of showing it. */
+.mark {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  flex: none;
+}
+
+.mark .i {
+  width: 16px;
+  height: 16px;
+}
+
+.mark.disk {
+  color: var(--good);
+}
+
+.mark.lan {
+  color: var(--accent);
+}
+
+/* The playing row's equaliser, standing in for its cover's play glyph. */
+.eq {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+
+.eq span {
+  width: 3px;
+  background: var(--accent);
+  border-radius: 1px;
+  animation: eq 0.9s ease-in-out infinite alternate;
+}
+
+.eq span:nth-child(2) {
+  animation-delay: -0.3s;
+}
+
+.eq span:nth-child(3) {
+  animation-delay: -0.6s;
+}
+
+body:not(.playing) .eq span {
+  animation-play-state: paused;
+}
+
+@keyframes eq {
+  from {
+    height: 3px;
+  }
+
+  to {
+    height: 16px;
+  }
+}
+
+/* «Мне нравится» is per account, not per room: pressing this changes what Yandex
+   holds for this token and nothing at all for the other listeners. */
+.heart,
+.drop {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  color: var(--dim);
+  flex: none;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
+}
+
+.tracks .heart:not(.on),
+.tracks .drop {
+  opacity: 0;
+}
+
+.tracks li:hover .heart,
+.tracks li:hover .drop,
+.tracks .heart:focus-visible,
+.tracks .drop:focus-visible {
+  opacity: 1;
+}
+
+.heart .i,
+.drop .i {
+  width: 20px;
+  height: 20px;
+}
+
+.heart.on {
+  color: var(--bad);
+}
+
+.heart:hover:not(:disabled) {
+  color: var(--bad);
+  background: rgb(255 255 255 / 6%);
+}
+
+.drop:hover:not(:disabled) {
+  color: var(--bad);
+  background: rgb(255 255 255 / 6%);
+}
+
+.drop .i {
+  width: 18px;
+  height: 18px;
+}
+
+/* The album header in the grouped view: pressing it queues the whole album. */
+.tracks li.group {
+  margin-top: 14px;
+  padding: 4px 8px;
+}
+
+.tracks li.group:hover {
+  background: none;
+}
+
+.group-entry {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  text-align: left;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.group-entry .group-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-entry .group-count {
+  color: var(--dim);
+  font-weight: 500;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.group-entry:hover:not(:disabled) .group-name {
+  color: var(--accent);
+}
+
+.tracks li.group .time {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.empty {
+  padding: 28px 0;
+  text-align: center;
+  color: var(--dim);
+}
+
+/* ---------- now playing ---------- */
+
+.now-hero {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 28px;
+  padding: 28px;
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--surface);
+  isolation: isolate;
+}
+
+.now-backdrop {
+  position: absolute;
+  inset: -40px;
+  z-index: -1;
+  background-size: cover;
+  background-position: center;
+  filter: blur(48px) saturate(1.4) brightness(0.55);
+  transform: scale(1.1);
+  transition: background-image 0.4s;
+}
+
+.now-cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 220px;
+  height: 220px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--surface-3);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 50%);
+  color: rgb(255 255 255 / 70%);
+}
+
+.now-cover .i {
+  width: 72px;
+  height: 72px;
+}
+
+.now-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.now-title {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.now-artist {
+  font-size: 18px;
+  color: rgb(255 255 255 / 80%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.now-meta {
+  min-height: 1.45em;
+  font-size: 13px;
+  color: rgb(255 255 255 / 60%);
+  font-variant-numeric: tabular-nums;
+}
+
+.now-info .row {
+  margin-top: 10px;
+}
+
+/* ---------- collection ---------- */
+
+.playlist-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 28px;
+}
+
+.playlist-art {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 180px;
+  height: 180px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #3a7bff, #2439a8);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 45%);
+  color: #fff;
+}
+
+.playlist-art.likes {
+  background: linear-gradient(135deg, #ff5a6e, #b3122f);
+}
+
+.playlist-art.albums {
+  background: linear-gradient(135deg, #ffb800, #d9480f);
+}
+
+.playlist-art .i {
+  width: 72px;
+  height: 72px;
+}
+
+.playlist-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.playlist-title {
+  font-size: 44px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.playlist-info .row {
+  margin-top: 12px;
+}
+
+.round-play {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  box-shadow: 0 8px 24px rgb(255 213 46 / 25%);
+  transition: transform 0.12s, background 0.15s;
+}
+
+.round-play .i {
+  width: 28px;
+  height: 28px;
+}
+
+.round-play:hover:not(:disabled) {
+  transform: scale(1.06);
+  background: #ffe066;
+}
+
+/* ---------- room ---------- */
+
+.room-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.setup {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .status {
-  margin-left: auto;
-  /* Shrinks first when the header runs out of room: the connect controls and the
-     hosting address matter more than the tail of a URL. */
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  margin-top: 6px;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
-  text-align: right;
 }
 
 .status.live {
@@ -127,327 +1207,57 @@ header {
 /* A fact about this machine rather than about the room: it is running the relay
    the others connect to. */
 .chip {
+  display: inline-block;
+  margin-top: 8px;
   font-size: 12px;
-  padding: 3px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid #6b5a20;
+  background: rgb(255 213 46 / 12%);
   color: var(--accent);
   white-space: nowrap;
 }
 
-/* ---------- controls ---------- */
-
-button,
-select,
-input[type="text"],
-input[type="password"],
-input:not([type]) {
-  font: inherit;
-  color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 6px 10px;
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover:not(:disabled) {
-  border-color: #3a4152;
-}
-
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #1a1c22;
-  font-weight: 600;
-}
-
-button:disabled,
-input:disabled,
-select:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
-input[type="range"] {
-  accent-color: var(--accent);
-  width: 100%;
-}
-
-/* ---------- main ---------- */
-
-main {
-  display: grid;
-  /* The first panel carries the source controls, so it needs the widest column;
-     the library panel is second-widest because its rows carry the most: a name,
-     a size, a heart and a delete. */
-  grid-template-columns: 1.5fr 1fr 1.3fr;
-  gap: 12px;
-  padding: 12px 16px;
-  min-height: 0;
-}
-
-.panel {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  /* Without this a grid column is at least as wide as its widest row, and the
-     source controls in the first panel would squeeze the other two. */
-  min-width: 0;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 12px;
-}
-
-h2 {
-  margin: 0 0 10px;
-  font-size: 13px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--dim);
-}
-
-.row {
-  display: flex;
-  /* Wrapping is the safety valve for a narrow window: buttons drop to the next
-     line instead of squeezing the field they belong to. */
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.row input {
-  flex: 1;
-  /* A text field narrower than this is not a text field any more. */
-  min-width: 10ch;
-}
-
-/* A label that wraps inside its own button reads as two broken words. */
-.row button {
-  white-space: nowrap;
-}
-
-.hint,
-.dim {
-  color: var(--dim);
-}
-
-.hint {
-  margin: 8px 0 0;
-  font-size: 12px;
-  /* A cache path has no spaces to break at, and would otherwise run out of the
-     panel. */
-  overflow-wrap: anywhere;
-}
-
-.list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.list li {
-  padding: 0;
-}
-
-.list .entry {
-  display: flex;
-  /* Tight, because a row can carry five things: number, name, origin mark,
-     time and — outside the button — a heart and a delete. */
-  gap: 6px;
-  align-items: baseline;
-  width: 100%;
-  padding: 6px 4px;
-  border: 0;
-  border-radius: 6px;
-  background: none;
-  text-align: left;
-  cursor: pointer;
-}
-
-.list .entry:hover {
-  background: var(--panel-2);
-}
-
-.list .entry:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.list .entry.current {
-  background: var(--panel-2);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-
-.list .num {
-  min-width: 2.2em;
-  text-align: right;
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-}
-
-.list .name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.list .time {
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-}
-
-.list li.skipped .name {
-  color: var(--dim);
-  text-decoration: line-through;
-}
-
-/* Where a track will come from: on this disk, or from somebody else on the local
-   network. Either way it costs no internet, which is the point of showing it. */
-.list .mark {
-  font-size: 11px;
-  color: var(--dim);
-  min-width: 1.2em;
-  text-align: center;
-}
-
-.list .mark.disk {
-  color: var(--good);
-}
-
-.list .mark.lan {
-  color: var(--accent);
-}
-
-/* Three views of the library panel: the downloads, what this account has
-   hearted, and the downloads grouped by album. */
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-
-.tab {
-  padding: 3px 8px;
-  font-size: 11px;
-  border-radius: 999px;
-  white-space: nowrap;
-  color: var(--dim);
-}
-
-.tab.current {
-  color: var(--text);
-  border-color: #6b5a20;
-  background: #241f13;
-}
-
-/* A library row carries its own delete button, so the row is not one big
-   button the way queue and search rows are. */
-.list li.pair {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.list li.pair .entry {
-  flex: 1;
-  min-width: 0;
-}
-
-/* The album header in the grouped view: pressing it queues the whole album. */
-.list li.group {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-top: 6px;
-}
-
-.group-entry {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: left;
-  padding: 4px 8px;
-  border: 0;
-  background: none;
-  color: var(--accent);
-  font-weight: 600;
+.rooms {
   font-size: 13px;
 }
 
-.group-entry:hover:not(:disabled) {
-  background: var(--panel-2);
-  border-radius: 6px;
-}
+/* ---------- player ---------- */
 
-/* «Мне нравится» is per account, not per room: pressing this changes what Yandex
-   holds for this token and nothing at all for the other listeners. */
-.heart {
-  padding: 2px 4px;
-  border: 0;
-  border-radius: 6px;
-  background: none;
-  color: var(--dim);
-  line-height: 1;
-}
-
-.heart.on {
-  color: var(--bad);
-}
-
-.heart:hover:not(:disabled) {
-  background: var(--panel-2);
-  color: var(--bad);
-}
-
-.drop {
-  padding: 2px 4px;
-  border: 0;
-  border-radius: 6px;
-  background: none;
-  color: var(--dim);
-}
-
-.drop:hover:not(:disabled) {
-  color: var(--bad);
-  background: var(--panel-2);
-}
-
-/* ---------- footer ---------- */
-
-footer {
+.player {
+  grid-area: player;
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) auto minmax(200px, 2fr) minmax(180px, 1fr);
-  gap: 16px;
+  grid-template-columns: minmax(200px, 1fr) minmax(320px, 1.6fr) minmax(200px, 1fr);
   align-items: center;
-  padding: 12px 16px;
+  gap: 24px;
+  padding: 0 20px;
+  background: #121215;
   border-top: 1px solid var(--line);
-  background: var(--panel);
 }
 
 .now {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   min-width: 0;
 }
 
-/* The heart sits with the title, not with the transport: it acts on the track,
-   while the transport acts on the room. */
-.title-line {
+.cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-3);
+  color: rgb(255 255 255 / 70%);
+  cursor: pointer;
+}
+
+.now-text {
   display: flex;
-  align-items: center;
-  gap: 4px;
+  flex-direction: column;
   min-width: 0;
 }
 
@@ -458,65 +1268,98 @@ footer {
   white-space: nowrap;
 }
 
-.now .dim {
-  font-size: 12px;
+.artist {
+  font-size: 13px;
+  color: var(--dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
 .transport {
   display: flex;
-  gap: 6px;
+  align-items: center;
+  gap: 14px;
 }
 
-.transport button {
-  min-width: 40px;
+.play {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--text);
+  color: #000;
+  transition: transform 0.12s, background 0.15s;
 }
 
-.times {
+.play .i {
+  width: 22px;
+  height: 22px;
+}
+
+.play:hover:not(:disabled) {
+  transform: scale(1.07);
+  background: #fff;
+}
+
+.progress {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.time {
   font-size: 12px;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
+  min-width: 3ch;
 }
 
 .meters {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  min-width: 0;
 }
 
 .volume {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  width: 140px;
+  color: var(--dim);
 }
 
 .drift {
   font-variant-numeric: tabular-nums;
   font-size: 12px;
-  padding: 3px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  text-align: center;
+  background: var(--surface-2);
+  white-space: nowrap;
 }
 
 .drift.good {
   color: var(--good);
-  border-color: #2c5c3e;
 }
 
 .drift.warn {
   color: var(--warn);
-  border-color: #6b5a20;
 }
 
 .drift.bad {
   color: var(--bad);
-  border-color: #6b2c2c;
 }
 
 /* ---------- toast ---------- */
@@ -524,17 +1367,63 @@ footer {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 96px;
+  bottom: calc(var(--player-h) + 16px);
   transform: translateX(-50%);
   max-width: 70%;
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: #2a1d1d;
-  border: 1px solid #6b2c2c;
-  color: #ffd9d9;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  padding: 12px 18px;
+  border-radius: 12px;
+  background: #2b2b33;
+  color: var(--text);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 55%);
+  z-index: 10;
 }
 
-.hidden {
-  display: none;
+/* ---------- narrow windows ---------- */
+
+@media (max-width: 900px) {
+  body {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  .logo-text,
+  .nav-item span,
+  .side-room-text {
+    display: none;
+  }
+
+  .nav-item,
+  .side-room,
+  .logo {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .view {
+    padding: 20px;
+  }
+
+  .player {
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 1.1fr) auto;
+    gap: 16px;
+  }
+
+  .volume {
+    width: 90px;
+  }
+
+  .now-cover {
+    width: 160px;
+    height: 160px;
+  }
+
+  .now-title,
+  .playlist-title {
+    font-size: 30px;
+  }
+
+  .playlist-art {
+    width: 140px;
+    height: 140px;
+  }
 }

@@ -9,142 +9,293 @@
 </head>
 
 <body>
-  <header>
-    <div class="top">
-      <div class="brand">ym&#8209;sync</div>
-      <button id="disconnect" class="hidden">Отключиться</button>
-      <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>
-      <div id="status" class="status">не подключено</div>
+  <!-- Icons, drawn once and referenced by id: text glyphs like ⏸ render as emoji
+       on some Windows fonts and at a different size on every one. -->
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" /></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M7 4h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm7 0h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" /></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="M6 5h2v14H6zm3.5 7 9.5 7V5z" /></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M5 19l9.5-7L5 5v14zM16 5h2v14h-2z" /></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z" /></symbol>
+    <symbol id="i-heart-outline" viewBox="0 0 24 24"><path d="M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3zm-4.4 15.55-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z" /></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" /></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z" /></symbol>
+    <symbol id="i-queue" viewBox="0 0 24 24"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18A3 3 0 0 0 16 14c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z" /></symbol>
+    <symbol id="i-library" viewBox="0 0 24 24"><path d="M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 5h-3v5.5a2.5 2.5 0 0 1-5 0 2.5 2.5 0 0 1 2.5-2.5c.57 0 1.08.19 1.5.51V5h4v2zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6z" /></symbol>
+    <symbol id="i-devices" viewBox="0 0 24 24"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z" /></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" /></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" /></symbol>
+    <symbol id="i-disk" viewBox="0 0 24 24"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm5 16H7v-2h10v2zm-6.7-4L7 10.7l1.41-1.41 1.89 1.88 5.29-5.29L17 7.3 10.3 14z" /></symbol>
+    <symbol id="i-lan" viewBox="0 0 24 24"><path d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" /></symbol>
+    <symbol id="i-add" viewBox="0 0 24 24"><path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z" /></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M13 3h-2v10h2V3zm4.83 2.17-1.42 1.42A6.92 6.92 0 0 1 19 12c0 3.87-3.13 7-7 7A6.995 6.995 0 0 1 7.58 6.58L6.17 5.17A8.932 8.932 0 0 0 3 12a9 9 0 0 0 18 0c0-2.74-1.23-5.18-3.17-6.83z" /></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z" /></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z" /></symbol>
+  </svg>
+
+  <!-- ---------- sidebar ---------- -->
+  <aside class="side">
+    <div class="logo">
+      <span class="logo-mark"><svg class="i"><use href="#i-note" /></svg></span>
+      <span class="logo-text">ym<span>&#8209;</span>sync</span>
     </div>
 
-    <!-- Two ways into a room, and the same two fields for both: a room is a name
-         and a password. Which button you press decides who runs the relay. -->
-    <div id="setup" class="setup">
-      <!-- Only on screen while the config has no token. It is the one setting the
-           window could not offer, so a fresh install had to go and edit TOML. -->
-      <div id="token-line" class="line hidden">
-        <label for="token">токен Яндекса</label>
-        <input id="token" type="password" placeholder="y0_… — токен аккаунта этого ПК"
-          title="OAuth-токен аккаунта ИМЕННО этого ПК; где его взять — раздел «Токен Яндекса» в README" />
-        <button id="save-token" class="primary">Сохранить</button>
-        <span class="hint inline">у каждого устройства свой аккаунт с Плюсом</span>
+    <nav class="nav" id="nav">
+      <button type="button" class="nav-item current" data-view="home">
+        <svg class="i"><use href="#i-note" /></svg><span>Главная</span>
+      </button>
+      <button type="button" class="nav-item" data-view="queue">
+        <svg class="i"><use href="#i-queue" /></svg><span>Очередь</span>
+        <span id="nav-queue" class="nav-badge"></span>
+      </button>
+      <button type="button" class="nav-item" data-view="library">
+        <svg class="i"><use href="#i-library" /></svg><span>Коллекция</span>
+      </button>
+      <button type="button" class="nav-item" data-view="room">
+        <svg class="i"><use href="#i-devices" /></svg><span>Комната</span>
+      </button>
+    </nav>
+
+    <!-- The room at a glance, wherever you are in the window: pressing it opens the
+         room page, which is where connecting and disconnecting live. -->
+    <button type="button" id="side-room" class="side-room" data-view="room">
+      <span id="side-dot" class="dot"></span>
+      <span class="side-room-text">
+        <span id="side-room-name" class="side-room-name">не подключено</span>
+        <span id="side-room-meta" class="side-room-meta">нажмите, чтобы войти в комнату</span>
+      </span>
+    </button>
+  </aside>
+
+  <!-- ---------- main ---------- -->
+  <main class="main">
+
+    <!-- Home: the ways to start music. -->
+    <section class="view" data-view="home">
+      <div class="searchbar">
+        <svg class="i"><use href="#i-search" /></svg>
+        <input id="query" placeholder="Трек, альбом, исполнитель" autocomplete="off" />
+        <button id="find" class="pill">Найти</button>
       </div>
 
-      <div class="line">
-        <label for="room">комната</label>
-        <input id="room" placeholder="home" title="имя комнаты; у всех участников оно должно совпадать" />
-        <label for="password">пароль</label>
-        <input id="password" placeholder="общий секрет комнаты" title="общий секрет: без него в комнату не войти, и он должен совпадать у всех" />
+      <div class="hero" id="hero">
+        <div class="blob b1"></div>
+        <div class="blob b2"></div>
+        <div class="blob b3"></div>
+        <div class="hero-body">
+          <button id="wave-play" class="hero-title" title="включить «Мою волну» для всей комнаты">
+            <svg class="i"><use href="#i-play" /></svg>
+            <span>Моя волна</span>
+          </button>
+          <p class="hero-sub">бесконечный поток по вашему вкусу — одновременно на всех устройствах комнаты</p>
+          <button id="wave" class="chip-btn hidden" title="Волну можно выключить только с того устройства, которое её ведёт">Волна</button>
+        </div>
       </div>
 
-      <div class="line">
-        <label for="relay">адрес комнаты</label>
-        <input id="relay" placeholder="ws://192.168.1.10:8787" title="адрес того, кто держит комнату" />
-        <button id="find-rooms" title="спросить сеть, кто держит комнату">Комнаты</button>
-        <select id="rooms" class="rooms hidden" title="найденные в сети комнаты"></select>
-        <button id="connect" class="primary">Подключиться</button>
+      <div class="tiles">
+        <button type="button" class="tile" id="likes-tile" title="играть «Мне нравится»">
+          <span class="tile-art likes"><svg class="i"><use href="#i-heart" /></svg></span>
+          <span class="tile-text">
+            <span class="tile-title">Мне нравится <svg class="i chev"><use href="#i-chevron" /></svg></span>
+            <span id="likes-tile-meta" class="tile-meta">—</span>
+          </span>
+        </button>
+        <button type="button" class="tile" id="offline-tile" title="открыть скачанное">
+          <span class="tile-art offline"><svg class="i"><use href="#i-download" /></svg></span>
+          <span class="tile-text">
+            <span class="tile-title">Скачанное <svg class="i chev"><use href="#i-chevron" /></svg></span>
+            <span id="offline-tile-meta" class="tile-meta">—</span>
+          </span>
+        </button>
       </div>
 
-      <div class="line">
-        <label for="advertise">адрес этого ПК</label>
-        <input id="advertise" placeholder="определю сам" title="какой адрес сообщать остальным, когда комнату держит этот ПК; заполните, если определился не тот — например на машине с VPN" />
-        <span class="hint inline">комнату будет держать этот ПК</span>
-        <button id="host">Хостить</button>
-      </div>
-    </div>
-  </header>
-
-  <main>
-    <section class="panel">
-      <h2>Что играть</h2>
-
-      <div class="row">
-        <select id="kind" title="Источник очереди">
-          <option value="search">поиск</option>
-          <option value="album">альбом</option>
-          <option value="playlist">плейлист</option>
-          <option value="track">трек</option>
-          <option value="wave">моя волна</option>
-          <option value="likes">мне нравится</option>
-        </select>
-        <input id="source" placeholder="кино группа крови" />
-        <button id="load">В очередь</button>
-        <button id="play">Играть</button>
-        <button id="wave" class="hidden" title="Волну можно выключить только с того устройства, которое её ведёт">Волна</button>
+      <div class="card">
+        <h2>По ссылке или номеру</h2>
+        <div class="segmented" id="kind">
+          <button type="button" class="seg current" data-kind="search">поиск</button>
+          <button type="button" class="seg" data-kind="album">альбом</button>
+          <button type="button" class="seg" data-kind="playlist">плейлист</button>
+          <button type="button" class="seg" data-kind="track">трек</button>
+        </div>
+        <div class="row">
+          <input id="source" class="field" placeholder="кино группа крови" />
+          <button id="load" class="btn" title="добавить в конец очереди">
+            <svg class="i"><use href="#i-add" /></svg>В очередь
+          </button>
+          <button id="play" class="btn primary">
+            <svg class="i"><use href="#i-play" /></svg>Играть
+          </button>
+        </div>
       </div>
 
-      <div class="row">
-        <input id="query" placeholder="найти треки…" />
-        <button id="find">Найти</button>
+      <div class="section-head">
+        <h2>Результаты поиска</h2>
       </div>
-
-      <ul id="results" class="list"></ul>
-      <p id="results-hint" class="hint">Клик по результату добавит трек в конец очереди.</p>
+      <ul id="results" class="tracks"></ul>
+      <p id="results-hint" class="hint">Клик по треку добавит его в конец очереди.</p>
     </section>
 
-    <section class="panel">
-      <h2>Очередь <span id="queue-count" class="dim"></span></h2>
-
-      <div class="row">
-        <button id="dl-track" title="оставить текущий трек на этом устройстве">&#8595; трек</button>
-        <button id="dl-queue" title="оставить всю очередь на этом устройстве">&#8595; очередь</button>
-        <button id="dl-cancel" class="hidden" title="забыть всё, что ещё не скачалось">отменить</button>
+    <!-- Queue: what the room is playing and what comes next. -->
+    <section class="view hidden" data-view="queue">
+      <div class="now-hero">
+        <div class="now-backdrop" id="now-backdrop"></div>
+        <div class="now-cover" id="now-cover"></div>
+        <div class="now-info">
+          <div class="eyebrow">Сейчас играет</div>
+          <div id="now-title" class="now-title">Тишина</div>
+          <div id="now-artist" class="now-artist">поставьте что-нибудь в очередь</div>
+          <div id="subtitle" class="now-meta"></div>
+          <div class="row">
+            <button id="dl-track" class="btn ghost" title="оставить текущий трек на этом устройстве">
+              <svg class="i"><use href="#i-download" /></svg>Трек
+            </button>
+            <button id="dl-queue" class="btn ghost" title="оставить всю очередь на этом устройстве">
+              <svg class="i"><use href="#i-download" /></svg>Всю очередь
+            </button>
+            <button id="dl-cancel" class="btn ghost hidden" title="забыть всё, что ещё не скачалось">отменить загрузку</button>
+          </div>
+        </div>
       </div>
 
-      <ul id="queue" class="list"></ul>
+      <div class="section-head">
+        <h2>Далее <span id="queue-count" class="dim"></span></h2>
+      </div>
+      <ul id="queue" class="tracks"></ul>
     </section>
 
-    <section class="panel">
-      <h2>Скачанное <span id="lib-count" class="dim"></span></h2>
+    <!-- Collection: this device's downloads and the account's likes. -->
+    <section class="view hidden" data-view="library">
+      <div class="playlist-head">
+        <div class="playlist-art" id="lib-art"><svg class="i"><use href="#i-library" /></svg></div>
+        <div class="playlist-info">
+          <div class="eyebrow">Коллекция</div>
+          <div class="playlist-title" id="lib-title">Скачанное</div>
+          <div class="now-meta"><span id="lib-count"></span></div>
+          <div class="row">
+            <button id="lib-play" class="round-play" title="играть всё"><svg class="i"><use href="#i-play" /></svg></button>
+            <button id="lib-queue" class="btn ghost" title="добавить всё в конец очереди">
+              <svg class="i"><use href="#i-add" /></svg>В очередь
+            </button>
+            <button id="lib-refresh" class="icon-btn" title="перечитать папку с треками"><svg class="i"><use href="#i-refresh" /></svg></button>
+          </div>
+        </div>
+      </div>
 
       <!-- Three views of one library: the flat list, what this account has
            hearted, and the same downloads grouped by album. -->
-      <div class="tabs" id="tabs">
-        <button type="button" class="tab current" data-tab="all">всё скачанное</button>
-        <button type="button" class="tab" data-tab="likes">мне нравится</button>
-        <button type="button" class="tab" data-tab="albums">по альбомам</button>
+      <div class="segmented" id="tabs">
+        <button type="button" class="seg tab current" data-tab="all">Всё скачанное</button>
+        <button type="button" class="seg tab" data-tab="likes">Мне нравится</button>
+        <button type="button" class="seg tab" data-tab="albums">По альбомам</button>
       </div>
 
-      <div class="row">
-        <button id="lib-play">Играть</button>
-        <button id="lib-queue">В очередь</button>
-        <button id="lib-refresh" title="перечитать папку с треками">&#8635;</button>
-      </div>
-
-      <ul id="library" class="list"></ul>
+      <ul id="library" class="tracks"></ul>
       <p id="lib-hint" class="hint"></p>
+    </section>
+
+    <!-- Room: two ways in, and the same two fields for both — a room is a name and
+         a password. Which button you press decides who runs the relay. -->
+    <section class="view hidden" data-view="room">
+      <div class="room-head">
+        <div>
+          <div class="eyebrow">Совместное прослушивание</div>
+          <div class="playlist-title">Комната</div>
+          <div id="status" class="status">не подключено</div>
+          <div id="hosting" class="chip hidden" title="комнату держит это устройство"></div>
+        </div>
+        <button id="disconnect" class="btn danger hidden">
+          <svg class="i"><use href="#i-power" /></svg>Отключиться
+        </button>
+      </div>
+
+      <div id="setup" class="setup">
+        <!-- Only on screen while the config has no token. It is the one setting the
+             window could not offer, so a fresh install had to go and edit TOML. -->
+        <div id="token-line" class="card hidden">
+          <h2>Токен Яндекса</h2>
+          <div class="row">
+            <input id="token" class="field" type="password" placeholder="y0_… — токен аккаунта этого ПК"
+              title="OAuth-токен аккаунта ИМЕННО этого ПК; где его взять — раздел «Токен Яндекса» в README" />
+            <button id="save-token" class="btn primary">Сохранить</button>
+          </div>
+          <p class="hint">У каждого устройства свой аккаунт с Плюсом.</p>
+        </div>
+
+        <div class="card">
+          <h2>Комната</h2>
+          <div class="grid2">
+            <label class="field-label">название
+              <input id="room" class="field" placeholder="home" title="имя комнаты; у всех участников оно должно совпадать" />
+            </label>
+            <label class="field-label">пароль
+              <input id="password" class="field" placeholder="общий секрет комнаты" title="общий секрет: без него в комнату не войти, и он должен совпадать у всех" />
+            </label>
+          </div>
+          <p class="hint">Название и пароль должны совпадать у всех участников.</p>
+        </div>
+
+        <div class="grid2">
+          <div class="card">
+            <h2>Подключиться</h2>
+            <label class="field-label">адрес комнаты
+              <input id="relay" class="field" placeholder="ws://192.168.1.10:8787" title="адрес того, кто держит комнату" />
+            </label>
+            <select id="rooms" class="field rooms hidden" title="найденные в сети комнаты"></select>
+            <div class="row">
+              <button id="find-rooms" class="btn ghost" title="спросить сеть, кто держит комнату">
+                <svg class="i"><use href="#i-search" /></svg>Найти в сети
+              </button>
+              <button id="connect" class="btn primary">Подключиться</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Держать комнату здесь</h2>
+            <label class="field-label">адрес этого ПК
+              <input id="advertise" class="field" placeholder="определю сам" title="какой адрес сообщать остальным, когда комнату держит этот ПК; заполните, если определился не тот — например на машине с VPN" />
+            </label>
+            <p class="hint">Остальные подключатся к этому ПК. Так же выглядит и прослушивание скачанного без интернета.</p>
+            <div class="row">
+              <button id="host" class="btn">Хостить</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
-  <footer>
+  <!-- ---------- player ---------- -->
+  <footer class="player">
     <div class="now">
-      <div class="title-line">
-        <button id="heart" class="heart" title="Мне нравится">&#9825;</button>
+      <div id="cover" class="cover"></div>
+      <div class="now-text">
         <div id="title" class="title">—</div>
+        <div id="artist" class="artist"></div>
       </div>
-      <div id="subtitle" class="dim"></div>
+      <button id="heart" class="heart" title="Мне нравится"><svg class="i"><use href="#i-heart-outline" /></svg></button>
     </div>
 
-    <div class="transport">
-      <button id="prev" title="предыдущий">&#9198;</button>
-      <button id="toggle" class="primary" title="пауза / продолжить">&#9654;</button>
-      <button id="next" title="следующий">&#9197;</button>
-    </div>
-
-    <div class="progress">
-      <input id="seek" type="range" min="0" max="1000" value="0" title="позиция" />
-      <div class="times">
-        <span id="position">0:00</span>
-        <span id="duration">0:00</span>
+    <div class="center">
+      <div class="transport">
+        <button id="prev" class="icon-btn" title="предыдущий"><svg class="i"><use href="#i-prev" /></svg></button>
+        <button id="toggle" class="play" title="пауза / продолжить"><svg class="i"><use href="#i-play" /></svg></button>
+        <button id="next" class="icon-btn" title="следующий"><svg class="i"><use href="#i-next" /></svg></button>
+      </div>
+      <div class="progress">
+        <span id="position" class="time">0:00</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" title="позиция" />
+        <span id="duration" class="time">0:00</span>
       </div>
     </div>
 
     <div class="meters">
-      <label class="volume">
-        <span class="dim">громкость</span>
+      <div id="drift" class="drift hidden"></div>
+      <label class="volume" title="громкость">
+        <svg class="i"><use href="#i-volume" /></svg>
         <input id="volume" type="range" min="0" max="100" value="80" />
       </label>
-      <div id="drift" class="drift hidden"></div>
     </div>
   </footer>
 

@@ -13,7 +13,19 @@ data class TrackInfo(
     val albumId: String? = null,
     /** The album's name, when the core knows it. What the album view groups by. */
     val album: String? = null,
+    /** Yandex's cover template, `avatars.yandex.net/…/%%`; see [coverUrl]. */
+    val coverUri: String? = null,
 ) {
+    /**
+     * The cover at [size]×[size] pixels, or null when the core has none — a track
+     * downloaded before covers were stored, or one that came from another peer.
+     */
+    fun coverUrl(size: Int): String? {
+        val uri = coverUri?.takeIf { it.isNotBlank() } ?: return null
+        val sized = uri.replace("%%", "${size}x$size")
+        return if (sized.startsWith("http")) sized else "https://$sized"
+    }
+
     /**
      * The shape `Native.queueTracks` takes: `ymsync_proto::TrackRef`.
      *
@@ -29,6 +41,7 @@ data class TrackInfo(
             .apply {
                 albumId?.let { put("album_id", it) }
                 album?.let { put("album", it) }
+                coverUri?.let { put("cover_uri", it) }
             }
 }
 
@@ -143,6 +156,7 @@ fun JSONObject.toTrackInfo() =
         durationMs = optLong("duration_ms"),
         albumId = if (isNull("album_id")) null else optString("album_id"),
         album = if (isNull("album")) null else optString("album"),
+        coverUri = if (isNull("cover_uri")) null else optString("cover_uri"),
     )
 
 fun JSONArray.toTrackList(): List<TrackInfo> =

@@ -492,6 +492,7 @@ mod tests {
             title: format!("Title {id}"),
             artist: "Artist".to_string(),
             duration_ms: 1_000,
+            cover_uri: None,
         }
     }
 

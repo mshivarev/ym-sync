@@ -44,6 +44,13 @@ pub struct TrackRef {
     pub title: String,
     pub artist: String,
     pub duration_ms: u64,
+    /// Yandex's cover template, `avatars.yandex.net/get-music-content/…/%%`.
+    ///
+    /// Kept raw so each screen asks for the size it draws: `%%` becomes
+    /// `200x200`, `400x400` and so on. Optional for the same reasons as `album`,
+    /// and purely cosmetic — nothing but the pictures depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_uri: Option<String>,
 }
 
 impl std::fmt::Display for TrackRef {
@@ -253,6 +260,7 @@ mod tests {
             title: format!("Title {id}"),
             artist: "Artist".into(),
             duration_ms: 210_000,
+            cover_uri: None,
         }
     }
 

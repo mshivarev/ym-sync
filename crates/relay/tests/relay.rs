@@ -153,6 +153,7 @@ fn track(id: &str) -> TrackRef {
         title: format!("Title {id}"),
         artist: "Artist".to_string(),
         duration_ms: 200_000,
+        cover_uri: None,
     }
 }
 
@@ -167,6 +168,7 @@ fn set_queue(ids: &[&str]) -> Command {
 fn short_track(id: &str) -> TrackRef {
     TrackRef {
         duration_ms: 150,
+        cover_uri: None,
         ..track(id)
     }
 }

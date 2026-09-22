@@ -1084,6 +1084,7 @@ mod tests {
             title: format!("t{id}"),
             artist: "a".into(),
             duration_ms,
+            cover_uri: None,
         }
     }
 

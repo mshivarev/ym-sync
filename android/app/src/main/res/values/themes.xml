@@ -3,8 +3,8 @@
     <!-- A platform theme keeps the app free of an extra Material library just to
          have a window background. -->
     <style name="Theme.YmSync" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#FF101218</item>
-        <item name="android:statusBarColor">#FF171A22</item>
-        <item name="android:navigationBarColor">#FF171A22</item>
+        <item name="android:windowBackground">#FF0B0B0D</item>
+        <item name="android:statusBarColor">#FF0B0B0D</item>
+        <item name="android:navigationBarColor">#FF0B0B0D</item>
     </style>
 </resources>
