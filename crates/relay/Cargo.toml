@@ -32,7 +32,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
-ymsync-proto = { version = "0.1.0", path = "../proto" }
+ymsync-proto = { version = "0.2.0", path = "../proto" }
 
 [dev-dependencies]
 # The integration tests act as clients, which the relay itself never does.
