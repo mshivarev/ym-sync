@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+# The file picker for importing local tracks. Native dialogs only — no extra
+# window and nothing to style.
+rfd = { version = "0.15.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tauri = { version = "2.11.5", features = ["devtools"] }

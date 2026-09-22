@@ -74,7 +74,9 @@ pub struct Session {
     /// The engine plus whatever it brought up: a relay when this phone hosts the
     /// room, and the file server offering its downloads to the others.
     core: CoreSession,
-    api: Arc<YandexMusic>,
+    /// `None` when the phone has no Yandex token: it then plays what it has
+    /// downloaded, and whatever the room's other devices can supply.
+    api: Option<Arc<YandexMusic>>,
     /// Queue revision Kotlin has already been given; see [`Session::snapshot`].
     sent_revision: AtomicU64,
     /// Same idea for the list of downloaded ids.
@@ -96,7 +98,11 @@ impl Session {
             .build()
             .context("создание рантайма")?;
 
-        let api = Arc::new(YandexMusic::new(cfg.require_yandex_token()?)?);
+        // Optional: a phone with no token still plays what it downloaded.
+        let api = match cfg.yandex_token.trim() {
+            "" => None,
+            token => Some(Arc::new(YandexMusic::new(token)?)),
+        };
         // Opening the audio device blocks; this call already runs on a Kotlin
         // background thread. The same player as the desktop: the track is decoded
         // from memory, so seeking costs a decoder reset instead of a re-buffer.
@@ -109,7 +115,7 @@ impl Session {
         let likes = core::open_likes(&cache);
         let core = runtime.block_on(core::start(
             &cfg,
-            Arc::clone(&api),
+            api.clone(),
             player as Arc<dyn Playback>,
             cache,
             likes,
@@ -207,9 +213,10 @@ impl Session {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let api = self.api()?;
         let found = self
             .runtime
-            .block_on(self.api.search_tracks(query.trim(), limit.clamp(1, 50)))?;
+            .block_on(api.search_tracks(query.trim(), limit.clamp(1, 50)))?;
         Ok(found.iter().map(Track::to_track_ref).collect())
     }
 
@@ -259,14 +266,15 @@ impl Session {
             return Ok(self.queue(tracks, replace));
         }
 
+        let api = self.api()?;
         let tracks = self.runtime.block_on(async {
             match kind {
                 "track" => {
                     let id = api::parse_track_id(value)?;
-                    Ok(vec![self.api.track(&id).await?])
+                    Ok(vec![api.track(&id).await?])
                 }
                 "search" => {
-                    let found = self.api.search_tracks(value.trim(), 1).await?;
+                    let found = api.search_tracks(value.trim(), 1).await?;
                     if found.is_empty() {
                         bail!("по запросу «{value}» ничего не найдено");
                     }
@@ -274,13 +282,13 @@ impl Session {
                 }
                 "album" => {
                     let id = api::parse_album_id(value)?;
-                    self.api.album_tracks(&id).await
+                    api.album_tracks(&id).await
                 }
                 "playlist" => {
                     let (owner, number) = api::parse_playlist_ref(value)?;
-                    self.api.playlist_tracks(&owner, &number).await
+                    api.playlist_tracks(&owner, &number).await
                 }
-                "likes" => self.api.liked_tracks().await,
+                "likes" => api.liked_tracks().await,
                 other => bail!("неизвестный источник: {other}"),
             }
         })?;
@@ -289,6 +297,27 @@ impl Session {
             tracks.iter().map(Track::to_track_ref).collect(),
             replace,
         ))
+    }
+
+    /// Adds a local audio file to this device's downloads.
+    ///
+    /// The phone reads the bytes itself: its picker hands back a content URI,
+    /// which is not a path this process could open. Needs no account and no
+    /// network — the file is simply stored the way a download would be.
+    pub fn import(&self, name: &str, data: Vec<u8>) -> Result<serde_json::Value> {
+        let imported = ymsync::import::from_bytes(self.engine().cache().as_ref(), name, data)?;
+        Ok(serde_json::json!({
+            "track": imported.track,
+            "bytes": imported.bytes,
+            "already_there": imported.already_there,
+        }))
+    }
+
+    /// The Yandex client, or the one error worth reporting without it.
+    fn api(&self) -> Result<Arc<YandexMusic>> {
+        self.api
+            .clone()
+            .context("нет токена Яндекса: впишите его в настройках — без него играет только скачанное")
     }
 
     /// Sends a resolved list to the room, replacing the queue or extending it.

@@ -37,6 +37,15 @@ object Native {
     /** Queues a whole source by name: an album, a playlist, the wave. */
     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 
+    /**
+     * Adds a local audio file to this device's downloads.
+     *
+     * Takes the bytes because the picker answers with a content URI, which only
+     * this app may open — so this side reads the file and passes what it read.
+     * Needs no account and no network.
+     */
+    external fun importTrack(handle: Long, name: String, data: ByteArray): String
+
     /** What is downloaded on this device. Reads an in-memory index; no network. */
     external fun library(handle: Long): String
 

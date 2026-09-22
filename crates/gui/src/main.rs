@@ -19,6 +19,7 @@ use ymsync::cache::{Cache, CachedTrack};
 use ymsync::config::Config;
 use ymsync::discover::{self, FoundRoom};
 use ymsync::engine::{Command, Snapshot};
+use ymsync::import;
 use ymsync::likes::Likes;
 use ymsync::player::Player;
 use ymsync::session::{self, Session};
@@ -53,6 +54,17 @@ struct AppState {
 impl AppState {
     fn config(&self) -> Config {
         self.config.lock().expect("config mutex").clone()
+    }
+
+    /// The API client, if this machine has a token at all.
+    ///
+    /// Connecting does not need one: a room that plays what is on this disk works
+    /// without an account, and the actions that do need Yandex report it.
+    async fn api_if_any(&self) -> Result<Option<Arc<YandexMusic>>, String> {
+        if self.config().yandex_token.trim().is_empty() {
+            return Ok(None);
+        }
+        self.api().await.map(Some)
     }
 
     /// The API client, created on demand so the window can open even when no
@@ -201,7 +213,7 @@ async fn connect(
         cfg.relay = relay;
     }
 
-    let api = state.api().await?;
+    let api = state.api_if_any().await?;
     let cache = state.cache().await?;
     let likes = state.likes().await?;
     let volume = cfg.volume;
@@ -435,6 +447,67 @@ async fn find_rooms(wait: u64) -> Result<Vec<FoundRoom>, String> {
     discover::find_rooms(wait).await.map_err(fail)
 }
 
+/// Adds local audio files to this device's downloads.
+///
+/// Opens the system's file picker and imports whatever comes back: the tracks
+/// then behave like anything else downloaded here — they play with no internet,
+/// and the room's other devices can pull them over the local network.
+///
+/// Note that this cannot read what the Yandex Music app itself downloaded: that
+/// app stores its offline tracks encrypted.
+#[tauri::command]
+async fn import_tracks(state: State<'_, AppState>) -> Result<String, String> {
+    let cache = state.cache().await?;
+
+    // The dialog is modal and blocking, so it does not belong on the async
+    // runtime's threads.
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Выберите музыку")
+            .add_filter("Аудио", ymsync::import::AUDIO_EXTENSIONS)
+            .pick_files()
+    })
+    .await
+    .map_err(fail)?;
+
+    let Some(files) = picked else {
+        // The picker was closed. Nothing to report and nothing went wrong.
+        return Ok(String::new());
+    };
+
+    let report = tokio::task::spawn_blocking(move || {
+        let mut added = 0usize;
+        let mut known = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for file in files {
+            match import::from_path(&cache, &file) {
+                Ok(imported) if imported.already_there => known += 1,
+                Ok(_) => added += 1,
+                Err(err) => failed.push(format!("{err:#}")),
+            }
+        }
+        let mut parts = Vec::new();
+        if added > 0 {
+            parts.push(format!("добавлено: {added}"));
+        }
+        if known > 0 {
+            parts.push(format!("уже было: {known}"));
+        }
+        if !failed.is_empty() {
+            parts.push(format!("не вышло: {} ({})", failed.len(), failed.join("; ")));
+        }
+        if parts.is_empty() {
+            "ничего не выбрано".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    })
+    .await
+    .map_err(fail)?;
+
+    Ok(report)
+}
+
 /// This device's offline library, newest first.
 ///
 /// Answers with no connection and no internet: the metadata was stored beside the
@@ -578,7 +651,8 @@ fn main() {
             download,
             cancel_downloads,
             forget,
-            find_rooms
+            find_rooms,
+            import_tracks
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");

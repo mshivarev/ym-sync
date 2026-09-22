@@ -130,6 +130,30 @@ object Commands {
     }
 
     /**
+     * Adds a local audio file to the downloads on this device.
+     *
+     * Answers with what to tell the user: the track's name, or that it was already
+     * there. Reading and storing a file is disk work, hence [Dispatchers.IO].
+     */
+    suspend fun importTrack(name: String, data: ByteArray): Result<String> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) {
+            parseReply(Native.importTrack(handle, name, data))
+        }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> {
+                val track = reply.value.optJSONObject("track")?.toTrackInfo()
+                val label = track?.let { "${it.artist} — ${it.title}" } ?: name
+                Result.success(
+                    if (reply.value.optBoolean("already_there")) "$label — уже был" else label,
+                )
+            }
+        }
+    }
+
+    /**
      * Asks the local network which rooms are out there.
      *
      * The one call here that needs no session: it is what you do before you know

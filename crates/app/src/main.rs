@@ -240,7 +240,7 @@ async fn run(cfg: &Config, source: Option<Source>) -> Result<()> {
 
     let player = Arc::new(Player::new(cfg.volume)?);
     let likes = session::open_likes(&cache);
-    let session = session::start(cfg, Arc::clone(&api), player, cache, likes).await?;
+    let session = session::start(cfg, Some(Arc::clone(&api)), player, cache, likes).await?;
     let handle = session.handle();
 
     let start = handle.snapshot();

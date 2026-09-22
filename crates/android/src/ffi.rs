@@ -11,6 +11,7 @@
 //!     external fun search(handle: Long, query: String, limit: Int): String
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
+//!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
 //!     external fun library(handle: Long): String
 //!     external fun likes(handle: Long): String
 //!     external fun findRooms(waitMs: Int): String
@@ -32,7 +33,7 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 
 use crate::session::{Request, Session};
@@ -201,6 +202,37 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_queueFrom(
             None => failed("сессия не запущена"),
             Some(session) => match session.queue_from(&kind, &value, replace != 0) {
                 Ok(length) => ok(serde_json::json!({ "queued": length })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// Adds a local audio file to this device's downloads.
+///
+/// Takes the bytes rather than a path because Android's picker answers with a
+/// content URI: only the app that asked can open it, so Kotlin reads the file and
+/// hands over what it read.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_importTrack(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+    data: JByteArray,
+) -> jstring {
+    let bytes = env
+        .convert_byte_array(&data)
+        .map_err(|err| format!("не удалось прочитать файл: {err}"));
+
+    let text = match (read(&mut env, &name), bytes) {
+        (Err(err), _) => failed(err),
+        (_, Err(err)) => failed(err),
+        (Ok(name), Ok(bytes)) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.import(&name, bytes) {
+                Ok(value) => ok(value),
                 Err(err) => failed(err),
             },
         },

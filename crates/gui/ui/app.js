@@ -45,6 +45,7 @@ const ui = {
   libPlay: el("lib-play"),
   libQueue: el("lib-queue"),
   libRefresh: el("lib-refresh"),
+  libImport: el("lib-import"),
   libArt: el("lib-art"),
   libTitle: el("lib-title"),
   tabs: el("tabs"),
@@ -227,6 +228,54 @@ function paintRange(input) {
   input.style.setProperty("--fill", `${((input.value - input.min) / span) * 100}%`);
 }
 
+/// A password for a room nobody asked to name.
+///
+/// The relay refuses a room without one, and stopping to ask for a password when
+/// somebody pressed «Моя волна» would be silly — so one is made up and written to
+/// the settings, where the room page shows it to whoever wants to join.
+function newPassword() {
+  const alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return [...bytes].map((byte) => alphabet[byte % alphabet.length]).join("");
+}
+
+/// Runs an action in a room, holding one on this PC if there is none.
+///
+/// Playing something is the point of the app, so it is not gated behind setting
+/// a room up first: the room is what the app needs, not what the listener asked
+/// for, and it can be made without asking anything.
+async function withRoom(action) {
+  if (connected) return action();
+
+  if (!ui.room.value.trim()) ui.room.value = "home";
+  if (!ui.password.value.trim()) ui.password.value = newPassword();
+
+  const snapshot = await call("connect", {
+    host: true,
+    advertise: ui.advertise.value,
+    relay: ui.relay.value,
+    room: ui.room.value,
+    password: ui.password.value,
+  });
+  if (!snapshot) {
+    // Something is wrong with the settings — the room page is where it is fixed.
+    showView("room");
+    return;
+  }
+
+  roomName = ui.room.value;
+  setConnected(true);
+  render(snapshot);
+  toast(`комната «${roomName}» поднята на этом ПК`);
+  return action();
+}
+
+/** Puts tracks in the room's queue, raising the room first if need be. */
+function queueTracks(tracks, replace = false) {
+  if (!tracks.length) return;
+  return withRoom(() => call("queue_tracks", { tracks, start: 0, replace }));
+}
+
 // ---------- navigation ----------
 
 function showView(name) {
@@ -245,6 +294,12 @@ ui.nav.addEventListener("click", (event) => {
 });
 ui.sideRoom.addEventListener("click", () => showView("room"));
 ui.cover.addEventListener("click", () => showView("queue"));
+// A tile is a way into a list, as a playlist card is anywhere else. Playing is
+// the round button on the collection page.
+ui.likesTile.addEventListener("click", () => {
+  selectTab("likes");
+  showView("library");
+});
 ui.offlineTile.addEventListener("click", () => {
   selectTab("all");
   showView("library");
@@ -260,8 +315,9 @@ function setConnected(value) {
   ui.disconnect.classList.toggle("hidden", !value);
 
   // Protocol 3 has no roles: everyone in the room may drive it.
-  for (const node of [ui.source, ui.load, ui.play, ui.prev, ui.toggle, ui.next, ui.seek,
-    ui.dlTrack, ui.dlQueue, ui.wavePlay, ui.likesTile, ...ui.kind.querySelectorAll(".seg")]) {
+  // Only what needs something already playing is turned off. Everything that
+  // starts music stays live: pressing it raises a room on this PC first.
+  for (const node of [ui.prev, ui.toggle, ui.next, ui.seek, ui.dlTrack, ui.dlQueue]) {
     node.disabled = !value;
   }
   updateLibraryButtons();
@@ -311,7 +367,7 @@ function setConnected(value) {
 /// Playing the library means queueing it into the room, so it needs both the
 /// tracks and a connection.
 function updateLibraryButtons() {
-  const usable = connected && visibleTracks().length > 0;
+  const usable = visibleTracks().length > 0;
   ui.libPlay.disabled = !usable;
   ui.libQueue.disabled = !usable;
   ui.libRefresh.title =
@@ -464,7 +520,7 @@ function renderResults() {
         current: false,
         // One track at a time, appended: clicking must not throw away a queue
         // that is already playing.
-        onClick: () => call("queue_tracks", { tracks: [track], start: 0, replace: false }),
+        onClick: () => queueTracks([track]),
       }),
     ),
   );
@@ -505,7 +561,7 @@ function renderDownloads() {
       trackItem(entry, index, {
         current: false,
         trailing: fmtSize(entry.bytes),
-        onClick: () => call("queue_tracks", { tracks: [entry], start: 0, replace: false }),
+        onClick: () => queueTracks([entry]),
         extra: dropButton(entry),
       }),
     ),
@@ -523,7 +579,7 @@ function renderLikes() {
     ...likes.map((track, index) =>
       trackItem(track, index, {
         current: false,
-        onClick: () => call("queue_tracks", { tracks: [track], start: 0, replace: false }),
+        onClick: () => queueTracks([track]),
       }),
     ),
   );
@@ -556,9 +612,7 @@ function renderAlbums() {
     count.textContent = tracksWord(group.tracks.length);
 
     button.append(art, name, count);
-    button.addEventListener("click", () =>
-      call("queue_tracks", { tracks: group.tracks, start: 0, replace: false }),
-    );
+    button.addEventListener("click", () => queueTracks(group.tracks));
 
     const size = document.createElement("span");
     size.className = "time";
@@ -571,7 +625,7 @@ function renderAlbums() {
       nodes.push(
         trackItem(entry, index, {
           current: false,
-          onClick: () => call("queue_tracks", { tracks: [entry], start: 0, replace: false }),
+          onClick: () => queueTracks([entry]),
           extra: dropButton(entry),
         }),
       );
@@ -929,7 +983,7 @@ async function loadSource(button, source, value, replace) {
   if (!value && !SELF_CONTAINED.has(source)) return;
 
   button.disabled = true;
-  const length = await call("play_source", { kind: source, value, replace });
+  const length = await withRoom(() => call("play_source", { kind: source, value, replace }));
   button.disabled = false;
 
   if (typeof length !== "number") return;
@@ -945,7 +999,6 @@ async function loadSource(button, source, value, replace) {
 ui.load.addEventListener("click", () => loadSource(ui.load, kind, ui.source.value.trim(), false));
 ui.play.addEventListener("click", () => loadSource(ui.play, kind, ui.source.value.trim(), true));
 ui.wavePlay.addEventListener("click", () => loadSource(ui.wavePlay, "wave", "", true));
-ui.likesTile.addEventListener("click", () => loadSource(ui.likesTile, "likes", "", true));
 ui.wave.addEventListener("click", () => call("control", { action: "stop_wave" }));
 
 ui.find.addEventListener("click", async () => {
@@ -993,12 +1046,20 @@ ui.dlCancel.addEventListener("click", () => call("cancel_downloads"));
 // Replacing the queue with the library is how you listen with no internet: every
 // one of these plays off the disk. On the «мне нравится» tab it is the playlist
 // instead, which is the same act with a different list.
-ui.libPlay.addEventListener("click", () =>
-  call("queue_tracks", { tracks: visibleTracks(), start: 0, replace: true }),
-);
-ui.libQueue.addEventListener("click", () =>
-  call("queue_tracks", { tracks: visibleTracks(), start: 0, replace: false }),
-);
+ui.libPlay.addEventListener("click", () => queueTracks(visibleTracks(), true));
+ui.libQueue.addEventListener("click", () => queueTracks(visibleTracks()));
+
+// Local files, added to this device's downloads. The picker is the system's own,
+// so the paths never pass through this page.
+ui.libImport.addEventListener("click", async () => {
+  ui.libImport.disabled = true;
+  const report = await call("import_tracks");
+  ui.libImport.disabled = false;
+  if (report) {
+    await refreshLibrary();
+    toast(report);
+  }
+});
 
 // Re-reading means two different things: the folder on this disk, or the playlist
 // on Yandex. Which one depends on what is on screen.
@@ -1076,8 +1137,8 @@ listen("notice", (event) => toast(String(event.payload))).catch(() => {});
 (async function start() {
   ui.source.placeholder = PLACEHOLDERS[kind];
   setConnected(false);
-  // Nothing plays until the window is in a room, so that is where it opens.
-  showView("room");
+  // The home page works without a room now — pressing anything there raises one.
+  showView("home");
   paintRange(ui.volume);
 
   const settings = await call("settings");

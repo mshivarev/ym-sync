@@ -3125,6 +3125,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfd"
+version = "0.15.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef2bee61e6cffa4635c72d7d81a84294e28f0930db0ddcb0f66d10244674ebed"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "js-sys",
+ "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5664,6 +5685,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "symphonia",
  "tokio",
  "tokio-tungstenite",
  "toml 1.1.4+spec-1.1.0",
@@ -5694,6 +5716,7 @@ name = "ymsync-gui"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "rfd",
  "serde",
  "serde_json",
  "tauri",

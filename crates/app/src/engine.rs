@@ -41,6 +41,10 @@ use crate::share;
 
 /// A snapshot whose seq is this far below the last one means the relay restarted
 /// and began a fresh counter, rather than a frame arriving late.
+/// Said whenever an action needs the account this device has not been given.
+/// Everything that plays off this disk keeps working without one.
+const NO_TOKEN: &str = "нет токена Яндекса: без него играет только скачанное";
+
 const SEQ_RESTART_GAP: u64 = 64;
 
 /// A load can fail for transient reasons — Yandex rate-limits concurrent stream
@@ -256,7 +260,10 @@ impl Handle {
 /// the engine connects, and doing that in one place keeps the three front ends
 /// from each getting it subtly wrong.
 pub struct Wiring {
-    pub api: Arc<YandexMusic>,
+    /// `None` when no Yandex token is configured. The room still works: it plays
+    /// what is on this disk and what the other peers can supply, and the actions
+    /// that do need Yandex say so instead of being missing.
+    pub api: Option<Arc<YandexMusic>>,
     pub player: Arc<dyn Playback>,
     pub cache: Arc<Cache>,
     /// The account's «Мне нравится». Opened by the front end for the same reason
@@ -487,8 +494,9 @@ struct Station {
 /// reopen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadFailure {
-    /// Yandex says this account may not play the track, and nobody in the room
-    /// offered it either. Nothing to retry.
+    /// The track cannot be had at all: Yandex says this account may not play it
+    /// and nobody in the room offered it, or there is no account to ask. Nothing
+    /// to retry.
     NotLicensed(String),
     /// Everything else: no internet, a peer that announced the track but cannot
     /// be reached, a player that refused the source. All of these may pass, so
@@ -547,7 +555,8 @@ impl std::fmt::Display for NotLicensed {
 impl std::error::Error for NotLicensed {}
 
 struct Engine {
-    api: Arc<YandexMusic>,
+    /// `None` when there is no Yandex token; see [`Wiring::api`].
+    api: Option<Arc<YandexMusic>>,
     /// For pulling tracks off other players on the local network. Separate from
     /// the Yandex client because a peer answers at once or not at all.
     http: reqwest::Client,
@@ -834,7 +843,10 @@ impl Engine {
             }
 
             Command::Like { track, liked } => {
-                let api = Arc::clone(&self.api);
+                let Some(api) = self.api.clone() else {
+                    self.notice = Some(NO_TOKEN.to_string());
+                    return;
+                };
                 let likes = Arc::clone(&self.likes);
                 let internal = internal.clone();
                 let label = track.to_string();
@@ -866,7 +878,13 @@ impl Engine {
     /// `asked_for` separates the read done on connecting from one the listener
     /// pressed a button for: only the latter is worth reporting when it works.
     fn read_likes(&mut self, internal: &mpsc::UnboundedSender<Internal>, asked_for: bool) {
-        let api = Arc::clone(&self.api);
+        let Some(api) = self.api.clone() else {
+            // The stored list is still on screen; it just cannot be refreshed.
+            if asked_for {
+                self.notice = Some(NO_TOKEN.to_string());
+            }
+            return;
+        };
         let likes = Arc::clone(&self.likes);
         let internal = internal.clone();
         tokio::spawn(async move {
@@ -894,7 +912,9 @@ impl Engine {
         if albums::missing(&self.cache).is_empty() {
             return;
         }
-        let api = Arc::clone(&self.api);
+        let Some(api) = self.api.clone() else {
+            return;
+        };
         let cache = Arc::clone(&self.cache);
         let internal = internal.clone();
         tokio::spawn(async move {
@@ -920,9 +940,12 @@ impl Engine {
         if self.refilling {
             return;
         }
+        let Some(api) = self.api.clone() else {
+            self.notice = Some(NO_TOKEN.to_string());
+            return;
+        };
         self.refilling = true;
 
-        let api = Arc::clone(&self.api);
         let internal = internal.clone();
         let id = station.id.clone();
         let after = station.after.clone();
@@ -1026,7 +1049,7 @@ impl Engine {
     /// supply this track without going to the internet.
     fn fetch_for(&self, track_id: &str, store: bool, pinned: bool) -> Fetch {
         Fetch {
-            api: Arc::clone(&self.api),
+            api: self.api.clone(),
             http: self.http.clone(),
             cache: Arc::clone(&self.cache),
             player: Arc::clone(&self.player),
@@ -1803,7 +1826,7 @@ impl Engine {
 /// spawned task without borrowing the engine.
 #[derive(Clone)]
 struct Fetch {
-    api: Arc<YandexMusic>,
+    api: Option<Arc<YandexMusic>>,
     http: reqwest::Client,
     cache: Arc<Cache>,
     player: Arc<dyn Playback>,
@@ -1878,7 +1901,16 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
         }
     }
 
-    let (track, url) = match yandex_stream(&fetch.api, id).await {
+    let Some(api) = fetch.api.as_ref() else {
+        // Nothing left to try: not on this disk, not on the local network, and
+        // there is no account to ask.
+        return Err(LoadFailure::NotLicensed(match peer_error {
+            Some(err) => format!("{NO_TOKEN}; у участников тоже не вышло: {err}"),
+            None => NO_TOKEN.to_string(),
+        }));
+    };
+
+    let (track, url) = match yandex_stream(api, id).await {
         Ok(pair) => pair,
         Err(err) => return Err(LoadFailure::from_yandex(&err, peer_error)),
     };
@@ -1894,7 +1926,7 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
         });
     }
 
-    let data = match fetch.api.fetch_track(&url).await {
+    let data = match api.fetch_track(&url).await {
         Ok(data) => data,
         Err(err) => return Err(LoadFailure::Temporary(format!("{err:#}"))),
     };
@@ -2036,8 +2068,9 @@ async fn download(fetch: &Fetch, want: &TrackRef) -> Result<(Origin, Insertion)>
         debug!(track = id, "no luck on the local network: {err:#}");
     }
 
-    let (track, url) = yandex_stream(&fetch.api, id).await?;
-    let data = fetch.api.fetch_track(&url).await?;
+    let api = fetch.api.as_ref().context(NO_TOKEN)?;
+    let (track, url) = yandex_stream(api, id).await?;
+    let data = api.fetch_track(&url).await?;
     let insertion = store(fetch, &track, &data)
         .await
         .context("не удалось сохранить трек на устройство")?;

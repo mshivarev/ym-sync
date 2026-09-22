@@ -288,6 +288,25 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_CACHE_LIMIT, 2f)
         set(value) = prefs.edit().putFloat(KEY_CACHE_LIMIT, value).apply()
 
+    /**
+     * Fills in what a room needs to come up by itself.
+     *
+     * Pressing «Моя волна» or «Скачанное» outside a room raises one on this phone,
+     * and neither a name nor a password is something to stop and ask for at that
+     * moment. The password is random rather than empty because the relay refuses
+     * a room without one; it is on the room page for whoever wants to join.
+     */
+    fun prepareForSolo() {
+        if (room.isBlank()) room = "home"
+        if (password.isBlank()) password = newPassword()
+    }
+
+    private fun newPassword(): String {
+        val alphabet = "abcdefghijkmnpqrstuvwxyz23456789"
+        val random = java.security.SecureRandom()
+        return (1..12).map { alphabet[random.nextInt(alphabet.length)] }.joinToString("")
+    }
+
     /** What still has to be filled in before a session can start. */
     val missing: List<String>
         get() = buildList {

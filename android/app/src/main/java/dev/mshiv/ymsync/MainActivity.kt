@@ -108,6 +108,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 private val Bg = Color(0xFF0B0B0D)
@@ -167,6 +169,8 @@ private class Room(
     val running: Boolean,
     val likedIds: Set<String>,
     val scope: CoroutineScope,
+    /// Runs something in a room, raising one on this phone first if there is none.
+    val inRoom: (() -> Unit) -> Unit,
 ) {
     val canDrive: Boolean get() = running
 
@@ -180,8 +184,10 @@ private class Room(
     /// The row already holds the whole track, so nothing is asked of Yandex here
     /// — see `Commands.queueTracks`.
     fun enqueue(tracks: List<TrackInfo>, replace: Boolean = false) {
-        scope.launch {
-            Commands.queueTracks(tracks, replace).onFailure { SyncHolder.say(it.message) }
+        inRoom {
+            scope.launch {
+                Commands.queueTracks(tracks, replace).onFailure { SyncHolder.say(it.message) }
+            }
         }
     }
 
@@ -190,19 +196,21 @@ private class Room(
     }
 
     fun load(kind: String, value: String, replace: Boolean) {
-        scope.launch {
-            Commands.queueFrom(kind, value, replace)
-                .onSuccess { count ->
-                    SyncHolder.say(
-                        when {
-                            kind == "wave" && replace -> "волна включена"
-                            kind == "wave" -> "волна продолжит очередь"
-                            replace -> "играю: ${tracksWord(count)}"
-                            else -> "добавлено в очередь: ${tracksWord(count)}"
-                        },
-                    )
-                }
-                .onFailure { SyncHolder.say(it.message) }
+        inRoom {
+            scope.launch {
+                Commands.queueFrom(kind, value, replace)
+                    .onSuccess { count ->
+                        SyncHolder.say(
+                            when {
+                                kind == "wave" && replace -> "волна включена"
+                                kind == "wave" -> "волна продолжит очередь"
+                                replace -> "играю: ${tracksWord(count)}"
+                                else -> "добавлено в очередь: ${tracksWord(count)}"
+                            },
+                        )
+                    }
+                    .onFailure { SyncHolder.say(it.message) }
+            }
         }
     }
 }
@@ -218,6 +226,9 @@ private fun App(settings: Settings) {
 
     var screen by rememberSaveable { mutableStateOf(if (running) Screen.HOME else Screen.ROOM) }
     var playerOpen by rememberSaveable { mutableStateOf(false) }
+    // Lifted out of the collection page so the home tiles can open a given view
+    // of it: «Мне нравится» is a tile there and a tab here.
+    var libraryTab by rememberSaveable { mutableStateOf(LibraryTab.ALL) }
     var library by remember { mutableStateOf<Library?>(null) }
     var likes by remember { mutableStateOf<Likes?>(null) }
 
@@ -255,7 +266,50 @@ private fun App(settings: Settings) {
         }
     }
 
-    val room = Room(snapshot, running, likes?.ids ?: emptySet(), scope)
+    // What was asked for before there was a room to ask it of. Held until the
+    // room is up, then run once — pressing «Моя волна» outside a room should
+    // start the wave, not just a room with nothing playing in it.
+    var pending by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var raising by remember { mutableStateOf(false) }
+
+    LaunchedEffect(running) {
+        if (running) {
+            raising = false
+            pending?.invoke()
+            pending = null
+        }
+    }
+
+    // A room that never comes up — a busy port, a refused token — must not leave
+    // a press waiting for it forever.
+    LaunchedEffect(pending, running) {
+        if (pending != null && !running) {
+            delay(30_000)
+            if (!running) {
+                pending = null
+                raising = false
+            }
+        }
+    }
+
+    // A room comes up with whatever this phone has: a name and a password are
+    // filled in when blank, and a Yandex token is not needed at all — without one
+    // the room plays what is downloaded here and what the other devices offer.
+    val inRoom: (() -> Unit) -> Unit = { action ->
+        if (running) {
+            action()
+        } else {
+            pending = action
+            if (!raising) {
+                raising = true
+                settings.prepareForSolo()
+                SyncHolder.say("поднимаю комнату на этом телефоне…")
+                SyncService.start(context, settings.configJson(host = true), true)
+            }
+        }
+    }
+
+    val room = Room(snapshot, running, likes?.ids ?: emptySet(), scope, inRoom)
 
     BackHandler(enabled = playerOpen) { playerOpen = false }
 
@@ -282,11 +336,29 @@ private fun App(settings: Settings) {
                         room = room,
                         library = library,
                         likes = likes,
-                        onOpen = { screen = it },
+                        onRoom = { screen = Screen.ROOM },
+                        // A tile opens its view of the collection. Playing is the
+                        // round button there, not the tile: the tile is a way in
+                        // to the list, the way a playlist card is anywhere else.
+                        onCollection = { tab ->
+                            libraryTab = tab
+                            screen = Screen.LIBRARY
+                            // The lists live in the core, so they need a room to
+                            // be read at all — raise one while the page opens.
+                            room.inRoom {}
+                        },
                     )
 
                     Screen.QUEUE -> QueueScreen(room)
-                    Screen.LIBRARY -> LibraryScreen(room, library, likes) { library = it }
+                    Screen.LIBRARY -> LibraryScreen(
+                        room = room,
+                        library = library,
+                        likes = likes,
+                        tab = libraryTab,
+                        onTab = { libraryTab = it },
+                        raising = raising,
+                        onChanged = { library = it },
+                    )
                     Screen.ROOM -> RoomScreen(settings, snapshot, running) { host ->
                         val absent = settings.missing
                         if (absent.isEmpty()) {
@@ -378,7 +450,8 @@ private fun HomeScreen(
     room: Room,
     library: Library?,
     likes: Likes?,
-    onOpen: (Screen) -> Unit,
+    onRoom: () -> Unit,
+    onCollection: (LibraryTab) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
@@ -387,13 +460,16 @@ private fun HomeScreen(
 
     fun search() {
         if (query.isBlank()) return
-        room.scope.launch {
-            Commands.search(query)
-                .onSuccess {
-                    results = it
-                    if (it.isEmpty()) SyncHolder.say("ничего не найдено")
-                }
-                .onFailure { error -> SyncHolder.say(error.message) }
+        // Searching goes through the core, so it needs a room like everything else.
+        room.inRoom {
+            room.scope.launch {
+                Commands.search(query)
+                    .onSuccess {
+                        results = it
+                        if (it.isEmpty()) SyncHolder.say("ничего не найдено")
+                    }
+                    .onFailure { error -> SyncHolder.say(error.message) }
+            }
         }
     }
 
@@ -414,7 +490,7 @@ private fun HomeScreen(
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Spacer(Modifier.height(4.dp))
-                    PrimaryButton("Войти в комнату") { onOpen(Screen.ROOM) }
+                    PrimaryButton("Войти в комнату") { onRoom() }
                 }
             }
         }
@@ -423,7 +499,7 @@ private fun HomeScreen(
             SearchField(
                 value = query,
                 onValue = { query = it },
-                enabled = room.canDrive,
+                enabled = true,
                 onSearch = ::search,
             )
         }
@@ -441,7 +517,8 @@ private fun HomeScreen(
 
         item {
             WaveHero(
-                enabled = room.canDrive,
+                // Not gated on being in a room: pressing it raises one here.
+                enabled = true,
                 playing = room.snapshot?.playing == true,
                 station = room.snapshot?.station,
                 feeding = room.snapshot?.feeding == true,
@@ -457,17 +534,15 @@ private fun HomeScreen(
                     meta = likes?.tracks?.size?.let { if (it > 0) tracksWord(it) else "пока пусто" } ?: "—",
                     art = LikesGradient,
                     icon = AppIcons.Heart,
-                    enabled = room.canDrive,
                     modifier = Modifier.weight(1f),
-                ) { room.load("likes", "", replace = true) }
+                ) { onCollection(LibraryTab.LIKES) }
                 Tile(
                     title = "Скачанное",
                     meta = library?.tracks?.size?.let { if (it > 0) tracksWord(it) else "пока пусто" } ?: "—",
                     art = OfflineGradient,
                     icon = AppIcons.Download,
-                    enabled = true,
                     modifier = Modifier.weight(1f),
-                ) { onOpen(Screen.LIBRARY) }
+                ) { onCollection(LibraryTab.ALL) }
             }
         }
 
@@ -477,7 +552,7 @@ private fun HomeScreen(
                 onKind = { kind = it },
                 value = source,
                 onValue = { source = it },
-                enabled = room.canDrive,
+                enabled = true,
                 onLoad = { replace -> room.load(kind, source, replace) },
             )
         }
@@ -608,8 +683,8 @@ private fun Tile(
     meta: String,
     art: Brush,
     icon: ImageVector,
-    enabled: Boolean,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     // Art above the text rather than beside it: two tiles share a phone's width,
@@ -840,9 +915,12 @@ private fun LibraryScreen(
     room: Room,
     library: Library?,
     likes: Likes?,
+    tab: LibraryTab,
+    onTab: (LibraryTab) -> Unit,
+    /// A room is coming up for these lists; they are read from the core.
+    raising: Boolean,
     onChanged: (Library?) -> Unit,
 ) {
-    var tab by rememberSaveable { mutableStateOf(LibraryTab.ALL) }
     val downloaded = library?.tracks ?: emptyList()
     val likedTracks = likes?.tracks ?: emptyList()
     val shown: List<TrackInfo> = when (tab) {
@@ -915,6 +993,7 @@ private fun LibraryScreen(
                 GhostButton("В очередь", AppIcons.Add, enabled = room.canDrive && shown.isNotEmpty()) {
                     room.enqueue(shown)
                 }
+                ImportButton(room, onChanged)
                 // Only «Мне нравится» has anything to re-read: the other two views
                 // are this disk, and the core watches that.
                 if (tab == LibraryTab.LIKES) {
@@ -935,13 +1014,21 @@ private fun LibraryScreen(
                     .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
                 for (option in LibraryTab.entries) {
-                    Chip(option.label, selected = tab == option) { tab = option }
+                    Chip(option.label, selected = tab == option) { onTab(option) }
                 }
             }
         }
 
         if (!room.running) {
-            item { Empty("Коллекция откроется, когда вы войдёте в комнату") }
+            item {
+                Empty(
+                    if (raising) {
+                        "поднимаю комнату на этом телефоне…"
+                    } else {
+                        "Коллекция откроется, когда вы войдёте в комнату"
+                    },
+                )
+            }
             return@LazyColumn
         }
 
@@ -1003,6 +1090,69 @@ private fun LazyListScope.albums(
     if (downloaded.any { it.track.album == null }) {
         item { Empty("у части треков название альбома ещё не загружено — нужен интернет") }
     }
+}
+
+/// Adds files from the phone to the downloads.
+///
+/// The system picker hands back content URIs, which only this app may open, so the
+/// bytes are read here and passed to the core. It cannot open what the Yandex
+/// Music app downloaded: that app keeps its offline tracks encrypted.
+@Composable
+private fun ImportButton(room: Room, onChanged: (Library?) -> Unit) {
+    val context = LocalContext.current
+    var working by remember { mutableStateOf(false) }
+
+    val pick = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        working = true
+        room.inRoom {
+            room.scope.launch {
+                var added = 0
+                var failed = 0
+                for (uri in uris) {
+                    val name = displayName(context, uri)
+                    val data = withContext(Dispatchers.IO) {
+                        runCatching {
+                            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        }.getOrNull()
+                    }
+                    if (data == null) {
+                        failed++
+                        continue
+                    }
+                    Commands.importTrack(name, data)
+                        .onSuccess { added++ }
+                        .onFailure { failed++ }
+                }
+                onChanged(Commands.library().getOrNull())
+                working = false
+                SyncHolder.say(
+                    buildString {
+                        append("добавлено: $added")
+                        if (failed > 0) append(" · не вышло: $failed")
+                    },
+                )
+            }
+        }
+    }
+
+    IconButton(
+        onClick = { pick.launch(arrayOf("audio/*")) },
+        enabled = !working,
+    ) {
+        Icon(AppIcons.Add, "добавить файлы с телефона", tint = Color.White)
+    }
+}
+
+/// The file's own name, for when its tags have none.
+private fun displayName(context: android.content.Context, uri: android.net.Uri): String {
+    val projection = arrayOf(android.provider.OpenableColumns.DISPLAY_NAME)
+    context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst() && !cursor.isNull(0)) return cursor.getString(0)
+    }
+    return uri.lastPathSegment ?: "файл"
 }
 
 /// A downloaded track: plays off the disk, can be hearted, and carries the delete

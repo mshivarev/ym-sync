@@ -97,7 +97,8 @@ pub fn open_likes(cache: &Cache) -> Arc<Likes> {
 /// Brings up hosting, sharing and the engine.
 pub async fn start(
     cfg: &Config,
-    api: Arc<YandexMusic>,
+    // `None` when this device has no Yandex token; see `engine::Wiring::api`.
+    api: Option<Arc<YandexMusic>>,
     player: Arc<dyn Playback>,
     cache: Arc<Cache>,
     likes: Arc<Likes>,
