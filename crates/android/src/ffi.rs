@@ -9,6 +9,7 @@
 //!     external fun snapshot(handle: Long): String
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
+//!     external fun suggest(handle: Long, part: String): String
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
@@ -153,6 +154,27 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_search(
             None => failed("сессия не запущена"),
             Some(session) => match session.search(&query, limit.max(1) as usize) {
                 Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// What to offer while the listener is still typing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_suggest(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    part: JString,
+) -> jstring {
+    let text = match read(&mut env, &part) {
+        Err(err) => failed(err),
+        Ok(part) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.suggest(&part) {
+                Ok(value) => ok(value),
                 Err(err) => failed(err),
             },
         },

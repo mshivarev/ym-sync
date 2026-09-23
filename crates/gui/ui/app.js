@@ -31,6 +31,8 @@ const ui = {
   offlineTile: el("offline-tile"),
   offlineTileMeta: el("offline-tile-meta"),
   query: el("query"),
+  clearQuery: el("clear-query"),
+  suggest: el("suggest"),
   find: el("find"),
   results: el("results"),
   queue: el("queue"),
@@ -81,6 +83,15 @@ const PLACEHOLDERS = {
   track: "38633712 или ссылка на трек",
 };
 
+/// How much has to be typed before the search runs by itself. Below this, only
+/// Enter searches: two letters match half the catalogue and every keystroke would
+/// be a wasted request.
+const LIVE_SEARCH_FROM = 3;
+
+/// How long to wait after the last keystroke before asking. Long enough that
+/// typing a word is one request rather than six, short enough not to feel slow.
+const TYPING_PAUSE_MS = 180;
+
 /// Sources that are whole collections of their own: nothing to type in.
 const SELF_CONTAINED = new Set(["wave", "likes"]);
 
@@ -101,6 +112,13 @@ let queueKey = "";
 let dragging = false;
 let toastTimer = null;
 let volumeTimer = null;
+let typingTimer = null;
+/// Answers that arrive out of order must not overwrite a newer query's: each
+/// request carries the number of the keystroke it belongs to.
+let searchToken = 0;
+let suggestToken = 0;
+/// Which line of the dropdown the arrow keys are on; -1 is the field itself.
+let suggestIndex = -1;
 /// Which source the «по ссылке» card loads from.
 let kind = "search";
 /// This device's downloads, and where they live. Known before connecting.
@@ -274,6 +292,116 @@ async function withRoom(action) {
 function queueTracks(tracks, replace = false) {
   if (!tracks.length) return;
   return withRoom(() => call("queue_tracks", { tracks, start: 0, replace }));
+}
+
+// ---------- search ----------
+
+function hideSuggest() {
+  ui.suggest.classList.add("hidden");
+  ui.suggest.replaceChildren();
+  ui.query.setAttribute("aria-expanded", "false");
+  suggestIndex = -1;
+}
+
+/// The dropdown Yandex draws while you type: its best guess, then the queries.
+function renderSuggest(found) {
+  const rows = [];
+
+  if (found.best) {
+    const best = found.best;
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "suggest-best";
+    row.dataset.query = best.query;
+
+    const art = document.createElement("span");
+    art.className = best.kind === "artist" ? "art round" : "art";
+    fillCover(art, best, 100);
+
+    const text = document.createElement("span");
+    text.className = "meta";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = best.name;
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = best.subtitle
+      ? `${KINDS[best.kind] ?? best.kind} · ${best.subtitle}`
+      : (KINDS[best.kind] ?? best.kind);
+    text.append(name, kind);
+
+    row.append(art, text);
+    rows.push(row);
+    if (found.suggestions.length) rows.push(document.createElement("hr"));
+  }
+
+  for (const line of found.suggestions) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "suggest-line";
+    row.dataset.query = line;
+    const text = document.createElement("span");
+    text.textContent = line;
+    row.append(icon("i-search"), text);
+    rows.push(row);
+  }
+
+  if (!rows.length) {
+    hideSuggest();
+    return;
+  }
+  ui.suggest.replaceChildren(...rows);
+  ui.suggest.classList.remove("hidden");
+  ui.query.setAttribute("aria-expanded", "true");
+  suggestIndex = -1;
+}
+
+/// What the row under the name says.
+const KINDS = { artist: "исполнитель", album: "альбом", track: "трек" };
+
+/** Runs the search itself. `token` guards against a stale answer landing late. */
+async function runSearch(query, token) {
+  const found = await call("search", { query, limit: 30 });
+  if (token !== searchToken || !found) return;
+  results = found;
+  renderResults();
+  return found;
+}
+
+/// Everything that happens on a keystroke: the dropdown, and — once there is
+/// enough typed — the search itself.
+function onTyping() {
+  const query = ui.query.value.trim();
+  ui.clearQuery.classList.toggle("hidden", !ui.query.value);
+  clearTimeout(typingTimer);
+
+  if (query.length < LIVE_SEARCH_FROM) {
+    // Not enough to go on: the dropdown closes and nothing is asked for. Enter
+    // still searches for whatever is typed.
+    hideSuggest();
+    return;
+  }
+
+  typingTimer = setTimeout(async () => {
+    const mine = ++suggestToken;
+    const search = ++searchToken;
+    runSearch(query, search);
+
+    const found = await call("suggest", { part: query });
+    // Another keystroke has already been sent: that answer is the current one.
+    if (mine !== suggestToken || !found) return;
+    if (document.activeElement === ui.query) renderSuggest(found);
+  }, TYPING_PAUSE_MS);
+}
+
+/** Searches for exactly this, from Enter or from a line of the dropdown. */
+function searchFor(query) {
+  if (!query) return;
+  ui.query.value = query;
+  ui.clearQuery.classList.remove("hidden");
+  clearTimeout(typingTimer);
+  hideSuggest();
+  runSearch(query, ++searchToken);
 }
 
 // ---------- navigation ----------
@@ -1005,20 +1133,69 @@ ui.find.addEventListener("click", async () => {
   const query = ui.query.value.trim();
   if (!query) return;
   ui.find.disabled = true;
-  const found = await call("search", { query, limit: 30 });
+  clearTimeout(typingTimer);
+  hideSuggest();
+  const found = await runSearch(query, ++searchToken);
   ui.find.disabled = false;
-  if (found) {
-    results = found;
-    renderResults();
-    if (found.length === 0) toast("ничего не найдено");
-  }
+  if (found && found.length === 0) toast("ничего не найдено");
+});
+
+ui.query.addEventListener("input", onTyping);
+ui.query.addEventListener("focus", onTyping);
+ui.clearQuery.addEventListener("click", () => {
+  ui.query.value = "";
+  ui.clearQuery.classList.add("hidden");
+  hideSuggest();
+  ui.query.focus();
+});
+
+// A press picks that line; the field keeps what was chosen, as Yandex does.
+ui.suggest.addEventListener("mousedown", (event) => {
+  // Before `blur`, or the dropdown would be gone by the time the click lands.
+  const row = event.target.closest("[data-query]");
+  if (!row) return;
+  event.preventDefault();
+  searchFor(row.dataset.query);
+});
+
+// Leaving the field closes the dropdown, but not before a click on it is seen.
+ui.query.addEventListener("blur", () => setTimeout(hideSuggest, 120));
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".search")) hideSuggest();
 });
 
 ui.source.addEventListener("keydown", (event) => {
   if (event.key === "Enter") ui.load.click();
 });
+/// The keyboard in the dropdown: arrows walk the lines, Enter takes one, Escape
+/// closes it. With nothing highlighted, Enter searches for what was typed — which
+/// is the only way to search at all below [`LIVE_SEARCH_FROM`] characters.
 ui.query.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") ui.find.click();
+  const rows = [...ui.suggest.querySelectorAll("[data-query]")];
+  const open = !ui.suggest.classList.contains("hidden") && rows.length > 0;
+
+  if (event.key === "Escape") {
+    hideSuggest();
+    return;
+  }
+
+  if (open && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault();
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    suggestIndex = (suggestIndex + step + rows.length + 1) % (rows.length + 1) - 1;
+    rows.forEach((row, index) => row.classList.toggle("current", index === suggestIndex));
+    if (suggestIndex >= 0) rows[suggestIndex].scrollIntoView({ block: "nearest" });
+    return;
+  }
+
+  if (event.key === "Enter") {
+    if (open && suggestIndex >= 0) {
+      searchFor(rows[suggestIndex].dataset.query);
+      return;
+    }
+    ui.find.click();
+  }
 });
 
 ui.toggle.addEventListener("click", () => call("control", { action: "toggle" }));

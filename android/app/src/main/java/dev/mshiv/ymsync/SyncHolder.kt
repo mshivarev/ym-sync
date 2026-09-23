@@ -130,6 +130,23 @@ object Commands {
     }
 
     /**
+     * What to offer while the listener is typing.
+     *
+     * Failures are answered with an empty list rather than reported: a dropdown
+     * that did not appear is not worth a message over the player.
+     */
+    suspend fun suggest(part: String): Suggest {
+        val handle = SyncHolder.handle
+        val empty = Suggest(best = null, suggestions = emptyList())
+        if (handle == 0L) return empty
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.suggest(handle, part)) }
+        return when (reply) {
+            is NativeResult.Failed -> empty
+            is NativeResult.Ok -> reply.value.toSuggest()
+        }
+    }
+
+    /**
      * Adds a local audio file to the downloads on this device.
      *
      * Answers with what to tell the user: the track's name, or that it was already

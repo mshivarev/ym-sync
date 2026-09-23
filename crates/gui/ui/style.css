@@ -525,6 +525,102 @@ h2 {
   color: var(--faint);
 }
 
+/* The field and its dropdown are one unit: the list hangs off the field rather
+   than pushing the page around. */
+.search {
+  position: relative;
+  z-index: 5;
+}
+
+.suggest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: 16px;
+  background: var(--surface-2);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
+}
+
+.suggest-best {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px;
+  border-radius: 12px;
+  text-align: left;
+}
+
+.suggest-best .art {
+  width: 40px;
+  height: 40px;
+}
+
+/* An artist is a face, an album is a cover: the shape says which. */
+.suggest-best .art.round {
+  border-radius: 50%;
+}
+
+.suggest-best .name {
+  font-weight: 600;
+}
+
+.suggest-best .kind {
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.suggest hr {
+  height: 1px;
+  margin: 6px 8px;
+  border: 0;
+  background: var(--line);
+}
+
+.suggest-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  text-align: left;
+  color: var(--text);
+}
+
+.suggest-line .i {
+  width: 16px;
+  height: 16px;
+  color: var(--faint);
+  flex: none;
+}
+
+.suggest-line span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suggest-best:hover,
+.suggest-line:hover,
+.suggest .current {
+  background: rgb(255 255 255 / 8%);
+}
+
+.icon-btn.small {
+  width: 32px;
+  height: 32px;
+}
+
+.icon-btn.small .i {
+  width: 18px;
+  height: 18px;
+}
+
 /* «Моя волна»: a slow, blurred blob, as in the Yandex app. Purely decorative —
    the animation stops when the window does not want motion. */
 .hero {

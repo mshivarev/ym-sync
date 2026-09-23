@@ -447,6 +447,21 @@ async fn find_rooms(wait: u64) -> Result<Vec<FoundRoom>, String> {
     discover::find_rooms(wait).await.map_err(fail)
 }
 
+/// What to offer while the listener is still typing.
+///
+/// Yandex's own suggest endpoint, which is what its apps draw their dropdown
+/// from. Cheap enough for a keystroke, unlike a full search — and it needs no
+/// room, only a token.
+#[tauri::command]
+async fn suggest(part: String, state: State<'_, AppState>) -> Result<api::Suggest, String> {
+    let part = part.trim().to_string();
+    if part.is_empty() {
+        return Ok(api::Suggest::default());
+    }
+    let api = state.api().await?;
+    api.suggest(&part).await.map_err(fail)
+}
+
 /// Adds local audio files to this device's downloads.
 ///
 /// Opens the system's file picker and imports whatever comes back: the tracks
@@ -641,6 +656,7 @@ fn main() {
             disconnect,
             snapshot,
             search,
+            suggest,
             play_source,
             queue_tracks,
             control,

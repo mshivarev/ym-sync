@@ -74,10 +74,19 @@
 
     <!-- Home: the ways to start music. -->
     <section class="view" data-view="home">
-      <div class="searchbar">
-        <svg class="i"><use href="#i-search" /></svg>
-        <input id="query" placeholder="Трек, альбом, исполнитель" autocomplete="off" />
-        <button id="find" class="pill">Найти</button>
+      <!-- The field and the dropdown Yandex draws under it: a best guess at the
+           top, then the queries to try. -->
+      <div class="search">
+        <div class="searchbar">
+          <svg class="i"><use href="#i-search" /></svg>
+          <input id="query" placeholder="Трек, альбом, исполнитель" autocomplete="off"
+            role="combobox" aria-expanded="false" aria-controls="suggest" />
+          <button id="clear-query" class="icon-btn small hidden" title="очистить">
+            <svg class="i"><use href="#i-close" /></svg>
+          </button>
+          <button id="find" class="pill">Найти</button>
+        </div>
+        <div id="suggest" class="suggest hidden" role="listbox"></div>
       </div>
 
       <div class="hero" id="hero">

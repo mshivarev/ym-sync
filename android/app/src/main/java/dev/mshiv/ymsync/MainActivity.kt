@@ -127,6 +127,15 @@ private val LikesGradient = Brush.linearGradient(listOf(Color(0xFFFF5A6E), Color
 private val OfflineGradient = Brush.linearGradient(listOf(Color(0xFF3A7BFF), Color(0xFF2439A8)))
 private val AlbumsGradient = Brush.linearGradient(listOf(Color(0xFFFFB800), Color(0xFFD9480F)))
 
+/// How much has to be typed before the search runs by itself. Below this, only
+/// the keyboard's search key searches: two letters match half the catalogue, and
+/// every keystroke would be a wasted request.
+private const val LIVE_SEARCH_FROM = 3
+
+/// How long to wait after the last keystroke before asking. Long enough that
+/// typing a word is one request rather than six, short enough not to feel slow.
+private const val TYPING_PAUSE_MS = 180L
+
 /// Sources that are a whole collection in themselves, with nothing to type in.
 private val SELF_CONTAINED = setOf("wave", "likes", "offline")
 
@@ -455,15 +464,17 @@ private fun HomeScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
+    var suggest by remember { mutableStateOf<Suggest?>(null) }
     var kind by rememberSaveable { mutableStateOf("album") }
     var source by rememberSaveable { mutableStateOf("") }
 
-    fun search() {
-        if (query.isBlank()) return
+    fun search(text: String = query) {
+        if (text.isBlank()) return
+        suggest = null
         // Searching goes through the core, so it needs a room like everything else.
         room.inRoom {
             room.scope.launch {
-                Commands.search(query)
+                Commands.search(text)
                     .onSuccess {
                         results = it
                         if (it.isEmpty()) SyncHolder.say("ничего не найдено")
@@ -471,6 +482,23 @@ private fun HomeScreen(
                     .onFailure { error -> SyncHolder.say(error.message) }
             }
         }
+    }
+
+    // Restarted on every keystroke, which is what makes the pause a pause: the
+    // previous run is cancelled before it asks for anything. Below
+    // [LIVE_SEARCH_FROM] characters nothing is asked at all — the search key on
+    // the keyboard still works.
+    LaunchedEffect(query) {
+        val typed = query.trim()
+        if (typed.length < LIVE_SEARCH_FROM) {
+            suggest = null
+            return@LaunchedEffect
+        }
+        delay(TYPING_PAUSE_MS)
+        search(typed)
+        // Suggestions are decoration, so unlike the search they do not raise a
+        // room of their own: they appear once there is one.
+        suggest = Commands.suggest(typed).takeIf { !it.isEmpty }
     }
 
     LazyColumn(
@@ -500,8 +528,23 @@ private fun HomeScreen(
                 value = query,
                 onValue = { query = it },
                 enabled = true,
-                onSearch = ::search,
+                onClear = { query = ""; suggest = null; results = emptyList() },
+                onSearch = { search() },
             )
+        }
+
+        // The dropdown Yandex draws while you type: its best guess, then the
+        // queries to try. Part of the page rather than a floating panel — on a
+        // phone there is nothing to float over.
+        suggest?.let { found ->
+            found.best?.let { best ->
+                item(key = "best") {
+                    SuggestBest(best) { query = best.query; search(best.query) }
+                }
+            }
+            items(found.suggestions, key = { "s$it" }) { line ->
+                SuggestLine(line) { query = line; search(line) }
+            }
         }
 
         if (results.isNotEmpty()) {
@@ -721,8 +764,62 @@ private fun Tile(
     }
 }
 
+/// The row at the top of the dropdown: a picture, a name and what it is.
 @Composable
-private fun SearchField(value: String, onValue: (String) -> Unit, enabled: Boolean, onSearch: () -> Unit) {
+private fun SuggestBest(best: BestMatch, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(8.dp),
+    ) {
+        CoverArt(
+            url = best.coverUrl(100),
+            size = 48.dp,
+            // An artist is a face, an album is a cover: the shape says which.
+            corner = if (best.kind == "artist") 24.dp else 8.dp,
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(best.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                if (best.subtitle.isEmpty()) best.kindLabel else "${best.kindLabel} · ${best.subtitle}",
+                color = Dim,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/// One suggested query.
+@Composable
+private fun SuggestLine(line: String, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 10.dp),
+    ) {
+        Icon(AppIcons.Search, null, tint = Dim, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Text(line, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun SearchField(
+    value: String,
+    onValue: (String) -> Unit,
+    enabled: Boolean,
+    onClear: () -> Unit,
+    onSearch: () -> Unit,
+) {
     TextField(
         value = value,
         onValueChange = onValue,
@@ -731,8 +828,10 @@ private fun SearchField(value: String, onValue: (String) -> Unit, enabled: Boole
         placeholder = { Text("Трек, альбом, исполнитель", color = Dim) },
         leadingIcon = { Icon(AppIcons.Search, null, tint = Dim) },
         trailingIcon = {
-            if (value.isNotBlank()) {
-                TextButton(onClick = onSearch, enabled = enabled) { Text("Найти", color = Accent) }
+            if (value.isNotEmpty()) {
+                IconButton(onClick = onClear) {
+                    Icon(AppIcons.Close, "очистить", tint = Dim, modifier = Modifier.size(20.dp))
+                }
             }
         },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -1904,7 +2003,21 @@ private fun CoverBox(
     pixels: Int = 200,
     overlay: @Composable BoxScope.() -> Unit = {},
 ) {
-    val cover = rememberCover(track, pixels)
+    CoverArt(track?.coverUrl(pixels), modifier, size, corner, overlay)
+}
+
+/// A cover box drawn from an address rather than from a track: the search
+/// dropdown's best match has one of its own.
+@Composable
+private fun CoverArt(
+    url: String?,
+    modifier: Modifier = Modifier,
+    size: Dp? = null,
+    corner: Dp = 8.dp,
+    overlay: @Composable BoxScope.() -> Unit = {},
+) {
+    val cover by produceState(Covers.peek(url), url) { value = url?.let { Covers.load(it) } }
+    val image = cover?.image
     Box(
         modifier = modifier
             .then(if (size != null) Modifier.size(size) else Modifier)
@@ -1912,9 +2025,9 @@ private fun CoverBox(
             .background(Surface3),
         contentAlignment = Alignment.Center,
     ) {
-        if (cover != null) {
+        if (image != null) {
             Image(
-                bitmap = cover.image,
+                bitmap = image,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),

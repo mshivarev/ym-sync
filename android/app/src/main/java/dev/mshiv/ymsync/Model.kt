@@ -20,11 +20,7 @@ data class TrackInfo(
      * The cover at [size]×[size] pixels, or null when the core has none — a track
      * downloaded before covers were stored, or one that came from another peer.
      */
-    fun coverUrl(size: Int): String? {
-        val uri = coverUri?.takeIf { it.isNotBlank() } ?: return null
-        val sized = uri.replace("%%", "${size}x$size")
-        return if (sized.startsWith("http")) sized else "https://$sized"
-    }
+    fun coverUrl(size: Int): String? = coverUrlOf(coverUri, size)
 
     /**
      * The shape `Native.queueTracks` takes: `ymsync_proto::TrackRef`.
@@ -44,6 +40,66 @@ data class TrackInfo(
                 coverUri?.let { put("cover_uri", it) }
             }
 }
+
+/**
+ * A cover address from Yandex's template, at the size being drawn.
+ *
+ * Null when there is none: a track downloaded before covers were stored, or one
+ * that came from another peer.
+ */
+fun coverUrlOf(uri: String?, size: Int): String? {
+    val template = uri?.takeIf { it.isNotBlank() } ?: return null
+    val sized = template.replace("%%", "${size}x$size")
+    return if (sized.startsWith("http")) sized else "https://$sized"
+}
+
+/** What the search dropdown draws while somebody is typing. */
+data class Suggest(
+    /** Yandex's best guess: an artist, an album or a track. */
+    val best: BestMatch?,
+    /** Queries to offer as plain lines, in Yandex's own order. */
+    val suggestions: List<String>,
+) {
+    val isEmpty: Boolean get() = best == null && suggestions.isEmpty()
+}
+
+data class BestMatch(
+    /** `artist`, `album` or `track`. */
+    val kind: String,
+    val name: String,
+    /** The artist under an album or a track; empty for an artist. */
+    val subtitle: String,
+    val coverUri: String?,
+    /** What to search for when the row is pressed. */
+    val query: String,
+) {
+    fun coverUrl(size: Int): String? = coverUrlOf(coverUri, size)
+
+    /** What the row says under the name. */
+    val kindLabel: String
+        get() = when (kind) {
+            "artist" -> "исполнитель"
+            "album" -> "альбом"
+            "track" -> "трек"
+            else -> kind
+        }
+}
+
+fun JSONObject.toSuggest(): Suggest =
+    Suggest(
+        best = optJSONObject("best")?.let { best ->
+            BestMatch(
+                kind = best.optString("kind"),
+                name = best.optString("name"),
+                subtitle = best.optString("subtitle"),
+                coverUri = if (best.isNull("cover_uri")) null else best.optString("cover_uri"),
+                query = best.optString("query"),
+            )
+        },
+        suggestions = optJSONArray("suggestions")
+            ?.let { array -> (0 until array.length()).mapNotNull { array.optString(it).ifBlank { null } } }
+            ?: emptyList(),
+    )
 
 /** A list of tracks as the core expects it. */
 fun List<TrackInfo>.toJsonArray(): JSONArray =

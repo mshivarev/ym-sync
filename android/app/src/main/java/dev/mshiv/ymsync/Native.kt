@@ -29,6 +29,12 @@ object Native {
     external fun search(handle: Long, query: String, limit: Int): String
 
     /**
+     * What to offer while somebody is typing: Yandex's own suggest endpoint.
+     * Cheap enough for a keystroke, unlike a full search.
+     */
+    external fun suggest(handle: Long, part: String): String
+
+    /**
      * Queues tracks the screen already holds in full — a search result, a row of
      * the offline library. Costs no Yandex request, which is the point.
      */

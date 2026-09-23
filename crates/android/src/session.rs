@@ -220,6 +220,17 @@ impl Session {
         Ok(found.iter().map(Track::to_track_ref).collect())
     }
 
+    /// What to offer while the listener is still typing; see `api::suggest`.
+    pub fn suggest(&self, part: &str) -> Result<serde_json::Value> {
+        let part = part.trim();
+        if part.is_empty() {
+            return Ok(serde_json::json!({ "suggestions": [] }));
+        }
+        let api = self.api()?;
+        let found = self.runtime.block_on(api.suggest(part))?;
+        Ok(serde_json::to_value(found)?)
+    }
+
     /// Queues tracks the screen already holds in full.
     ///
     /// This is how a row is played: a search result and a downloaded track both

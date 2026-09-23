@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use md5::{Digest, Md5};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use ymsync_proto::TrackRef;
 
@@ -104,6 +104,25 @@ impl YandexMusic {
         let mut tracks = found.tracks.map(|t| t.results).unwrap_or_default();
         tracks.truncate(limit);
         Ok(tracks)
+    }
+
+    /// What to offer while somebody is still typing.
+    ///
+    /// This is Yandex's own suggest endpoint, the one its apps draw the dropdown
+    /// from: a best guess at what is meant, plus the queries other people went on
+    /// to search for. It is a different thing from [`Self::search_tracks`], which
+    /// costs a full search — hence a separate call made on every keystroke.
+    pub async fn suggest(&self, part: &str) -> Result<Suggest> {
+        let raw: SuggestResponse = self.get_result("/search/suggest", &[("part", part)]).await?;
+        Ok(Suggest {
+            best: raw.best.and_then(BestMatch::from_raw),
+            suggestions: raw
+                .suggestions
+                .into_iter()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+        })
     }
 
     pub async fn track(&self, track_id: &str) -> Result<Track> {
@@ -436,6 +455,111 @@ impl std::fmt::Display for TokenRejected {
 }
 
 impl std::error::Error for TokenRejected {}
+
+/// What the suggest dropdown draws.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Suggest {
+    /// Yandex's best guess: an artist, an album or a track.
+    pub best: Option<BestMatch>,
+    /// Queries to offer as plain lines, in Yandex's own order.
+    pub suggestions: Vec<String>,
+}
+
+/// The row at the top of the dropdown, with a picture and what it is.
+#[derive(Debug, Clone, Serialize)]
+pub struct BestMatch {
+    /// `artist`, `album` or `track`. What the row says under the name.
+    pub kind: String,
+    pub name: String,
+    /// The artist under an album or a track; empty for an artist.
+    pub subtitle: String,
+    /// The same template as a track's, so every screen asks for its own size.
+    pub cover_uri: Option<String>,
+    /// What to search for when the row is pressed.
+    pub query: String,
+}
+
+impl BestMatch {
+    /// Yandex packs a different object per `type`; only the three that can be
+    /// turned into something to look at are taken.
+    fn from_raw(raw: RawBest) -> Option<Self> {
+        let result = raw.result?;
+        let artists = || {
+            result
+                .artists
+                .iter()
+                .map(|artist| artist.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (name, subtitle) = match raw.kind.as_str() {
+            "artist" => (result.name.clone()?, String::new()),
+            "album" => (result.title.clone()?, artists()),
+            "track" => (result.title.clone()?, artists()),
+            // Playlists, podcasts and whatever else Yandex adds later: the plain
+            // suggestion lines below still cover them.
+            _ => return None,
+        };
+        let cover_uri = result
+            .cover
+            .and_then(|cover| cover.uri)
+            .or(result.og_image)
+            .or_else(|| result.albums.first().and_then(|album| album.cover_uri.clone()))
+            .filter(|uri| !uri.trim().is_empty());
+        Some(Self {
+            query: if subtitle.is_empty() {
+                name.clone()
+            } else {
+                format!("{subtitle} {name}")
+            },
+            kind: raw.kind,
+            name,
+            subtitle,
+            cover_uri,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestResponse {
+    #[serde(default)]
+    best: Option<RawBest>,
+    #[serde(default)]
+    suggestions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBest {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    result: Option<RawBestResult>,
+}
+
+/// One shape for all three kinds: an artist has a name, an album and a track a
+/// title, and each carries its picture somewhere else again.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBestResult {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    artists: Vec<Artist>,
+    #[serde(default)]
+    albums: Vec<Album>,
+    #[serde(default)]
+    cover: Option<RawCover>,
+    #[serde(default)]
+    og_image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCover {
+    #[serde(default)]
+    uri: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
@@ -825,6 +949,39 @@ mod tests {
     fn ids_decode_from_strings_and_numbers() {
         assert_eq!(serde_json::from_str::<Id>("\"123\"").unwrap(), Id("123".into()));
         assert_eq!(serde_json::from_str::<Id>("123").unwrap(), Id("123".into()));
+    }
+
+    #[test]
+    fn suggest_reads_the_best_match_of_each_kind() {
+        let artist: SuggestResponse = serde_json::from_str(
+            r#"{"best": {"type": "artist", "result": {"name": "Мельница",
+                "cover": {"uri": "avatars.yandex.net/a/%%"}}},
+                "suggestions": ["мельница", "мельница - дороги", ""]}"#,
+        )
+        .unwrap();
+        let best = BestMatch::from_raw(artist.best.unwrap()).unwrap();
+        assert_eq!(best.kind, "artist");
+        assert_eq!(best.name, "Мельница");
+        assert_eq!(best.subtitle, "");
+        assert_eq!(best.query, "Мельница");
+        assert_eq!(best.cover_uri.as_deref(), Some("avatars.yandex.net/a/%%"));
+
+        let album: SuggestResponse = serde_json::from_str(
+            r#"{"best": {"type": "album", "result": {"title": "Дикие травы",
+                "artists": [{"name": "Мельница"}], "ogImage": "avatars.yandex.net/b/%%"}}}"#,
+        )
+        .unwrap();
+        let best = BestMatch::from_raw(album.best.unwrap()).unwrap();
+        assert_eq!(best.subtitle, "Мельница");
+        // What pressing the row searches for: the artist and the title together.
+        assert_eq!(best.query, "Мельница Дикие травы");
+        assert_eq!(best.cover_uri.as_deref(), Some("avatars.yandex.net/b/%%"));
+
+        // A kind with nothing to draw is dropped; the plain lines remain.
+        let playlist: SuggestResponse =
+            serde_json::from_str(r#"{"best": {"type": "playlist", "result": {"title": "X"}}}"#)
+                .unwrap();
+        assert!(BestMatch::from_raw(playlist.best.unwrap()).is_none());
     }
 
     #[test]
