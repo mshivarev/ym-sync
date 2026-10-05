@@ -12,6 +12,10 @@
          desktop. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Updates come from GitHub Releases rather than a store, so the app hands the
+         APK it downloaded to the system installer. Android still asks the user
+         before installing, and refuses an APK signed with another key. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:allowBackup="false"
@@ -34,6 +38,18 @@
              The audio itself comes out of the Rust core; the service holds the
              media session Android draws the player in the shade from, along with
              the wake lock and the multicast lock. -->
+        <!-- Lets the system installer read the downloaded update out of this
+             app's cache, and nothing else. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
+
         <service
             android:name=".SyncService"
             android:exported="false"

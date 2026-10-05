@@ -241,6 +241,11 @@ private fun App(settings: Settings) {
     var library by remember { mutableStateOf<Library?>(null) }
     var likes by remember { mutableStateOf<Likes?>(null) }
 
+    // A newer release on GitHub, asked about once per launch. Null when there is
+    // none or GitHub could not be reached — either way nothing is shown.
+    var update by remember { mutableStateOf<Release?>(null) }
+    LaunchedEffect(Unit) { update = Updater.latest(context) }
+
     // A finished download changes the disk, and the cache revision is how the
     // core says so — cheaper than re-reading the list on every snapshot.
     LaunchedEffect(running, snapshot?.cacheRevision) {
@@ -349,6 +354,7 @@ private fun App(settings: Settings) {
                         room = room,
                         library = library,
                         likes = likes,
+                        update = update,
                         onRoom = { screen = Screen.ROOM },
                         // A tile opens its view of the collection. Playing is the
                         // round button there, not the tile: the tile is a way in
@@ -372,7 +378,13 @@ private fun App(settings: Settings) {
                         raising = raising,
                         onChanged = { library = it },
                     )
-                    Screen.ROOM -> RoomScreen(settings, snapshot, running) { host ->
+                    Screen.ROOM -> RoomScreen(
+                        settings,
+                        snapshot,
+                        running,
+                        update = update,
+                        onUpdate = { update = it },
+                    ) { host ->
                         val absent = settings.missing
                         if (absent.isEmpty()) {
                             SyncService.start(context, settings.configJson(host), host)
@@ -463,6 +475,7 @@ private fun HomeScreen(
     room: Room,
     library: Library?,
     likes: Likes?,
+    update: Release?,
     onRoom: () -> Unit,
     onCollection: (LibraryTab) -> Unit,
 ) {
@@ -511,6 +524,8 @@ private fun HomeScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item { Logo(room) }
+
+        update?.let { release -> item(key = "update") { UpdateCard(release) } }
 
         if (!room.running) {
             item {
@@ -1324,6 +1339,8 @@ private fun RoomScreen(
     settings: Settings,
     snapshot: Snapshot?,
     running: Boolean,
+    update: Release?,
+    onUpdate: (Release?) -> Unit,
     onEnter: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -1360,6 +1377,90 @@ private fun RoomScreen(
         }
 
         item { SettingsCard(settings) }
+
+        item { AboutCard(update, onUpdate) }
+    }
+}
+
+/// The installed version, and a way to ask GitHub for a newer one by hand — the
+/// check at launch is silent when it fails, so this is where to look when in doubt.
+@Composable
+private fun AboutCard(update: Release?, onUpdate: (Release?) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var checking by remember { mutableStateOf(false) }
+    var answer by remember { mutableStateOf<String?>(null) }
+
+    Card {
+        Text("О приложении", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        Text("ym-sync ${Updater.currentVersion(context)}", color = Dim)
+        if (update != null) {
+            UpdateCard(update)
+        } else {
+            GhostButton(if (checking) "Проверяю…" else "Проверить обновления", AppIcons.Refresh, enabled = !checking) {
+                checking = true
+                scope.launch {
+                    val found = Updater.latest(context)
+                    onUpdate(found)
+                    answer = if (found == null) "это последняя версия — или GitHub сейчас недоступен" else null
+                    checking = false
+                }
+            }
+            answer?.let { Hint(it) }
+        }
+    }
+}
+
+/// A newer release: download it, then hand it to the system installer.
+///
+/// Kept here rather than started on its own: installing always asks the user, and
+/// the first time also needs permission to install from this app, so the press
+/// that starts it may need repeating after a trip to settings.
+@Composable
+private fun UpdateCard(release: Release) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var progress by remember { mutableStateOf<Float?>(null) }
+    var downloaded by remember { mutableStateOf<java.io.File?>(null) }
+    var problem by remember { mutableStateOf<String?>(null) }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Accent.copy(alpha = 0.12f))
+            .padding(14.dp),
+    ) {
+        Icon(AppIcons.Download, null, tint = Accent, modifier = Modifier.size(28.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Доступна ${release.version}", color = Accent, fontWeight = FontWeight.Bold)
+            Text(
+                problem ?: progress?.let { "скачиваю ${(it * 100).toInt()}%" } ?: "обновление с GitHub",
+                color = Accent.copy(alpha = 0.8f),
+                fontSize = 13.sp,
+            )
+        }
+        PrimaryButton("Обновить", enabled = progress == null) {
+            problem = null
+            val ready = downloaded
+            if (ready != null) {
+                // Already downloaded: this is the press after allowing installs.
+                problem = Updater.install(context, ready)
+                return@PrimaryButton
+            }
+            progress = 0f
+            scope.launch {
+                runCatching { Updater.download(context, release) { progress = it } }
+                    .onSuccess { file ->
+                        downloaded = file
+                        problem = Updater.install(context, file)
+                    }
+                    .onFailure { problem = "не скачалось: ${it.message}" }
+                progress = null
+            }
+        }
     }
 }
 

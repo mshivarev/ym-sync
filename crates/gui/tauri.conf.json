@@ -24,7 +24,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi"],
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFNkM4N0Y0RjUxM0E4MjgKUldRb3FCUDE5SWRzWGpNZFk5U2ljbjdwOFNoOFcvdDJWWGV2ejJuTDRpS01PNzNxQ3cyK1JuUFYK",
+      "endpoints": [
+        "https://github.com/mshivarev/ym-sync/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

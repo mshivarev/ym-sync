@@ -52,6 +52,9 @@ const ui = {
   libTitle: el("lib-title"),
   tabs: el("tabs"),
   nav: el("nav"),
+  update: el("update"),
+  updateTitle: el("update-title"),
+  updateMeta: el("update-meta"),
   sideRoom: el("side-room"),
   sideDot: el("side-dot"),
   sideRoomName: el("side-room-name"),
@@ -1322,7 +1325,40 @@ listen("closed", () => {
 // come up empty next launch.
 listen("notice", (event) => toast(String(event.payload))).catch(() => {});
 
+// ---------- updates ----------
+
+/// Asks GitHub once per launch whether a newer release is out. Silent when it is
+/// not, and silent when it cannot tell — no internet, no release yet — since a
+/// message about that on every start would only be noise.
+async function checkForUpdate() {
+  let found = null;
+  try {
+    found = await invoke("check_update");
+  } catch (err) {
+    console.info("update check failed", err);
+  }
+  if (!found) return;
+  ui.updateTitle.textContent = `Доступна ${found.version}`;
+  ui.updateMeta.textContent = "нажмите, чтобы обновить";
+  ui.update.title = found.notes || "скачать, проверить подпись и установить";
+  ui.update.classList.remove("hidden");
+}
+
+// The download is checked against this project's signing key before anything is
+// installed; then the installer runs and the app comes back on the new version.
+ui.update.addEventListener("click", async () => {
+  ui.update.disabled = true;
+  ui.updateMeta.textContent = "скачиваю и проверяю подпись…";
+  const done = await attempt("install_update");
+  // On success the app restarts and never gets here.
+  if (!done) {
+    ui.update.disabled = false;
+    ui.updateMeta.textContent = "не вышло — нажмите, чтобы повторить";
+  }
+});
+
 (async function start() {
+  checkForUpdate();
   ui.source.placeholder = PLACEHOLDERS[kind];
   setConnected(false);
   // The home page works without a room now — pressing anything there raises one.

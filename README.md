@@ -11,7 +11,7 @@ Attention: I've fully vibecoded this great app, but it's fun and working, so I'm
 не нужен ни отдельный релей, ни доступ в интернет.
 
 ## Быстрый запуск
-1) Из release установите ymsync_guy.exe для Windows, либо app-release.apk для Android устройств
+1) Из release установите `ym-sync_<версия>_x64-setup.exe` для Windows, либо `ymsync-<версия>-android.apk` для Android устройств. Дальше приложение обновляется само — см. «Обновления»
 2) Получите токен вашего аккаунта Яндекс.музыки по ссылке https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d
 токен появится в поле вода ссылки по ключу access_token=
 3) Вставьте токен в настройках приложения
@@ -83,7 +83,38 @@ netsh advfirewall firewall add rule name="ym-sync share" dir=in action=allow pro
 сети, поэтому в его настройках порт так и остаётся выбираемым системой.
 
 
+## Обновления
+
+Оба клиента сами проверяют [GitHub Releases](https://github.com/mshivarev/ym-sync/releases)
+при запуске.
+
+- **Windows.** В боковом меню появляется «Доступна X.Y.Z». По нажатию приложение
+  скачивает установщик, проверяет его подпись ключом проекта, ставит и
+  перезапускается. Файл без правильной подписи не установится.
+- **Android.** На главной появляется карточка «Доступна X.Y.Z». По нажатию
+  скачивается APK и открывается системный установщик — молча обновиться Android
+  приложению не даёт. В первый раз система попросит разрешить установку из
+  ym-sync. Проверить вручную можно на странице «Комната», блок «О приложении».
+
+Что должно быть в релизе, чтобы это работало: тег `vX.Y.Z`; для Windows —
+установщик `ym-sync_X.Y.Z_x64-setup.exe` и `latest.json`; для Android —
+`ymsync-X.Y.Z-android.apk`, подписанный тем же ключом, что и прежние версии.
+
 ### Сборка windows клиента
+
+Установщик с подписанным обновлением (нужен `tauri-cli`, например `npx @tauri-apps/cli@2`):
+```
+cd crates\gui
+set TAURI_SIGNING_PRIVATE_KEY=%USERPROFILE%\.tauri\ymsync-updater.key
+set TAURI_SIGNING_PRIVATE_KEY_PASSWORD=
+npx @tauri-apps/cli@2 build
+```
+Получится `target\release\bundle\nsis\ym-sync_<версия>_x64-setup.exe` и `.sig` к нему;
+из подписи собирается `latest.json`. Ключ `ymsync-updater.key` храните в резервной
+копии, как и ключ подписи APK: без него обновления для уже установленных копий
+выпустить нельзя.
+
+Просто запустить из исходников:
 ```
 cargo build --release -p ymsync-gui
 target\release\ymsync-gui.exe

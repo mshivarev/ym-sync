@@ -462,6 +462,63 @@ async fn suggest(part: String, state: State<'_, AppState>) -> Result<api::Sugges
     api.suggest(&part).await.map_err(fail)
 }
 
+/// A newer release, as the window shows it.
+#[derive(Serialize)]
+struct UpdateInfo {
+    version: String,
+    /// The release notes, as written on GitHub.
+    notes: Option<String>,
+}
+
+/// Asks GitHub whether a newer version is out.
+///
+/// `None` when this is the latest — and also when the check could not be made:
+/// no internet, or no release published yet. Neither is worth a message on every
+/// launch, so failures are logged and the window just says nothing.
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(fail)?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(UpdateInfo {
+            version: update.version.clone(),
+            notes: update.body.clone(),
+        })),
+        Ok(None) => Ok(None),
+        Err(err) => {
+            tracing::info!("проверка обновлений не удалась: {err:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// Downloads the newer version, checks its signature, installs it and restarts.
+///
+/// The signature check is the plugin's, against the public key in
+/// tauri.conf.json: a file that was not signed with this project's key is
+/// refused before anything is installed. The room is left first, so the other
+/// listeners see this device go rather than vanish mid-track.
+#[tauri::command]
+async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(fail)?
+        .check()
+        .await
+        .map_err(fail)?
+        .ok_or_else(|| "обновлений нет — уже последняя версия".to_string())?;
+
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(fail)?;
+
+    // A room that will not close cleanly is no reason to stay on the old version.
+    if let Some(session) = state.session.lock().await.take() {
+        let _ = session.shutdown().await;
+    }
+    update.install(bytes).map_err(fail)?;
+    app.restart();
+}
+
 /// Adds local audio files to this device's downloads.
 ///
 /// Opens the system's file picker and imports whatever comes back: the tracks
@@ -647,6 +704,7 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             app.manage(AppState {
                 config: std::sync::Mutex::new(config),
@@ -677,7 +735,9 @@ fn main() {
             cancel_downloads,
             forget,
             find_rooms,
-            import_tracks
+            import_tracks,
+            check_update,
+            install_update
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");

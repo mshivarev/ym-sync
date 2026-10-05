@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The one folder the system installer is given read access to: where the
+     updater puts the APK it downloaded. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

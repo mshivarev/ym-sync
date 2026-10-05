@@ -14,6 +14,9 @@ rfd = { version = "0.15.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tauri = { version = "2.11.5", features = ["devtools"] }
+# Updates from GitHub Releases. Every download is checked against the public key
+# in tauri.conf.json before it is installed; the private half signs the release.
+tauri-plugin-updater = "2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
@@ -21,4 +24,4 @@ ymsync = { version = "0.2.0", path = "../app" }
 ymsync-proto = { version = "0.2.0", path = "../proto" }
 
 [build-dependencies]
-tauri-build = "2.6.3"
+tauri-build = { version = "2.6.3", features = [] }
