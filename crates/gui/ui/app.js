@@ -116,6 +116,8 @@ let dragging = false;
 let toastTimer = null;
 let volumeTimer = null;
 let typingTimer = null;
+/// The room being raised right now, if any; see [`withRoom`].
+let raising = null;
 /// Answers that arrive out of order must not overwrite a newer query's: each
 /// request carries the number of the keystroke it belongs to.
 let searchToken = 0;
@@ -276,6 +278,17 @@ function newPassword() {
 async function withRoom(action) {
   if (connected) return action();
 
+  // One raise at a time, shared by everybody who asked while it was under way.
+  // The search fires by itself after a pause in typing, so a second request
+  // landing mid-connect is the normal case, not a corner: it waits for the same
+  // room rather than starting another and being told «уже подключено».
+  if (!raising) raising = raiseRoom().finally(() => (raising = null));
+  if (!(await raising)) return;
+  return action();
+}
+
+/// The room-raising half of [`withRoom`]. Answers whether there is a room now.
+async function raiseRoom() {
   if (!ui.room.value.trim()) ui.room.value = "home";
   if (!ui.password.value.trim()) ui.password.value = newPassword();
 
@@ -289,14 +302,14 @@ async function withRoom(action) {
   if (!snapshot) {
     // Something is wrong with the settings — the room page is where it is fixed.
     showView("room");
-    return;
+    return false;
   }
 
   roomName = ui.room.value;
   setConnected(true);
   render(snapshot);
   toast(`комната «${roomName}» поднята на этом ПК`);
-  return action();
+  return true;
 }
 
 /** Puts tracks in the room's queue, raising the room first if need be. */
@@ -371,8 +384,11 @@ function renderSuggest(found) {
 const KINDS = { artist: "исполнитель", album: "альбом", track: "трек" };
 
 /** Runs the search itself. `token` guards against a stale answer landing late. */
+/// Searching raises a room first, as on the phone: whatever is found is about
+/// to be played, and playing needs one. The suggestions do not — they are only
+/// words under the field.
 async function runSearch(query, token) {
-  const found = await call("search", { query, limit: 30 });
+  const found = await withRoom(() => call("search", { query, limit: 30 }));
   if (token !== searchToken || !found) return;
   results = found;
   renderResults();
