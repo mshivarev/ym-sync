@@ -149,10 +149,12 @@ object Commands {
     /**
      * Adds a local audio file to the downloads on this device.
      *
-     * Answers with what to tell the user: the track's name, or that it was already
-     * there. Reading and storing a file is disk work, hence [Dispatchers.IO].
+     * Answers whether the file was new: `false` means the same file was already
+     * among the downloads, and the screen counts the two separately — «добавлено»
+     * must not include what was there before. Reading and storing a file is disk
+     * work, hence [Dispatchers.IO].
      */
-    suspend fun importTrack(name: String, data: ByteArray): Result<String> {
+    suspend fun importTrack(name: String, data: ByteArray): Result<Boolean> {
         val handle = SyncHolder.handle
         if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
         val reply = withContext(Dispatchers.IO) {
@@ -160,13 +162,7 @@ object Commands {
         }
         return when (reply) {
             is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
-            is NativeResult.Ok -> {
-                val track = reply.value.optJSONObject("track")?.toTrackInfo()
-                val label = track?.let { "${it.artist} — ${it.title}" } ?: name
-                Result.success(
-                    if (reply.value.optBoolean("already_there")) "$label — уже был" else label,
-                )
-            }
+            is NativeResult.Ok -> Result.success(!reply.value.optBoolean("already_there"))
         }
     }
 

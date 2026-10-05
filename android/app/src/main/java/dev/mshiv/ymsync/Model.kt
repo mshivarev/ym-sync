@@ -41,16 +41,23 @@ data class TrackInfo(
             }
 }
 
+/** Yandex's image CDN: the only place a cover is fetched from. */
+private const val COVER_HOST = "avatars.yandex.net"
+
 /**
  * A cover address from Yandex's template, at the size being drawn.
  *
- * Null when there is none: a track downloaded before covers were stored, or one
- * that came from another peer.
+ * Null when there is none — a track downloaded before covers were stored — and
+ * also when the template points anywhere but Yandex's image CDN. The template
+ * travels inside a track, and tracks reach this phone from whoever is in the
+ * room, unchecked by the relay; without this a peer could make every phone in
+ * the room fetch an address of its choosing.
  */
 fun coverUrlOf(uri: String?, size: Int): String? {
-    val template = uri?.takeIf { it.isNotBlank() } ?: return null
-    val sized = template.replace("%%", "${size}x$size")
-    return if (sized.startsWith("http")) sized else "https://$sized"
+    val template = uri?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val path = template.removePrefix("https://").removePrefix("http://").removePrefix("//")
+    if (!path.startsWith("$COVER_HOST/")) return null
+    return "https://" + path.replace("%%", "${size}x$size")
 }
 
 /** What the search dropdown draws while somebody is typing. */

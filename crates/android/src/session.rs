@@ -317,6 +317,11 @@ impl Session {
     /// network — the file is simply stored the way a download would be.
     pub fn import(&self, name: &str, data: Vec<u8>) -> Result<serde_json::Value> {
         let imported = ymsync::import::from_bytes(self.engine().cache().as_ref(), name, data)?;
+        // Written past the engine, so the engine has to be told: it keeps its own
+        // list of what this phone can serve to the room.
+        if !imported.already_there {
+            self.engine().send(Command::CacheChanged);
+        }
         Ok(serde_json::json!({
             "track": imported.track,
             "bytes": imported.bytes,

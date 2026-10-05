@@ -214,14 +214,22 @@ function setIcon(node, name) {
   if (use && use.getAttribute("href") !== `#${name}`) use.setAttribute("href", `#${name}`);
 }
 
+/// Yandex's image CDN: the only place a cover is fetched from.
+const COVER_HOST = "avatars.yandex.net";
+
 /// Yandex hands out a template, `avatars.yandex.net/…/%%`, and each screen asks
 /// for the size it draws. Tracks downloaded before covers were stored have none,
 /// and neither does anything with no internet — those get the placeholder.
+///
+/// Anything not on Yandex's CDN is refused here as well as by the CSP: the
+/// template arrives inside tracks that any peer in the room can hand over, and
+/// the phone has no CSP to fall back on, so both clients hold the same line.
 function coverUrl(track, size) {
-  const uri = track?.cover_uri;
+  const uri = track?.cover_uri?.trim();
   if (!uri) return null;
-  const sized = uri.replace("%%", `${size}x${size}`);
-  return /^[a-z]+:/i.test(sized) ? sized : `https://${sized}`;
+  const path = uri.replace(/^(https?:)?\/\//i, "");
+  if (!path.startsWith(`${COVER_HOST}/`)) return null;
+  return `https://${path.replace("%%", `${size}x${size}`)}`;
 }
 
 /// Fills a cover box: the picture when there is one, a note glyph otherwise —
@@ -1183,7 +1191,10 @@ ui.query.addEventListener("keydown", (event) => {
   if (open && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
     event.preventDefault();
     const step = event.key === "ArrowDown" ? 1 : -1;
-    suggestIndex = (suggestIndex + step + rows.length + 1) % (rows.length + 1) - 1;
+    // Positions run 0…N, where 0 is the field itself and k is row k-1: cycling
+    // through N+1 places, so Down from the last row lands back in the field.
+    const places = rows.length + 1;
+    suggestIndex = ((suggestIndex + 1 + step + places) % places) - 1;
     rows.forEach((row, index) => row.classList.toggle("current", index === suggestIndex));
     if (suggestIndex >= 0) rows[suggestIndex].scrollIntoView({ block: "nearest" });
     return;

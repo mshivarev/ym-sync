@@ -490,7 +490,7 @@ async fn import_tracks(state: State<'_, AppState>) -> Result<String, String> {
         return Ok(String::new());
     };
 
-    let report = tokio::task::spawn_blocking(move || {
+    let (added_any, report) = tokio::task::spawn_blocking(move || {
         let mut added = 0usize;
         let mut known = 0usize;
         let mut failed: Vec<String> = Vec::new();
@@ -511,14 +511,23 @@ async fn import_tracks(state: State<'_, AppState>) -> Result<String, String> {
         if !failed.is_empty() {
             parts.push(format!("не вышло: {} ({})", failed.len(), failed.join("; ")));
         }
-        if parts.is_empty() {
+        let report = if parts.is_empty() {
             "ничего не выбрано".to_string()
         } else {
             parts.join(" · ")
-        }
+        };
+        (added > 0, report)
     })
     .await
     .map_err(fail)?;
+
+    // The import went straight to the cache. A running engine keeps its own list
+    // of what this peer can serve and re-reads it only when told; without this the
+    // room would not hear about the new tracks until something else changed the
+    // disk. No session is fine: the next one reads the disk when it starts.
+    if added_any {
+        let _ = send(&state, Command::CacheChanged).await;
+    }
 
     Ok(report)
 }

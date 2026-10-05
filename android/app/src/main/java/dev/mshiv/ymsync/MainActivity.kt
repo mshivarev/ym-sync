@@ -276,26 +276,30 @@ private fun App(settings: Settings) {
     }
 
     // What was asked for before there was a room to ask it of. Held until the
-    // room is up, then run once — pressing «Моя волна» outside a room should
-    // start the wave, not just a room with nothing playing in it.
-    var pending by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // room is up, then run in the order it was pressed — pressing «Моя волна»
+    // outside a room should start the wave, not just a room with nothing playing
+    // in it. A list rather than one slot: the search fires by itself after a pause
+    // in typing, and a press that lands while the room is still coming up must
+    // not wipe out the search, nor the other way round.
+    var pending by remember { mutableStateOf<List<() -> Unit>>(emptyList()) }
     var raising by remember { mutableStateOf(false) }
 
     LaunchedEffect(running) {
         if (running) {
             raising = false
-            pending?.invoke()
-            pending = null
+            val due = pending
+            pending = emptyList()
+            due.forEach { it() }
         }
     }
 
     // A room that never comes up — a busy port, a refused token — must not leave
-    // a press waiting for it forever.
+    // presses waiting for it forever.
     LaunchedEffect(pending, running) {
-        if (pending != null && !running) {
+        if (pending.isNotEmpty() && !running) {
             delay(30_000)
             if (!running) {
-                pending = null
+                pending = emptyList()
                 raising = false
             }
         }
@@ -308,7 +312,7 @@ private fun App(settings: Settings) {
         if (running) {
             action()
         } else {
-            pending = action
+            pending = pending + action
             if (!raising) {
                 raising = true
                 settings.prepareForSolo()
@@ -1205,33 +1209,42 @@ private fun ImportButton(room: Room, onChanged: (Library?) -> Unit) {
         ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
-        working = true
         room.inRoom {
+            // Set here, once the import is actually running, and not before the
+            // room is up: a room that never comes up drops this action, and a flag
+            // raised outside it would then never come down — the button would
+            // stay disabled for good.
+            working = true
             room.scope.launch {
                 var added = 0
+                var known = 0
                 var failed = 0
-                for (uri in uris) {
-                    val name = displayName(context, uri)
-                    val data = withContext(Dispatchers.IO) {
-                        runCatching {
-                            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        }.getOrNull()
+                try {
+                    for (uri in uris) {
+                        val name = displayName(context, uri)
+                        val data = withContext(Dispatchers.IO) {
+                            runCatching {
+                                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                            }.getOrNull()
+                        }
+                        if (data == null) {
+                            failed++
+                            continue
+                        }
+                        Commands.importTrack(name, data)
+                            .onSuccess { new -> if (new) added++ else known++ }
+                            .onFailure { failed++ }
                     }
-                    if (data == null) {
-                        failed++
-                        continue
-                    }
-                    Commands.importTrack(name, data)
-                        .onSuccess { added++ }
-                        .onFailure { failed++ }
+                    onChanged(Commands.library().getOrNull())
+                } finally {
+                    working = false
                 }
-                onChanged(Commands.library().getOrNull())
-                working = false
                 SyncHolder.say(
-                    buildString {
-                        append("добавлено: $added")
-                        if (failed > 0) append(" · не вышло: $failed")
-                    },
+                    listOfNotNull(
+                        "добавлено: $added",
+                        "уже было: $known".takeIf { known > 0 },
+                        "не вышло: $failed".takeIf { failed > 0 },
+                    ).joinToString(" · "),
                 )
             }
         }

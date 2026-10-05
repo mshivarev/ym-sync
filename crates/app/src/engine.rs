@@ -128,6 +128,10 @@ pub enum Command {
     CancelDownloads,
     /// Deletes a downloaded track from this device.
     Forget { track_id: String },
+    /// Something other than the engine wrote to the cache — an imported local
+    /// file. Re-reads what is on disk, so the snapshot marks it and the room is
+    /// told this peer can now serve it.
+    CacheChanged,
     /// Puts the track into this account's «Мне нравится», or takes it out.
     ///
     /// The whole track rather than an id, so that a like made from the player also
@@ -841,6 +845,8 @@ impl Engine {
                     Err(err) => self.notice = Some(format!("не удалось удалить: {err:#}")),
                 }
             }
+
+            Command::CacheChanged => self.refresh_cache_view(),
 
             Command::Like { track, liked } => {
                 let Some(api) = self.api.clone() else {
