@@ -200,6 +200,30 @@ private class Room(
         }
     }
 
+    /// Plays a list from the track that was pressed, as any music player does:
+    /// the list becomes the queue, so «next» goes on through it and «previous»
+    /// goes back. Adding without interrupting is the row's own queue button.
+    fun playFrom(tracks: List<TrackInfo>, index: Int) {
+        if (tracks.isEmpty()) return
+        inRoom {
+            scope.launch {
+                Commands.queueTracks(tracks, replace = true, start = index)
+                    .onFailure { SyncHolder.say(it.message) }
+            }
+        }
+    }
+
+    /// One track onto the end of the queue, without touching what plays.
+    fun addToQueue(track: TrackInfo) {
+        inRoom {
+            scope.launch {
+                Commands.queueTracks(listOf(track))
+                    .onSuccess { SyncHolder.say("в очереди: ${track.artist} — ${track.title}") }
+                    .onFailure { SyncHolder.say(it.message) }
+            }
+        }
+    }
+
     fun send(action: String) {
         scope.launch { Commands.send(action)?.let { SyncHolder.say(it) } }
     }
@@ -567,12 +591,12 @@ private fun HomeScreen(
         }
 
         if (results.isNotEmpty()) {
-            item { SectionTitle("Результаты поиска", "клик добавит трек в конец очереди") }
-            itemsIndexed(results, key = { index, track -> "r${track.trackId}$index" }) { _, track ->
+            item { SectionTitle("Результаты поиска") }
+            itemsIndexed(results, key = { index, track -> "r${track.trackId}$index" }) { index, track ->
                 TrackRow(
                     track = track,
                     room = room,
-                    onClick = { room.enqueue(listOf(track)) },
+                    onClick = { room.playFrom(results, index) },
                 )
             }
         }
@@ -1000,6 +1024,8 @@ private fun QueueScreen(room: Room) {
                     track = queue[index],
                     room = room,
                     current = index == (snapshot?.index ?: -1),
+                    // Already in the queue: no button to add it again.
+                    queueable = false,
                     onClick = { room.scope.launch { Commands.send("index") { put("index", index) } } },
                 )
             }
@@ -1156,7 +1182,9 @@ private fun LibraryScreen(
                     item { Empty("Здесь пока пусто — скачивайте треки со страницы очереди") }
                 }
                 items(downloaded.size, key = { "c${downloaded[it].track.trackId}" }) { index ->
-                    DownloadedRow(downloaded[index], room, onChanged)
+                    DownloadedRow(downloaded[index], room, onChanged) {
+                        room.playFrom(downloaded.map { it.track }, index)
+                    }
                 }
             }
 
@@ -1164,8 +1192,8 @@ private fun LibraryScreen(
                 if (likedTracks.isEmpty()) {
                     item { Empty("Список пуст или ещё не загружен — обновите, когда будет интернет") }
                 }
-                itemsIndexed(likedTracks, key = { index, track -> "l${track.trackId}$index" }) { _, track ->
-                    TrackRow(track = track, room = room, onClick = { room.enqueue(listOf(track)) })
+                itemsIndexed(likedTracks, key = { index, track -> "l${track.trackId}$index" }) { index, track ->
+                    TrackRow(track = track, room = room, onClick = { room.playFrom(likedTracks, index) })
                 }
             }
 
@@ -1181,16 +1209,16 @@ private fun LazyListScope.albums(
 ) {
     for ((album, entries) in albumGroups(downloaded)) {
         item(key = "a$album") {
-            // The header queues the album; that is what makes this view worth
-            // having over a flat list.
+            // The header plays the album, like an album card anywhere else; the
+            // button beside it adds the whole album to the end of the queue.
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 14.dp)
                     .clip(RoundedCornerShape(12.dp))
-                    .clickable(enabled = room.canDrive) { room.enqueue(entries.map { it.track }) }
-                    .padding(8.dp),
+                    .clickable { room.playFrom(entries.map { it.track }, 0) }
+                    .padding(start = 8.dp, top = 8.dp, bottom = 8.dp),
             ) {
                 CoverBox(entries.firstOrNull { it.track.coverUri != null }?.track, size = 56.dp, corner = 10.dp)
                 Spacer(Modifier.width(12.dp))
@@ -1198,11 +1226,15 @@ private fun LazyListScope.albums(
                     Text(album, fontWeight = FontWeight.Bold, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(tracksWord(entries.size), color = Dim, fontSize = 13.sp)
                 }
-                Icon(AppIcons.Add, "в очередь", tint = Dim)
+                IconButton(onClick = { room.enqueue(entries.map { it.track }) }) {
+                    Icon(AppIcons.Add, "альбом в очередь", tint = Dim)
+                }
             }
         }
         items(entries.size, key = { "ac${entries[it].track.trackId}" }) { index ->
-            DownloadedRow(entries[index], room, onChanged)
+            DownloadedRow(entries[index], room, onChanged) {
+                room.playFrom(entries.map { it.track }, index)
+            }
         }
     }
     if (downloaded.any { it.track.album == null }) {
@@ -1285,14 +1317,20 @@ private fun displayName(context: android.content.Context, uri: android.net.Uri):
 /// A downloaded track: plays off the disk, can be hearted, and carries the delete
 /// that the other lists have no business offering.
 @Composable
-private fun DownloadedRow(entry: CachedTrack, room: Room, onChanged: (Library?) -> Unit) {
+private fun DownloadedRow(
+    entry: CachedTrack,
+    room: Room,
+    onChanged: (Library?) -> Unit,
+    /// Plays this track, with the list it sits in as the queue.
+    onPlay: () -> Unit,
+) {
     TrackRow(
         track = entry.track,
         room = room,
         trailing = formatSize(entry.bytes),
         // The metadata was stored beside the audio, so this needs neither Yandex
         // nor a network at all.
-        onClick = { room.enqueue(listOf(entry.track)) },
+        onClick = onPlay,
         extra = {
             IconButton(
                 onClick = {
@@ -1975,6 +2013,8 @@ private fun TrackRow(
     current: Boolean = false,
     /// Replaces the duration on the right, where size matters more.
     trailing: String? = null,
+    /// Offers «в очередь». Off on the queue's own rows, which are queued already.
+    queueable: Boolean = true,
     extra: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
 ) {
@@ -1987,7 +2027,8 @@ private fun TrackRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(if (current) Accent.copy(alpha = 0.08f) else Color.Transparent)
-            .clickable(enabled = room.canDrive, onClick = onClick)
+            // Not gated on being in a room: pressing a track raises one.
+            .clickable(onClick = onClick)
             .padding(start = 8.dp, top = 6.dp, bottom = 6.dp),
     ) {
         CoverBox(track, size = 48.dp, corner = 8.dp) {
@@ -2032,6 +2073,13 @@ private fun TrackRow(
             fontSize = 12.sp,
             modifier = Modifier.padding(start = 8.dp),
         )
+        // A phone has no hover, so the button that the desktop shows on hover is
+        // simply always there: pressing the row plays, this adds to the end.
+        if (queueable) {
+            IconButton(onClick = { room.addToQueue(track) }) {
+                Icon(AppIcons.Add, "в очередь", tint = Dim, modifier = Modifier.size(22.dp))
+            }
+        }
         HeartButton(track.trackId in room.likedIds) { room.like(track) }
         extra?.invoke()
     }

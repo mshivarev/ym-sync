@@ -38,7 +38,7 @@ object Native {
      * Queues tracks the screen already holds in full — a search result, a row of
      * the offline library. Costs no Yandex request, which is the point.
      */
-    external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
+    external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean, start: Int): String
 
     /** Queues a whole source by name: an album, a playlist, the wave. */
     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String

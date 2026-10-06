@@ -1058,7 +1058,8 @@ body:not(.playing) .eq span {
 /* «Мне нравится» is per account, not per room: pressing this changes what Yandex
    holds for this token and nothing at all for the other listeners. */
 .heart,
-.drop {
+.drop,
+.enqueue {
   display: grid;
   place-items: center;
   width: 36px;
@@ -1070,21 +1071,30 @@ body:not(.playing) .eq span {
 }
 
 .tracks .heart:not(.on),
-.tracks .drop {
+.tracks .drop,
+.tracks .enqueue {
   opacity: 0;
 }
 
 .tracks li:hover .heart,
 .tracks li:hover .drop,
+.tracks li:hover .enqueue,
 .tracks .heart:focus-visible,
-.tracks .drop:focus-visible {
+.tracks .drop:focus-visible,
+.tracks .enqueue:focus-visible {
   opacity: 1;
 }
 
 .heart .i,
-.drop .i {
+.drop .i,
+.enqueue .i {
   width: 20px;
   height: 20px;
+}
+
+.enqueue:hover:not(:disabled) {
+  color: var(--accent);
+  background: rgb(255 255 255 / 6%);
 }
 
 .heart.on {

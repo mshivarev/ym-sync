@@ -10,7 +10,7 @@
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
 //!     external fun suggest(handle: Long, part: String): String
-//!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean): String
+//!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean, start: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
 //!     external fun library(handle: Long): String
@@ -195,12 +195,13 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_queueTracks(
     handle: jlong,
     tracks_json: JString,
     replace: jboolean,
+    start: jint,
 ) -> jstring {
     let text = match read(&mut env, &tracks_json) {
         Err(err) => failed(err),
         Ok(json) => match unsafe { borrow(handle) } {
             None => failed("сессия не запущена"),
-            Some(session) => match session.queue_tracks(&json, replace != 0) {
+            Some(session) => match session.queue_tracks(&json, replace != 0, start.max(0) as usize) {
                 Ok(length) => ok(serde_json::json!({ "queued": length })),
                 Err(err) => failed(err),
             },

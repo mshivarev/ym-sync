@@ -308,6 +308,27 @@ impl YandexMusic {
     /// Buffering it entirely is what makes drift correction cheap: a seek then
     /// costs a decoder reset instead of a network round trip, and playback never
     /// stalls mid-track. A few megabytes per track is a fair trade.
+    /// Starts downloading a track and answers as soon as the server does, before
+    /// the body has arrived — so playback can begin on the first part.
+    ///
+    /// The timeout is the download's own rather than the client's 30 seconds:
+    /// that is fine for an API call, but a ten-megabyte track on a slow phone
+    /// connection takes longer, and the client's limit would cut it off mid-song.
+    pub async fn open_track(&self, url: &str) -> Result<reqwest::Response> {
+        let response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await
+            .context("downloading the track")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("не удалось скачать трек: HTTP {status}");
+        }
+        Ok(response)
+    }
+
     pub async fn fetch_track(&self, url: &str) -> Result<Bytes> {
         let response = self
             .http

@@ -19,6 +19,7 @@ pub mod net;
 pub mod playback;
 pub mod session;
 pub mod share;
+pub mod stream;
 
 /// The desktop audio backend. Absent on Android, where ExoPlayer plays instead
 /// and `rodio`/`cpal` would only be dead weight.

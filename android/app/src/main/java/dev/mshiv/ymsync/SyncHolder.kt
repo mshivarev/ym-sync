@@ -82,13 +82,18 @@ object Commands {
      * on screen. The core still decides where the audio comes from: this disk
      * first, then somebody in the room, then Yandex.
      */
-    suspend fun queueTracks(tracks: List<TrackInfo>, replace: Boolean = false): Result<Int> {
+    suspend fun queueTracks(
+        tracks: List<TrackInfo>,
+        replace: Boolean = false,
+        /** The track to play first when [replace] is set. */
+        start: Int = 0,
+    ): Result<Int> {
         val handle = SyncHolder.handle
         if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
         if (tracks.isEmpty()) return Result.success(0)
         val payload = tracks.toJsonArray().toString()
         val reply = withContext(Dispatchers.IO) {
-            parseReply(Native.queueTracks(handle, payload, replace))
+            parseReply(Native.queueTracks(handle, payload, replace, start))
         }
         return when (reply) {
             is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))

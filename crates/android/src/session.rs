@@ -239,13 +239,17 @@ impl Session {
     /// mean going to the internet to play something that is already here. The
     /// engine then resolves the audio itself, in its own order: this disk, then a
     /// peer on the local network, then Yandex.
-    pub fn queue_tracks(&self, tracks_json: &str, replace: bool) -> Result<usize> {
+    ///
+    /// `start` is the track to play first when the list replaces the queue: a
+    /// list pressed on its fifth row plays from the fifth, with the rest of the
+    /// list around it for «next» and «previous».
+    pub fn queue_tracks(&self, tracks_json: &str, replace: bool, start: usize) -> Result<usize> {
         let tracks: Vec<TrackRef> =
             serde_json::from_str(tracks_json).context("разбор списка треков")?;
         if tracks.is_empty() {
             bail!("пустой список треков");
         }
-        Ok(self.queue(tracks, replace))
+        Ok(self.queue(tracks, replace, start))
     }
 
     /// Resolves a source into tracks and hands them to the engine. Returns how
@@ -274,7 +278,7 @@ impl Session {
             if tracks.is_empty() {
                 bail!("на этом устройстве ничего не скачано");
             }
-            return Ok(self.queue(tracks, replace));
+            return Ok(self.queue(tracks, replace, 0));
         }
 
         let api = self.api()?;
@@ -307,6 +311,7 @@ impl Session {
         Ok(self.queue(
             tracks.iter().map(Track::to_track_ref).collect(),
             replace,
+            0,
         ))
     }
 
@@ -337,10 +342,13 @@ impl Session {
     }
 
     /// Sends a resolved list to the room, replacing the queue or extending it.
-    fn queue(&self, tracks: Vec<TrackRef>, replace: bool) -> usize {
+    fn queue(&self, tracks: Vec<TrackRef>, replace: bool, start: usize) -> usize {
         let length = tracks.len();
         self.engine().send(if replace {
-            Command::SetQueue { tracks, start: 0 }
+            // A start past the end would leave nothing playing; the last track is
+            // the nearest thing to what was meant.
+            let start = start.min(length.saturating_sub(1));
+            Command::SetQueue { tracks, start }
         } else {
             Command::Enqueue { tracks }
         });

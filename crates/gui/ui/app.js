@@ -318,6 +318,14 @@ function queueTracks(tracks, replace = false) {
   return withRoom(() => call("queue_tracks", { tracks, start: 0, replace }));
 }
 
+/// Plays a list from the track that was pressed, as any music player does: the
+/// list becomes the queue, so «next» goes on through it and «previous» goes back.
+/// Adding to the queue without interrupting is the row's own «в очередь» button.
+function playFrom(tracks, index) {
+  if (!tracks.length) return;
+  return withRoom(() => call("queue_tracks", { tracks, start: index, replace: true }));
+}
+
 // ---------- search ----------
 
 function hideSuggest() {
@@ -579,7 +587,7 @@ function equaliser() {
 /// Every row carries a heart, because the track you want to keep is as likely to
 /// be one you are queueing as the one already playing. It sits outside the row's
 /// own button: a button inside a button is not valid, and not clickable either.
-function trackItem(track, index, { current, onClick, trailing, extra }) {
+function trackItem(track, index, { current, onClick, trailing, extra, queueable = true }) {
   const item = document.createElement("li");
   if (current) item.className = "current";
 
@@ -623,9 +631,33 @@ function trackItem(track, index, { current, onClick, trailing, extra }) {
 
   entry.append(number, art, meta, mark, time);
   entry.addEventListener("click", onClick);
-  item.append(entry, heartButton(track));
+  item.append(entry);
+  // Pressing the row plays it; this adds it to the end without interrupting.
+  // Not on the queue's own rows, where every track is already queued.
+  if (queueable) item.append(queueButton(track));
+  item.append(heartButton(track));
   if (extra) item.append(extra);
   return item;
+}
+
+/// «В очередь»: shown on hover, like the heart beside it.
+function queueButton(track) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "enqueue";
+  button.append(icon("i-add"));
+  button.title = "добавить в очередь";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    // `attempt`, not `call`: the command answers with nothing, so only a
+    // true/false tells success from a refusal.
+    const done = await withRoom(() =>
+      attempt("queue_tracks", { tracks: [track], start: 0, replace: false }),
+    );
+    button.disabled = false;
+    if (done) toast(`в очереди: ${track.artist} — ${track.title}`);
+  });
+  return button;
 }
 
 /// The heart, drawn from the stored «Мне нравится».
@@ -661,6 +693,7 @@ function renderQueue(snapshot) {
       trackItem(track, index, {
         current: index === snapshot.index,
         onClick: () => call("control", { action: "index", value: index }),
+        queueable: false,
       }),
     ),
   );
@@ -673,9 +706,7 @@ function renderResults() {
     ...results.map((track, index) =>
       trackItem(track, index, {
         current: false,
-        // One track at a time, appended: clicking must not throw away a queue
-        // that is already playing.
-        onClick: () => queueTracks([track]),
+        onClick: () => playFrom(results, index),
       }),
     ),
   );
@@ -716,7 +747,7 @@ function renderDownloads() {
       trackItem(entry, index, {
         current: false,
         trailing: fmtSize(entry.bytes),
-        onClick: () => queueTracks([entry]),
+        onClick: () => playFrom(library, index),
         extra: dropButton(entry),
       }),
     ),
@@ -734,7 +765,7 @@ function renderLikes() {
     ...likes.map((track, index) =>
       trackItem(track, index, {
         current: false,
-        onClick: () => queueTracks([track]),
+        onClick: () => playFrom(likes, index),
       }),
     ),
   );
@@ -752,7 +783,6 @@ function renderAlbums() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "group-entry";
-    button.title = "поставить альбом в очередь";
 
     const art = document.createElement("span");
     art.className = "art";
@@ -767,7 +797,9 @@ function renderAlbums() {
     count.textContent = tracksWord(group.tracks.length);
 
     button.append(art, name, count);
-    button.addEventListener("click", () => queueTracks(group.tracks));
+    // The album header plays the album, like an album card anywhere else.
+    button.title = "играть альбом";
+    button.addEventListener("click", () => playFrom(group.tracks, 0));
 
     const size = document.createElement("span");
     size.className = "time";
@@ -780,7 +812,7 @@ function renderAlbums() {
       nodes.push(
         trackItem(entry, index, {
           current: false,
-          onClick: () => queueTracks([entry]),
+          onClick: () => playFrom(group.tracks, index),
           extra: dropButton(entry),
         }),
       );
@@ -1229,6 +1261,41 @@ ui.query.addEventListener("keydown", (event) => {
 });
 
 ui.toggle.addEventListener("click", () => call("control", { action: "toggle" }));
+
+/// Space pauses and resumes, as in any player — unless the focus is somewhere
+/// space means a space: the search field, the room's settings.
+function typingInto(target) {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    target?.isContentEditable
+  );
+}
+
+// Caught before it reaches whatever is focused: after a click on a track row the
+// row keeps the focus, and space on a button presses it — the track would start
+// over instead of pausing. A browser presses buttons on keyup, so both halves of
+// the keystroke are taken.
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.code !== "Space" || typingInto(event.target) || event.ctrlKey || event.altKey || event.metaKey) {
+      return;
+    }
+    event.preventDefault();
+    if (event.repeat || !connected || !latest?.track) return;
+    call("control", { action: "toggle" });
+  },
+  true,
+);
+document.addEventListener(
+  "keyup",
+  (event) => {
+    if (event.code === "Space" && !typingInto(event.target)) event.preventDefault();
+  },
+  true,
+);
 ui.next.addEventListener("click", () => call("control", { action: "next" }));
 ui.prev.addEventListener("click", () => call("control", { action: "prev" }));
 

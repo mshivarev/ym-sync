@@ -13,6 +13,10 @@ use ymsync_proto::TrackRef;
 pub enum AudioSource {
     /// The whole encoded track. Seeking is then free of the network.
     Bytes(Bytes),
+    /// The track while it is still downloading: playback starts on the first
+    /// part, and a read past what has arrived waits for it. Only for a backend
+    /// that answers [`Playback::plays_while_downloading`].
+    Stream(crate::stream::Progressive),
     /// A signed URL for a backend that streams on its own.
     Url(String),
 }
@@ -25,6 +29,12 @@ pub trait Playback: Send + Sync + 'static {
     /// Whether the engine should download the track before calling [`Playback::load`].
     /// A streaming backend answers `false` and receives [`AudioSource::Url`].
     fn needs_bytes(&self) -> bool;
+
+    /// Whether this backend can start on a track that is still downloading, given
+    /// as [`AudioSource::Stream`]. Those that cannot get the whole file instead.
+    fn plays_while_downloading(&self) -> bool {
+        false
+    }
 
     /// Stages `track`, paused at its start.
     fn load(&self, track: TrackRef, source: AudioSource) -> Result<()>;

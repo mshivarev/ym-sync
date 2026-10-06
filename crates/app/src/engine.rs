@@ -38,6 +38,7 @@ use crate::likes::Likes;
 use crate::link::Link;
 use crate::playback::{AudioSource, Playback};
 use crate::share;
+use crate::stream::Progressive;
 
 /// A snapshot whose seq is this far below the last one means the relay restarted
 /// and began a fresh counter, rather than a frame arriving late.
@@ -360,6 +361,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         prefetching: None,
         downloads: VecDeque::new(),
         downloading: None,
+        streaming: None,
         shares: Vec::new(),
         share_port,
         // True from the start: the room has not been told anything yet, and even
@@ -403,6 +405,17 @@ enum Internal {
         origin: Option<Origin>,
         /// Whether it landed on disk, which is what moves the shared list.
         stored: bool,
+        /// The download still running behind a track that started early.
+        stream: Option<Progressive>,
+    },
+    /// A track that started while downloading has finished downloading — or
+    /// broke off, or was cancelled. Frees the network slot.
+    StreamDone {
+        track_id: String,
+        stream: Progressive,
+        stored: bool,
+        /// Set when the connection broke; a cancel is not an error.
+        error: Option<String>,
     },
     /// A transient failure earned another try.
     Retry {
@@ -614,6 +627,9 @@ struct Engine {
     downloads: VecDeque<TrackRef>,
     /// The download in flight.
     downloading: Option<String>,
+    /// The track playing while it is still downloading. It holds the network
+    /// slot until the download ends, and is cancelled when the room moves on.
+    streaming: Option<(String, Progressive)>,
 
     /// Who in the room is offering cached tracks, as the relay last described it.
     shares: Vec<PeerShare>,
@@ -977,6 +993,13 @@ impl Engine {
         self.loading = Some(track.track_id.clone());
         self.drift_ms = None;
 
+        // Whatever was still downloading for the previous track is not wanted any
+        // more — and it would otherwise compete with this load for the account's
+        // single stream, which Yandex answers with a 429.
+        if let Some((_, stream)) = self.streaming.take() {
+            stream.cancel();
+        }
+
         let player = Arc::clone(&self.player);
         let internal_tx = internal.clone();
         let track_id = track.track_id.clone();
@@ -1007,28 +1030,33 @@ impl Engine {
                     origin: Some(origin),
                     // Whatever it cost was accounted for when it was prefetched.
                     stored: false,
+                    stream: None,
                 });
             });
             return;
         }
 
-        let fetch = self.fetch_for(&track.track_id, self.auto_cache, false);
+        let mut fetch = self.fetch_for(&track.track_id, self.auto_cache, false);
+        // This one is about to play, so it may start before it has all arrived.
+        fetch.progressive = true;
+        fetch.done = Some(internal.clone());
         let want = track.clone();
         tokio::spawn(async move {
             let outcome = fetch_source(&fetch, &want).await;
-            let (error, origin, stored) = match outcome {
-                Err(failure) => (Some(failure.labelled(&label)), None, false),
+            let (error, origin, stored, stream) = match outcome {
+                Err(failure) => (Some(failure.labelled(&label)), None, false, None),
                 Ok(Fetched {
                     track,
                     source,
                     origin,
                     stored,
+                    stream,
                 }) => {
                     let error = stage_track(&player, track, source)
                         .await
                         .err()
                         .map(|err| LoadFailure::Temporary(format!("{label}: {err:#}")));
-                    (error, Some(origin), stored)
+                    (error, Some(origin), stored, stream)
                 }
             };
             let _ = internal_tx.send(Internal::Loaded {
@@ -1036,6 +1064,7 @@ impl Engine {
                 error,
                 origin,
                 stored,
+                stream,
             });
         });
     }
@@ -1048,7 +1077,11 @@ impl Engine {
     /// the first claim on it: filling the offline library must never be the reason
     /// a track starts late.
     fn network_free(&self) -> bool {
-        self.loading.is_none() && self.prefetching.is_none() && self.downloading.is_none()
+        self.loading.is_none()
+            && self.prefetching.is_none()
+            && self.downloading.is_none()
+            // A track that started early is still pulling its stream.
+            && self.streaming.is_none()
     }
 
     /// Assembles what a background fetch needs, including who in the room can
@@ -1063,6 +1096,9 @@ impl Engine {
             peers: self.peers_with(track_id),
             store,
             pinned,
+            // Whole-file by default; `start_load` opts the track about to play in.
+            progressive: false,
+            done: None,
         }
     }
 
@@ -1404,19 +1440,58 @@ impl Engine {
                 }
             }
 
+            Internal::StreamDone {
+                track_id,
+                stream,
+                stored,
+                error,
+            } => {
+                // Matched on the download itself, not just the id: a cancelled
+                // download of this same track may report after a new one began,
+                // and must not free the slot the new one is using.
+                if self
+                    .streaming
+                    .as_ref()
+                    .is_some_and(|(id, current)| *id == track_id && current.same_as(&stream))
+                {
+                    self.streaming = None;
+                }
+                if stored {
+                    self.refresh_cache_view();
+                }
+                if let Some(error) = error {
+                    self.notice = Some(error);
+                }
+            }
+
             Internal::Loaded {
                 track_id,
                 error,
                 origin,
                 stored,
+                stream,
             } => {
-                // A newer request overtook this one.
+                // A newer request overtook this one; whatever it is still
+                // downloading is of no use to anybody.
                 if self.loading.as_deref() != Some(track_id.as_str()) {
+                    if let Some(stream) = stream {
+                        stream.cancel();
+                    }
                     return;
                 }
                 self.loading = None;
                 if stored {
                     self.refresh_cache_view();
+                }
+
+                // Started before it finished arriving: the rest keeps the network
+                // slot until it is in. A failed load cancels it instead.
+                if let Some(stream) = stream {
+                    if error.is_some() {
+                        stream.cancel();
+                    } else {
+                        self.streaming = Some((track_id.clone(), stream));
+                    }
                 }
 
                 if let Some(failure) = error {
@@ -1844,6 +1919,12 @@ struct Fetch {
     store: bool,
     /// Mark what is stored as a deliberate download, safe from eviction.
     pinned: bool,
+    /// Hand the player a track from Yandex while it is still downloading, rather
+    /// than once it is all here. Only for the track about to play — a prefetch or
+    /// an offline download has the time to fetch it whole.
+    progressive: bool,
+    /// Where a download that outlives the fetch reports how it ended.
+    done: Option<mpsc::UnboundedSender<Internal>>,
 }
 
 /// A track ready to be handed to the player.
@@ -1853,7 +1934,14 @@ struct Fetched {
     origin: Origin,
     /// Whether this fetch put something on disk.
     stored: bool,
+    /// The download still under way behind [`AudioSource::Stream`], if that is
+    /// what was handed over. The engine keeps it to cancel it on a track change.
+    stream: Option<Progressive>,
 }
+
+/// How much of a track to have before handing it to the player: a few seconds
+/// of audio, and enough for the decoder to read the header.
+const START_BYTES: usize = 128 * 1024;
 
 /// Resolves a track and produces whatever this backend wants to be handed.
 ///
@@ -1879,6 +1967,7 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
                 source,
                 origin: Origin::Cache,
                 stored: false,
+                stream: None,
             }),
             Err(err) => Err(LoadFailure::Temporary(format!("{err:#}"))),
         };
@@ -1894,6 +1983,7 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
                     source,
                     origin: Origin::Peer,
                     stored,
+                    stream: None,
                 });
             }
             // Not fatal — the peer may have evicted it, or gone — but not to be
@@ -1929,7 +2019,15 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
             source: AudioSource::Url(url),
             origin: Origin::Yandex,
             stored: false,
+            stream: None,
         });
+    }
+
+    // Playing now, on a player that can start before the end: hand it the first
+    // part and let the rest arrive while it plays. This is the difference between
+    // a track starting in a moment and one starting after the whole file is in.
+    if fetch.progressive && fetch.player.plays_while_downloading() {
+        return stream_from_yandex(fetch, api, want, track, &url).await;
     }
 
     let data = match api.fetch_track(&url).await {
@@ -1953,6 +2051,84 @@ async fn fetch_source(fetch: &Fetch, want: &TrackRef) -> Result<Fetched, LoadFai
         source,
         origin: Origin::Yandex,
         stored,
+        stream: None,
+    })
+}
+
+/// Downloads a track from Yandex in the background, answering once the first
+/// [`START_BYTES`] are in.
+///
+/// The rest keeps arriving while the track plays; reads past it wait. When the
+/// whole file is in it is written to the cache, if this fetch keeps what it
+/// plays, and the engine is told either way — the one network slot stays taken
+/// until then, because Yandex answers 429 to a second simultaneous stream.
+async fn stream_from_yandex(
+    fetch: &Fetch,
+    api: &YandexMusic,
+    want: &TrackRef,
+    track: TrackRef,
+    url: &str,
+) -> Result<Fetched, LoadFailure> {
+    let mut response = api
+        .open_track(url)
+        .await
+        .map_err(|err| LoadFailure::Temporary(format!("{err:#}")))?;
+    let stream = Progressive::new(response.content_length());
+
+    while stream.len() < START_BYTES && !stream.is_done() {
+        match response.chunk().await {
+            Ok(Some(chunk)) => stream.push(&chunk),
+            Ok(None) => stream.finish(),
+            Err(err) => {
+                return Err(LoadFailure::Temporary(format!("downloading the track: {err:#}")));
+            }
+        }
+    }
+    if stream.is_empty() {
+        return Err(LoadFailure::Temporary("скачанный трек оказался пустым".to_string()));
+    }
+
+    let background = stream.clone();
+    let fetch = fetch.clone();
+    let queue_id = want.track_id.clone();
+    let keep = track.clone();
+    tokio::spawn(async move {
+        let mut error = None;
+        // A cancelled download — the room moved on — just stops, and the
+        // connection closes with the response.
+        while !background.is_done() && !background.is_cancelled_or_failed() {
+            match response.chunk().await {
+                Ok(Some(chunk)) => background.push(&chunk),
+                Ok(None) => background.finish(),
+                Err(err) => {
+                    let reason = format!("загрузка трека оборвалась: {err:#}");
+                    background.fail(reason.clone());
+                    error = Some(reason);
+                }
+            }
+        }
+        let mut stored = false;
+        if fetch.store
+            && let Some(data) = background.complete_bytes()
+        {
+            stored = store(&fetch, &keep, &data).await.is_some();
+        }
+        if let Some(done) = &fetch.done {
+            let _ = done.send(Internal::StreamDone {
+                track_id: queue_id,
+                stream: background,
+                stored,
+                error,
+            });
+        }
+    });
+
+    Ok(Fetched {
+        track,
+        source: AudioSource::Stream(stream.clone()),
+        origin: Origin::Yandex,
+        stored: false,
+        stream: Some(stream),
     })
 }
 
@@ -2091,9 +2267,10 @@ async fn stage_track(
 ) -> Result<()> {
     match source {
         AudioSource::Url(_) => player.load(track, source),
-        AudioSource::Bytes(_) => {
+        AudioSource::Bytes(_) | AudioSource::Stream(_) => {
             let player = Arc::clone(player);
-            // Decoding probes the container; keep it off the runtime's workers.
+            // Decoding probes the container — and, for a track still arriving,
+            // may wait on the download — so keep it off the runtime's workers.
             tokio::task::spawn_blocking(move || player.load(track, source))
                 .await
                 .context("задача загрузки звука упала")?
