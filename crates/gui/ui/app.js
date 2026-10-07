@@ -20,10 +20,6 @@ const ui = {
   hosting: el("hosting"),
   findRooms: el("find-rooms"),
   rooms: el("rooms"),
-  kind: el("kind"),
-  source: el("source"),
-  load: el("load"),
-  play: el("play"),
   wave: el("wave"),
   wavePlay: el("wave-play"),
   likesTile: el("likes-tile"),
@@ -79,13 +75,6 @@ const ui = {
   toast: el("toast"),
 };
 
-const PLACEHOLDERS = {
-  search: "кино группа крови",
-  album: "5307396 или ссылка на альбом",
-  playlist: "логин/номер или ссылка на плейлист",
-  track: "38633712 или ссылка на трек",
-};
-
 /// How much has to be typed before the search runs by itself. Below this, only
 /// Enter searches: two letters match half the catalogue and every keystroke would
 /// be a wasted request.
@@ -124,8 +113,6 @@ let searchToken = 0;
 let suggestToken = 0;
 /// Which line of the dropdown the arrow keys are on; -1 is the field itself.
 let suggestIndex = -1;
-/// Which source the «по ссылке» card loads from.
-let kind = "search";
 /// This device's downloads, and where they live. Known before connecting.
 let library = [];
 let libraryRevision = -1;
@@ -1154,17 +1141,6 @@ ui.findRooms.addEventListener("click", async () => {
   toast(`нашлось: ${found.length}`);
 });
 
-ui.kind.addEventListener("click", (event) => {
-  const button = event.target.closest(".seg");
-  if (!button) return;
-  kind = button.dataset.kind;
-  for (const node of ui.kind.querySelectorAll(".seg")) {
-    node.classList.toggle("current", node === button);
-  }
-  ui.source.placeholder = PLACEHOLDERS[kind] ?? "";
-  ui.source.focus();
-});
-
 /** Loads a source into the room. `replace` starts it instead of queueing. */
 async function loadSource(button, source, value, replace) {
   if (!value && !SELF_CONTAINED.has(source)) return;
@@ -1183,8 +1159,6 @@ async function loadSource(button, source, value, replace) {
   }
 }
 
-ui.load.addEventListener("click", () => loadSource(ui.load, kind, ui.source.value.trim(), false));
-ui.play.addEventListener("click", () => loadSource(ui.play, kind, ui.source.value.trim(), true));
 ui.wavePlay.addEventListener("click", () => loadSource(ui.wavePlay, "wave", "", true));
 ui.wave.addEventListener("click", () => call("control", { action: "stop_wave" }));
 
@@ -1224,9 +1198,6 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest(".search")) hideSuggest();
 });
 
-ui.source.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") ui.load.click();
-});
 /// The keyboard in the dropdown: arrows walk the lines, Enter takes one, Escape
 /// closes it. With nothing highlighted, Enter searches for what was typed — which
 /// is the only way to search at all below [`LIVE_SEARCH_FROM`] characters.
@@ -1442,7 +1413,6 @@ ui.update.addEventListener("click", async () => {
 
 (async function start() {
   checkForUpdate();
-  ui.source.placeholder = PLACEHOLDERS[kind];
   setConnected(false);
   // The home page works without a room now — pressing anything there raises one.
   showView("home");
