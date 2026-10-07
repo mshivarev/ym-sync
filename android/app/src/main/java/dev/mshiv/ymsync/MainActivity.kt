@@ -31,7 +31,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -136,8 +135,6 @@ private const val LIVE_SEARCH_FROM = 3
 /// typing a word is one request rather than six, short enough not to feel slow.
 private const val TYPING_PAUSE_MS = 180L
 
-/// Sources that are a whole collection in themselves, with nothing to type in.
-private val SELF_CONTAINED = setOf("wave", "likes", "offline")
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -506,8 +503,6 @@ private fun HomeScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
     var suggest by remember { mutableStateOf<Suggest?>(null) }
-    var kind by rememberSaveable { mutableStateOf("album") }
-    var source by rememberSaveable { mutableStateOf("") }
 
     fun search(text: String = query) {
         if (text.isBlank()) return
@@ -630,17 +625,6 @@ private fun HomeScreen(
                     modifier = Modifier.weight(1f),
                 ) { onCollection(LibraryTab.ALL) }
             }
-        }
-
-        item {
-            SourceCard(
-                kind = kind,
-                onKind = { kind = it },
-                value = source,
-                onValue = { source = it },
-                enabled = true,
-                onLoad = { replace -> room.load(kind, source, replace) },
-            )
         }
     }
 }
@@ -891,58 +875,6 @@ private fun SearchField(
         ),
         modifier = Modifier.fillMaxWidth(),
     )
-}
-
-/// Loading by link or number: an album, a playlist, a track, or a search taken
-/// whole. The wave and «Мне нравится» have their own tiles above.
-@Composable
-private fun SourceCard(
-    kind: String,
-    onKind: (String) -> Unit,
-    value: String,
-    onValue: (String) -> Unit,
-    enabled: Boolean,
-    onLoad: (Boolean) -> Unit,
-) {
-    val needsValue = kind !in SELF_CONTAINED
-    val ready = enabled && (!needsValue || value.isNotBlank())
-
-    Card {
-        Text("По ссылке или номеру", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(
-                "album" to "альбом",
-                "playlist" to "плейлист",
-                "track" to "трек",
-                "search" to "поиск",
-            ).forEach { (id, label) ->
-                Chip(label, selected = kind == id) { onKind(id) }
-            }
-        }
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValue,
-            placeholder = {
-                Text(
-                    when (kind) {
-                        "album" -> "5307396 или ссылка на альбом"
-                        "playlist" -> "логин/номер или ссылка"
-                        "track" -> "38633712 или ссылка на трек"
-                        else -> "кино группа крови"
-                    },
-                    color = Dim,
-                )
-            },
-            singleLine = true,
-            shape = RoundedCornerShape(12.dp),
-            colors = fieldColors(),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            GhostButton("В очередь", AppIcons.Add, enabled = ready) { onLoad(false) }
-            PrimaryButton("Играть", AppIcons.Play, enabled = ready) { onLoad(true) }
-        }
-    }
 }
 
 // ---------------------------------------------------------------- queue
