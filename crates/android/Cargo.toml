@@ -23,8 +23,8 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
 # `audio-rodio`: the phone plays with the same decoder and the same sink as the
 # desktop. `cpal` reaches the speakers through AAudio, which needs no C++ toolchain
 # — hence `--platform 26` when building, since AAudio arrived in API 26.
-ymsync = { version = "0.2.0", path = "../app", default-features = false, features = ["audio-rodio", "tls-rustls"] }
-ymsync-proto = { version = "0.2.0", path = "../proto" }
+ymsync = { version = "0.2.1", path = "../app", default-features = false, features = ["audio-rodio", "tls-rustls"] }
+ymsync-proto = { version = "0.2.1", path = "../proto" }
 
 [dev-dependencies]
 bytes = "1.12.1"
