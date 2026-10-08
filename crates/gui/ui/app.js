@@ -48,6 +48,15 @@ const ui = {
   libTitle: el("lib-title"),
   tabs: el("tabs"),
   nav: el("nav"),
+  albumsBlock: el("albums-block"),
+  albums: el("albums"),
+  albumBack: el("album-back"),
+  albumCover: el("album-cover"),
+  albumTitle: el("album-title"),
+  albumMeta: el("album-meta"),
+  albumPlay: el("album-play"),
+  albumQueue: el("album-queue"),
+  albumTracks: el("album-tracks"),
   update: el("update"),
   updateTitle: el("update-title"),
   updateMeta: el("update-meta"),
@@ -100,6 +109,14 @@ const TAB_HEADS = {
 let connected = false;
 let latest = null;
 let results = [];
+/// Albums the last search found, shown as cards above the tracks.
+let albumResults = [];
+/// The album page: what is open, its tracks once they arrive, and which request
+/// they belong to, so a slow answer for an album left behind is not drawn.
+let albumTracks = [];
+let albumToken = 0;
+/// The dropdown's best guess, kept so pressing it can open an album.
+let suggestBest = null;
 let queueKey = "";
 let dragging = false;
 let toastTimer = null;
@@ -326,6 +343,7 @@ function hideSuggest() {
 function renderSuggest(found) {
   const rows = [];
 
+  suggestBest = found.best ?? null;
   if (found.best) {
     const best = found.best;
     const row = document.createElement("button");
@@ -383,11 +401,118 @@ const KINDS = { artist: "исполнитель", album: "альбом", track: 
 /// to be played, and playing needs one. The suggestions do not — they are only
 /// words under the field.
 async function runSearch(query, token) {
+  // Albums alongside the tracks. They need no room — nothing plays until one is
+  // opened and pressed — so they are not held up while one is raised.
+  call("search_albums", { query, limit: 12 }).then((albums) => {
+    if (token !== searchToken || !albums) return;
+    albumResults = albums;
+    renderAlbumCards();
+  });
+
   const found = await withRoom(() => call("search", { query, limit: 30 }));
   if (token !== searchToken || !found) return;
   results = found;
   renderResults();
   return found;
+}
+
+// ---------- albums ----------
+
+/// «Год · N треков», leaving out whatever Yandex did not say.
+function albumFacts(album) {
+  return [album.artist, album.year, album.track_count ? tracksWord(album.track_count) : null]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function renderAlbumCards() {
+  ui.albumsBlock.classList.toggle("hidden", albumResults.length === 0);
+  ui.albums.replaceChildren(
+    ...albumResults.map((album) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "album-card";
+      card.title = `открыть альбом «${album.title}»`;
+
+      const art = document.createElement("span");
+      art.className = "art";
+      fillCover(art, album, 200);
+
+      const name = document.createElement("span");
+      name.className = "album-name";
+      name.textContent = album.title;
+      const by = document.createElement("span");
+      by.className = "album-by";
+      by.textContent = [album.artist, album.year].filter(Boolean).join(" · ");
+
+      card.append(art, name, by);
+      card.addEventListener("click", () => openAlbum(album));
+      return card;
+    }),
+  );
+}
+
+/// Opens an album's page. The head is drawn at once from what the card already
+/// knows; the tracks follow from Yandex.
+async function openAlbum(album) {
+  hideSuggest();
+  const mine = ++albumToken;
+  albumTracks = [];
+  ui.albumTitle.textContent = album.title;
+  ui.albumMeta.textContent = albumFacts(album);
+  fillCover(ui.albumCover, album, 400);
+  ui.albumPlay.disabled = true;
+  ui.albumQueue.disabled = true;
+  ui.albumTracks.replaceChildren(emptyRow("загружаю треки…"));
+  showView("album");
+
+  const tracks = await call("album_tracks", { id: album.id });
+  if (mine !== albumToken) return;
+  if (!tracks) {
+    ui.albumTracks.replaceChildren(emptyRow("не удалось загрузить альбом"));
+    return;
+  }
+  albumTracks = tracks;
+  if (!album.track_count) ui.albumMeta.textContent = albumFacts({ ...album, track_count: tracks.length });
+  renderAlbumTracks();
+}
+
+function renderAlbumTracks() {
+  ui.albumPlay.disabled = albumTracks.length === 0;
+  ui.albumQueue.disabled = albumTracks.length === 0;
+  if (!albumTracks.length) {
+    ui.albumTracks.replaceChildren(emptyRow("в альбоме нет доступных треков"));
+    return;
+  }
+  ui.albumTracks.replaceChildren(
+    ...albumTracks.map((track, index) =>
+      trackItem(track, index, {
+        current: false,
+        onClick: () => playFrom(albumTracks, index),
+      }),
+    ),
+  );
+}
+
+ui.albumPlay.addEventListener("click", () => playFrom(albumTracks, 0));
+ui.albumQueue.addEventListener("click", async () => {
+  ui.albumQueue.disabled = true;
+  const done = await withRoom(() =>
+    attempt("queue_tracks", { tracks: albumTracks, start: 0, replace: false }),
+  );
+  ui.albumQueue.disabled = false;
+  if (done) toast(`в очереди: альбом «${ui.albumTitle.textContent}»`);
+});
+ui.albumBack.addEventListener("click", () => showView("home"));
+
+/// What pressing a line of the dropdown does: an album opens, anything else is
+/// searched for.
+function pickSuggestion(row) {
+  if (row.classList.contains("suggest-best") && suggestBest?.album) {
+    openAlbum(suggestBest.album);
+    return;
+  }
+  searchFor(row.dataset.query);
 }
 
 /// Everything that happens on a keystroke: the dropdown, and — once there is
@@ -432,8 +557,11 @@ function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.classList.toggle("hidden", view.dataset.view !== name);
   }
+  // An album page is reached from the home page's search, so that is where the
+  // menu says you are.
+  const section = name === "album" ? "home" : name;
   for (const item of ui.nav.querySelectorAll(".nav-item")) {
-    item.classList.toggle("current", item.dataset.view === name);
+    item.classList.toggle("current", item.dataset.view === section);
   }
   document.querySelector(".main").scrollTop = 0;
 }
@@ -1188,7 +1316,7 @@ ui.suggest.addEventListener("mousedown", (event) => {
   const row = event.target.closest("[data-query]");
   if (!row) return;
   event.preventDefault();
-  searchFor(row.dataset.query);
+  pickSuggestion(row);
 });
 
 // Leaving the field closes the dropdown, but not before a click on it is seen.
@@ -1224,7 +1352,7 @@ ui.query.addEventListener("keydown", (event) => {
 
   if (event.key === "Enter") {
     if (open && suggestIndex >= 0) {
-      searchFor(rows[suggestIndex].dataset.query);
+      pickSuggestion(rows[suggestIndex]);
       return;
     }
     ui.find.click();

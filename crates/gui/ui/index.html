@@ -129,11 +129,42 @@
         </button>
       </div>
 
+      <!-- Albums found by the same search: a card opens the album's page. -->
+      <div id="albums-block" class="hidden">
+        <div class="section-head">
+          <h2>Альбомы</h2>
+        </div>
+        <div id="albums" class="album-row"></div>
+      </div>
+
       <div class="section-head">
         <h2>Результаты поиска</h2>
       </div>
       <ul id="results" class="tracks"></ul>
       <p id="results-hint" class="hint">Клик по треку включит его, кнопка «в очередь» при наведении — добавит в конец.</p>
+    </section>
+
+    <!-- One album: opened from a card in the search results. Nothing plays until
+         one of the buttons, or a track, is pressed. -->
+    <section class="view hidden" data-view="album">
+      <button type="button" id="album-back" class="back">
+        <svg class="i flip"><use href="#i-chevron" /></svg>Назад
+      </button>
+      <div class="playlist-head">
+        <div class="playlist-art album-cover" id="album-cover"></div>
+        <div class="playlist-info">
+          <div class="eyebrow">Альбом</div>
+          <div class="playlist-title" id="album-title"></div>
+          <div class="now-meta" id="album-meta"></div>
+          <div class="row">
+            <button id="album-play" class="round-play" title="играть альбом"><svg class="i"><use href="#i-play" /></svg></button>
+            <button id="album-queue" class="btn ghost" title="добавить весь альбом в конец очереди">
+              <svg class="i"><use href="#i-add" /></svg>В очередь
+            </button>
+          </div>
+        </div>
+      </div>
+      <ul id="album-tracks" class="tracks"></ul>
     </section>
 
     <!-- Queue: what the room is playing and what comes next. -->

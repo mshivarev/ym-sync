@@ -47,6 +47,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
@@ -89,6 +90,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -256,6 +258,8 @@ private fun App(settings: Settings) {
 
     var screen by rememberSaveable { mutableStateOf(if (running) Screen.HOME else Screen.ROOM) }
     var playerOpen by rememberSaveable { mutableStateOf(false) }
+    // An album opened from search: its page, until back or a menu tab.
+    var openAlbum by remember { mutableStateOf<AlbumInfo?>(null) }
     // Lifted out of the collection page so the home tiles can open a given view
     // of it: «Мне нравится» is a tile there and a tab here.
     var libraryTab by rememberSaveable { mutableStateOf(LibraryTab.ALL) }
@@ -351,6 +355,8 @@ private fun App(settings: Settings) {
     val room = Room(snapshot, running, likes?.ids ?: emptySet(), scope, inRoom)
 
     BackHandler(enabled = playerOpen) { playerOpen = false }
+    // An open album sits on top of the home page; back returns to it.
+    BackHandler(enabled = openAlbum != null && !playerOpen) { openAlbum = null }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -361,7 +367,10 @@ private fun App(settings: Settings) {
                     if (running && snapshot?.track != null) {
                         MiniPlayer(room, onOpen = { playerOpen = true })
                     }
-                    BottomNav(screen) { screen = it }
+                    BottomNav(screen) {
+                        screen = it
+                        openAlbum = null
+                    }
                 }
             },
         ) { insets ->
@@ -370,13 +379,17 @@ private fun App(settings: Settings) {
                     .fillMaxSize()
                     .padding(insets),
             ) {
-                when (screen) {
+                val album = openAlbum
+                if (album != null) {
+                    AlbumScreen(album, room, onBack = { openAlbum = null })
+                } else when (screen) {
                     Screen.HOME -> HomeScreen(
                         room = room,
                         library = library,
                         likes = likes,
                         update = update,
                         onRoom = { screen = Screen.ROOM },
+                        onOpenAlbum = { openAlbum = it },
                         // A tile opens its view of the collection. Playing is the
                         // round button there, not the tile: the tile is a way in
                         // to the list, the way a playlist card is anywhere else.
@@ -499,9 +512,11 @@ private fun HomeScreen(
     update: Release?,
     onRoom: () -> Unit,
     onCollection: (LibraryTab) -> Unit,
+    onOpenAlbum: (AlbumInfo) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<TrackInfo>()) }
+    var albums by remember { mutableStateOf(emptyList<AlbumInfo>()) }
     var suggest by remember { mutableStateOf<Suggest?>(null) }
 
     fun search(text: String = query) {
@@ -517,6 +532,8 @@ private fun HomeScreen(
                     }
                     .onFailure { error -> SyncHolder.say(error.message) }
             }
+            // The albums the same words find, as a row of cards above the tracks.
+            room.scope.launch { albums = Commands.searchAlbums(text) }
         }
     }
 
@@ -566,7 +583,7 @@ private fun HomeScreen(
                 value = query,
                 onValue = { query = it },
                 enabled = true,
-                onClear = { query = ""; suggest = null; results = emptyList() },
+                onClear = { query = ""; suggest = null; results = emptyList(); albums = emptyList() },
                 onSearch = { search() },
             )
         }
@@ -577,11 +594,33 @@ private fun HomeScreen(
         suggest?.let { found ->
             found.best?.let { best ->
                 item(key = "best") {
-                    SuggestBest(best) { query = best.query; search(best.query) }
+                    // An album opens; anything else is searched for.
+                    SuggestBest(best) {
+                        val album = best.album
+                        if (album != null) {
+                            suggest = null
+                            onOpenAlbum(album)
+                        } else {
+                            query = best.query
+                            search(best.query)
+                        }
+                    }
                 }
             }
             items(found.suggestions, key = { "s$it" }) { line ->
                 SuggestLine(line) { query = line; search(line) }
+            }
+        }
+
+        if (albums.isNotEmpty()) {
+            item { SectionTitle("Альбомы") }
+            item(key = "albums") {
+                // A row that scrolls sideways, so the tracks stay in sight below.
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(albums, key = { "al${it.id}" }) { album ->
+                        AlbumCard(album) { onOpenAlbum(album) }
+                    }
+                }
             }
         }
 
@@ -836,6 +875,127 @@ private fun SuggestLine(line: String, onClick: () -> Unit) {
         Icon(AppIcons.Search, null, tint = Dim, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(12.dp))
         Text(line, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/// One album in the search results' row: pressing it opens the album.
+@Composable
+private fun AlbumCard(album: AlbumInfo, onClick: () -> Unit) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .width(140.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(4.dp),
+    ) {
+        CoverArt(url = album.coverUrl(300), size = 132.dp, corner = 12.dp)
+        Text(album.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            listOfNotNull(album.artist.ifBlank { null }, album.year?.toString()).joinToString(" · "),
+            color = Dim,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/// «Кино · 1988 · 11 треков», leaving out whatever Yandex did not say.
+private fun albumFacts(album: AlbumInfo, tracks: Int?): String =
+    listOfNotNull(
+        album.artist.ifBlank { null },
+        album.year?.toString(),
+        (album.trackCount ?: tracks)?.let { tracksWord(it) },
+    ).joinToString(" · ")
+
+/// An album opened from search. The head is drawn at once from what the card
+/// already knew; the tracks follow from Yandex. Nothing plays until the round
+/// button, «в очередь» or a track is pressed.
+@Composable
+private fun AlbumScreen(album: AlbumInfo, room: Room, onBack: () -> Unit) {
+    var tracks by remember(album.id) { mutableStateOf<List<TrackInfo>?>(null) }
+    var problem by remember(album.id) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(album.id) {
+        room.inRoom {
+            room.scope.launch {
+                Commands.albumTracks(album.id)
+                    .onSuccess { tracks = it }
+                    .onFailure { problem = it.message ?: "не удалось загрузить альбом" }
+            }
+        }
+    }
+    val list = tracks.orEmpty()
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            TextButton(onClick = onBack) {
+                Icon(
+                    AppIcons.Chevron,
+                    null,
+                    tint = Dim,
+                    modifier = Modifier
+                        .size(20.dp)
+                        .rotate(180f),
+                )
+                Text("Назад", color = Dim)
+            }
+        }
+
+        item {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            ) {
+                CoverArt(
+                    url = album.coverUrl(400),
+                    size = 120.dp,
+                    corner = 14.dp,
+                    modifier = Modifier.shadow(12.dp, RoundedCornerShape(14.dp)),
+                )
+                Spacer(Modifier.width(16.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("АЛЬБОМ", color = Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        album.title,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(albumFacts(album, tracks?.size), color = Dim, fontSize = 13.sp)
+                }
+            }
+        }
+
+        item {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+            ) {
+                RoundPlay(enabled = list.isNotEmpty()) { room.playFrom(list, 0) }
+                GhostButton("В очередь", AppIcons.Add, enabled = list.isNotEmpty()) {
+                    room.enqueue(list)
+                    SyncHolder.say("в очереди: альбом «${album.title}»")
+                }
+            }
+        }
+
+        when {
+            problem != null -> item { Empty(problem ?: "") }
+            tracks == null -> item { Empty("загружаю треки…") }
+            list.isEmpty() -> item { Empty("в альбоме нет доступных треков") }
+        }
+
+        itemsIndexed(list, key = { index, track -> "at${track.trackId}$index" }) { index, track ->
+            TrackRow(track = track, room = room, onClick = { room.playFrom(list, index) })
+        }
     }
 }
 

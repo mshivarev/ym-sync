@@ -135,6 +135,33 @@ object Commands {
     }
 
     /**
+     * Albums matching the query. An empty list on failure: the tracks below are
+     * the search's answer, and a missing row of albums is not worth a message.
+     */
+    suspend fun searchAlbums(query: String, limit: Int = 12): List<AlbumInfo> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return emptyList()
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.searchAlbums(handle, query, limit)) }
+        return when (reply) {
+            is NativeResult.Failed -> emptyList()
+            is NativeResult.Ok -> reply.value.optJSONArray("albums")
+                ?.let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toAlbumInfo() } }
+                ?: emptyList()
+        }
+    }
+
+    /** An album's tracks, in disc order, for its screen. */
+    suspend fun albumTracks(albumId: String): Result<List<TrackInfo>> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.albumTracks(handle, albumId)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.optJSONArray("tracks")?.toTrackList() ?: emptyList())
+        }
+    }
+
+    /**
      * What to offer while the listener is typing.
      *
      * Failures are answered with an empty list rather than reported: a dropdown

@@ -79,6 +79,8 @@ data class BestMatch(
     val coverUri: String?,
     /** What to search for when the row is pressed. */
     val query: String,
+    /** Set when the guess is an album: pressing the row opens it instead. */
+    val album: AlbumInfo? = null,
 ) {
     fun coverUrl(size: Int): String? = coverUrlOf(coverUri, size)
 
@@ -101,11 +103,34 @@ fun JSONObject.toSuggest(): Suggest =
                 subtitle = best.optString("subtitle"),
                 coverUri = if (best.isNull("cover_uri")) null else best.optString("cover_uri"),
                 query = best.optString("query"),
+                album = best.optJSONObject("album")?.toAlbumInfo(),
             )
         },
         suggestions = optJSONArray("suggestions")
             ?.let { array -> (0 until array.length()).mapNotNull { array.optString(it).ifBlank { null } } }
             ?: emptyList(),
+    )
+
+/** An album as a search card or the head of the album screen shows it. */
+data class AlbumInfo(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val coverUri: String?,
+    val year: Int?,
+    val trackCount: Int?,
+) {
+    fun coverUrl(size: Int): String? = coverUrlOf(coverUri, size)
+}
+
+fun JSONObject.toAlbumInfo(): AlbumInfo =
+    AlbumInfo(
+        id = optString("id"),
+        title = optString("title"),
+        artist = optString("artist"),
+        coverUri = if (isNull("cover_uri")) null else optString("cover_uri"),
+        year = if (isNull("year")) null else optInt("year"),
+        trackCount = if (isNull("track_count")) null else optInt("track_count"),
     )
 
 /** A list of tracks as the core expects it. */

@@ -220,6 +220,25 @@ impl Session {
         Ok(found.iter().map(Track::to_track_ref).collect())
     }
 
+    /// Albums matching the query, for the row of cards above the tracks.
+    pub fn search_albums(&self, query: &str, limit: usize) -> Result<serde_json::Value> {
+        if query.trim().is_empty() {
+            return Ok(serde_json::json!({ "albums": [] }));
+        }
+        let api = self.api()?;
+        let albums = self
+            .runtime
+            .block_on(api.search_albums(query.trim(), limit.clamp(1, 30)))?;
+        Ok(serde_json::json!({ "albums": albums }))
+    }
+
+    /// An album's tracks, in disc order, for the album page. Nothing is queued.
+    pub fn album_tracks(&self, album_id: &str) -> Result<Vec<TrackRef>> {
+        let api = self.api()?;
+        let tracks = self.runtime.block_on(api.album_tracks(album_id.trim()))?;
+        Ok(tracks.iter().map(Track::to_track_ref).collect())
+    }
+
     /// What to offer while the listener is still typing; see `api::suggest`.
     pub fn suggest(&self, part: &str) -> Result<serde_json::Value> {
         let part = part.trim();

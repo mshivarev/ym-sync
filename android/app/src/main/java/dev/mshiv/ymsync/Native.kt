@@ -34,6 +34,12 @@ object Native {
      */
     external fun suggest(handle: Long, part: String): String
 
+    /** Albums matching the query, for the row of cards above the tracks. */
+    external fun searchAlbums(handle: Long, query: String, limit: Int): String
+
+    /** An album's tracks, for its screen. Queues nothing. */
+    external fun albumTracks(handle: Long, albumId: String): String
+
     /**
      * Queues tracks the screen already holds in full — a search result, a row of
      * the offline library. Costs no Yandex request, which is the point.

@@ -136,6 +136,31 @@ impl YandexMusic {
             .with_context(|| format!("трека {track_id} нет на этом аккаунте"))
     }
 
+    /// Albums whose name or artist matches, for the row of cards above the
+    /// tracks in search results.
+    pub async fn search_albums(&self, text: &str, limit: usize) -> Result<Vec<AlbumInfo>> {
+        let found: AlbumSearchResponse = self
+            .get_result(
+                "/search",
+                &[
+                    ("text", text),
+                    ("type", "album"),
+                    ("page", "0"),
+                    ("nocorrect", "false"),
+                ],
+            )
+            .await?;
+        let mut albums: Vec<AlbumInfo> = found
+            .albums
+            .map(|bucket| bucket.results)
+            .unwrap_or_default()
+            .into_iter()
+            .map(RawAlbum::into_info)
+            .collect();
+        albums.truncate(limit);
+        Ok(albums)
+    }
+
     /// Every track of an album, in disc order.
     pub async fn album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
         let album: AlbumWithTracks = self
@@ -498,6 +523,9 @@ pub struct BestMatch {
     pub cover_uri: Option<String>,
     /// What to search for when the row is pressed.
     pub query: String,
+    /// Set when the guess is an album: pressing the row opens that album rather
+    /// than searching for its tracks.
+    pub album: Option<AlbumInfo>,
 }
 
 impl BestMatch {
@@ -527,6 +555,17 @@ impl BestMatch {
             .or(result.og_image)
             .or_else(|| result.albums.first().and_then(|album| album.cover_uri.clone()))
             .filter(|uri| !uri.trim().is_empty());
+        let album = match (raw.kind.as_str(), &result.id) {
+            ("album", Some(id)) => Some(AlbumInfo {
+                id: id.0.clone(),
+                title: name.clone(),
+                artist: subtitle.clone(),
+                cover_uri: cover_uri.clone(),
+                year: result.year,
+                track_count: result.track_count,
+            }),
+            _ => None,
+        };
         Some(Self {
             query: if subtitle.is_empty() {
                 name.clone()
@@ -537,6 +576,7 @@ impl BestMatch {
             name,
             subtitle,
             cover_uri,
+            album,
         })
     }
 }
@@ -562,6 +602,12 @@ struct RawBest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawBestResult {
+    #[serde(default)]
+    id: Option<Id>,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    track_count: Option<u32>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -592,6 +638,65 @@ struct SearchResponse {
 struct SearchBucket {
     #[serde(default)]
     results: Vec<Track>,
+}
+
+/// `/search?type=album`: the same envelope, with albums in it.
+#[derive(Debug, Deserialize)]
+struct AlbumSearchResponse {
+    #[serde(default)]
+    albums: Option<AlbumBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumBucket {
+    #[serde(default)]
+    results: Vec<RawAlbum>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAlbum {
+    id: Id,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artists: Vec<Artist>,
+    #[serde(default)]
+    cover_uri: Option<String>,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    track_count: Option<u32>,
+}
+
+/// An album as a search result or the head of an album page shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlbumInfo {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    /// The same template as a track's; each screen asks for its own size.
+    pub cover_uri: Option<String>,
+    pub year: Option<u32>,
+    pub track_count: Option<u32>,
+}
+
+impl RawAlbum {
+    fn into_info(self) -> AlbumInfo {
+        AlbumInfo {
+            id: self.id.0,
+            title: self.title,
+            artist: self
+                .artists
+                .iter()
+                .map(|artist| artist.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            cover_uri: self.cover_uri.filter(|uri| !uri.trim().is_empty()),
+            year: self.year,
+            track_count: self.track_count,
+        }
+    }
 }
 
 /// `/albums/{id}/with-tracks` groups tracks by disc.
@@ -970,6 +1075,56 @@ mod tests {
     fn ids_decode_from_strings_and_numbers() {
         assert_eq!(serde_json::from_str::<Id>("\"123\"").unwrap(), Id("123".into()));
         assert_eq!(serde_json::from_str::<Id>("123").unwrap(), Id("123".into()));
+    }
+
+    #[test]
+    fn album_search_reads_what_a_card_shows() {
+        let found: AlbumSearchResponse = serde_json::from_str(
+            r#"{"albums": {"results": [
+                {"id": 5307396, "title": "Группа крови", "artists": [{"name": "Кино"}],
+                 "coverUri": "avatars.yandex.net/a/%%", "year": 1988, "trackCount": 11},
+                {"id": "7", "title": "Без обложки"}
+            ]}}"#,
+        )
+        .unwrap();
+        let albums: Vec<AlbumInfo> = found
+            .albums
+            .unwrap()
+            .results
+            .into_iter()
+            .map(RawAlbum::into_info)
+            .collect();
+
+        assert_eq!(albums[0].id, "5307396");
+        assert_eq!(albums[0].title, "Группа крови");
+        assert_eq!(albums[0].artist, "Кино");
+        assert_eq!(albums[0].year, Some(1988));
+        assert_eq!(albums[0].track_count, Some(11));
+        assert_eq!(albums[0].cover_uri.as_deref(), Some("avatars.yandex.net/a/%%"));
+        // Missing fields are absent, not a reason to drop the album.
+        assert_eq!(albums[1].artist, "");
+        assert_eq!(albums[1].cover_uri, None);
+    }
+
+    #[test]
+    fn an_album_best_match_carries_the_album_to_open() {
+        let raw: SuggestResponse = serde_json::from_str(
+            r#"{"best": {"type": "album", "result": {"id": 42, "title": "Дикие травы",
+                "artists": [{"name": "Мельница"}], "year": 2009, "trackCount": 12}}}"#,
+        )
+        .unwrap();
+        let album = BestMatch::from_raw(raw.best.unwrap()).unwrap().album.unwrap();
+        assert_eq!(album.id, "42");
+        assert_eq!(album.title, "Дикие травы");
+        assert_eq!(album.artist, "Мельница");
+        assert_eq!(album.year, Some(2009));
+
+        // Anything else opens nothing: it is searched for, as before.
+        let raw: SuggestResponse = serde_json::from_str(
+            r#"{"best": {"type": "artist", "result": {"id": 1, "name": "Мельница"}}}"#,
+        )
+        .unwrap();
+        assert!(BestMatch::from_raw(raw.best.unwrap()).unwrap().album.is_none());
     }
 
     #[test]

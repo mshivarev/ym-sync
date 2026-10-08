@@ -10,6 +10,8 @@
 //!     external fun send(handle: Long, requestJson: String): String
 //!     external fun search(handle: Long, query: String, limit: Int): String
 //!     external fun suggest(handle: Long, part: String): String
+//!     external fun searchAlbums(handle: Long, query: String, limit: Int): String
+//!     external fun albumTracks(handle: Long, albumId: String): String
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean, start: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
@@ -153,6 +155,49 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_search(
         Ok(query) => match unsafe { borrow(handle) } {
             None => failed("сессия не запущена"),
             Some(session) => match session.search(&query, limit.max(1) as usize) {
+                Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// Albums matching the query.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_searchAlbums(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    query: JString,
+    limit: jint,
+) -> jstring {
+    let text = match read(&mut env, &query) {
+        Err(err) => failed(err),
+        Ok(query) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.search_albums(&query, limit.max(1) as usize) {
+                Ok(value) => ok(value),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// An album's tracks, for its page.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_albumTracks(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    album_id: JString,
+) -> jstring {
+    let text = match read(&mut env, &album_id) {
+        Err(err) => failed(err),
+        Ok(id) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.album_tracks(&id) {
                 Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
                 Err(err) => failed(err),
             },

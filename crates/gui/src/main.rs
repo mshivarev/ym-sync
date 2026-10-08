@@ -340,6 +340,31 @@ async fn search(
     Ok(found.iter().map(Track::to_track_ref).collect())
 }
 
+/// Albums matching the query, for the row of cards above the tracks.
+#[tauri::command]
+async fn search_albums(
+    query: String,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<api::AlbumInfo>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let api = state.api().await?;
+    api.search_albums(query.trim(), limit.clamp(1, 30))
+        .await
+        .map_err(fail)
+}
+
+/// An album's tracks, in disc order, for the album page. Nothing is queued:
+/// the page shows them first, and playing is a button there.
+#[tauri::command]
+async fn album_tracks(id: String, state: State<'_, AppState>) -> Result<Vec<TrackRef>, String> {
+    let api = state.api().await?;
+    let tracks = api.album_tracks(id.trim()).await.map_err(fail)?;
+    Ok(tracks.iter().map(Track::to_track_ref).collect())
+}
+
 /// Resolves `kind`/`value` into tracks and queues them. Returns how many were
 /// added; the wave reports 0, since it delivers as it goes.
 #[tauri::command]
@@ -723,6 +748,8 @@ fn main() {
             disconnect,
             snapshot,
             search,
+            search_albums,
+            album_tracks,
             suggest,
             play_source,
             queue_tracks,
