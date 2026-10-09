@@ -94,8 +94,9 @@ pub struct Insertion {
 
 pub struct Cache {
     dir: PathBuf,
-    /// 0 means no limit.
-    limit_bytes: u64,
+    /// 0 means no limit. Atomic so the settings page can change it while the
+    /// engine is writing tracks.
+    limit_bytes: std::sync::atomic::AtomicU64,
     index: Mutex<HashMap<String, Entry>>,
 }
 
@@ -118,7 +119,7 @@ impl Cache {
         );
         Ok(Self {
             dir,
-            limit_bytes,
+            limit_bytes: std::sync::atomic::AtomicU64::new(limit_bytes),
             index: Mutex::new(index),
         })
     }
@@ -128,7 +129,14 @@ impl Cache {
     }
 
     pub fn limit_bytes(&self) -> u64 {
+        self.limit_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A new limit, honoured from the next track written: lowering it does not
+    /// delete anything on the spot.
+    pub fn set_limit_bytes(&self, limit_bytes: u64) {
         self.limit_bytes
+            .store(limit_bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn audio_path(&self, id: &str) -> PathBuf {
@@ -369,7 +377,8 @@ impl Cache {
     /// a single download already exceeds the limit. Returns how many went, and
     /// whether the cache is still over its limit with nothing left to give.
     fn evict_to_fit(&self, keep: &str) -> (usize, bool) {
-        if self.limit_bytes == 0 {
+        let limit_bytes = self.limit_bytes();
+        if limit_bytes == 0 {
             return (0, false);
         }
 
@@ -378,7 +387,7 @@ impl Cache {
             let (total, oldest) = {
                 let index = self.lock();
                 let total: u64 = index.values().map(|e| e.sidecar.bytes).sum();
-                if total <= self.limit_bytes {
+                if total <= limit_bytes {
                     return (evicted, false);
                 }
                 let oldest = index
@@ -392,7 +401,7 @@ impl Cache {
             let Some(id) = oldest else {
                 warn!(
                     total,
-                    limit = self.limit_bytes,
+                    limit = limit_bytes,
                     "cache is over its limit but everything left was downloaded on purpose"
                 );
                 return (evicted, true);

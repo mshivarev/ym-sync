@@ -151,6 +151,8 @@ pub enum Command {
     SetShuffle(bool),
     /// Changes the name the room shows for this listener.
     SetName(String),
+    /// Whether everything that plays is kept, not only explicit downloads.
+    SetAutoCache(bool),
     Shutdown,
 }
 
@@ -812,6 +814,7 @@ impl Engine {
             }
             Command::SetRepeat(mode) => self.ask(ymsync_proto::Command::SetRepeat { mode }),
             Command::SetShuffle(on) => self.ask(ymsync_proto::Command::SetShuffle { on }),
+            Command::SetAutoCache(on) => self.auto_cache = on,
             Command::SetName(name) => {
                 if !self.link.set_name(&name) {
                     self.connected = false;

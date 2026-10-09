@@ -82,6 +82,32 @@ const ui = {
   volume: el("volume"),
   drift: el("drift"),
   toast: el("toast"),
+  albumEyebrow: el("album-eyebrow"),
+  albumNext: el("album-next"),
+  playlists: el("playlists"),
+  shuffle: el("shuffle"),
+  repeat: el("repeat"),
+  lyricsBtn: el("lyrics-btn"),
+  lyrics: el("lyrics"),
+  lyricsTitle: el("lyrics-title"),
+  lyricsArtist: el("lyrics-artist"),
+  lyricsCover: el("lyrics-cover"),
+  lyricsWriters: el("lyrics-writers"),
+  listenersCard: el("listeners-card"),
+  listeners: el("listeners"),
+  rename: el("rename"),
+  login: el("login"),
+  setName: el("set-name"),
+  setNameHint: el("set-name-hint"),
+  setAccount: el("set-account"),
+  setLogin: el("set-login"),
+  setToken: el("set-token"),
+  setSaveToken: el("set-save-token"),
+  setLimit: el("set-limit"),
+  setAuto: el("set-auto"),
+  setDir: el("set-dir"),
+  setSave: el("set-save"),
+  setPath: el("set-path"),
 };
 
 /// How much has to be typed before the search runs by itself. Below this, only
@@ -104,6 +130,15 @@ const TAB_HEADS = {
   all: { title: "Скачанное", art: "", icon: "i-download" },
   likes: { title: "Мне нравится", art: "likes", icon: "i-heart" },
   albums: { title: "По альбомам", art: "albums", icon: "i-library" },
+  playlists: { title: "Плейлисты", art: "albums", icon: "i-queue" },
+};
+
+/// The order the repeat button steps through, and how it says each.
+const REPEAT_NEXT = { off: 1, all: 2, one: 0 };
+const REPEAT_TITLES = {
+  off: "повтор выключен — для всей комнаты",
+  all: "повтор очереди — для всей комнаты",
+  one: "повтор трека — для всей комнаты",
 };
 
 let connected = false;
@@ -151,6 +186,18 @@ let roomName = "";
 /// The cover last drawn in the player, so a snapshot four times a second does not
 /// reload the same picture.
 let coverKey = null;
+/// The account's playlists, fetched the first time their tab is opened.
+let playlists = null;
+/// The page the album/playlist view goes back to.
+let albumReturn = "home";
+/// The words on the lyrics page: whose they are, and the timed lines if any.
+let lyricsFor = null;
+let lyricsLines = [];
+let lyricsToken = 0;
+/// The line lit up last, so a snapshot four times a second does not restyle all.
+let lyricsLit = -1;
+/// The page that was open before the lyrics, for the button to go back to.
+let beforeLyrics = "home";
 
 function fmt(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
@@ -456,13 +503,14 @@ function renderAlbumCards() {
 /// knows; the tracks follow from Yandex.
 async function openAlbum(album) {
   hideSuggest();
+  albumReturn = "home";
+  ui.albumEyebrow.textContent = "Альбом";
   const mine = ++albumToken;
   albumTracks = [];
   ui.albumTitle.textContent = album.title;
   ui.albumMeta.textContent = albumFacts(album);
   fillCover(ui.albumCover, album, 400);
-  ui.albumPlay.disabled = true;
-  ui.albumQueue.disabled = true;
+  setAlbumButtons(false);
   ui.albumTracks.replaceChildren(emptyRow("загружаю треки…"));
   showView("album");
 
@@ -477,11 +525,38 @@ async function openAlbum(album) {
   renderAlbumTracks();
 }
 
+/// One of the account's playlists, on the same page an album gets.
+async function openPlaylist(playlist) {
+  albumReturn = "library";
+  ui.albumEyebrow.textContent = "Плейлист";
+  const mine = ++albumToken;
+  albumTracks = [];
+  ui.albumTitle.textContent = playlist.title;
+  ui.albumMeta.textContent = playlist.track_count ? tracksWord(playlist.track_count) : "";
+  fillCover(ui.albumCover, playlist, 400);
+  setAlbumButtons(false);
+  ui.albumTracks.replaceChildren(emptyRow("загружаю треки…"));
+  showView("album");
+
+  const tracks = await call("playlist_tracks", { owner: playlist.owner, kind: playlist.kind });
+  if (mine !== albumToken) return;
+  if (!tracks) {
+    ui.albumTracks.replaceChildren(emptyRow("не удалось загрузить плейлист"));
+    return;
+  }
+  albumTracks = tracks;
+  ui.albumMeta.textContent = tracksWord(tracks.length);
+  renderAlbumTracks();
+}
+
+function setAlbumButtons(enabled) {
+  for (const node of [ui.albumPlay, ui.albumQueue, ui.albumNext]) node.disabled = !enabled;
+}
+
 function renderAlbumTracks() {
-  ui.albumPlay.disabled = albumTracks.length === 0;
-  ui.albumQueue.disabled = albumTracks.length === 0;
+  setAlbumButtons(albumTracks.length > 0);
   if (!albumTracks.length) {
-    ui.albumTracks.replaceChildren(emptyRow("в альбоме нет доступных треков"));
+    ui.albumTracks.replaceChildren(emptyRow("здесь нет доступных треков"));
     return;
   }
   ui.albumTracks.replaceChildren(
@@ -501,9 +576,15 @@ ui.albumQueue.addEventListener("click", async () => {
     attempt("queue_tracks", { tracks: albumTracks, start: 0, replace: false }),
   );
   ui.albumQueue.disabled = false;
-  if (done) toast(`в очереди: альбом «${ui.albumTitle.textContent}»`);
+  if (done) toast(`в очереди: «${ui.albumTitle.textContent}»`);
 });
-ui.albumBack.addEventListener("click", () => showView("home"));
+ui.albumNext.addEventListener("click", async () => {
+  ui.albumNext.disabled = true;
+  const done = await withRoom(() => attempt("play_next", { tracks: albumTracks }));
+  ui.albumNext.disabled = false;
+  if (done) toast(`следующим: «${ui.albumTitle.textContent}»`);
+});
+ui.albumBack.addEventListener("click", () => showView(albumReturn));
 
 /// What pressing a line of the dropdown does: an album opens, anything else is
 /// searched for.
@@ -559,7 +640,8 @@ function showView(name) {
   }
   // An album page is reached from the home page's search, so that is where the
   // menu says you are.
-  const section = name === "album" ? "home" : name;
+  const section = name === "album" ? albumReturn : name;
+  if (name !== "lyrics") ui.lyricsBtn.classList.remove("on");
   for (const item of ui.nav.querySelectorAll(".nav-item")) {
     item.classList.toggle("current", item.dataset.view === section);
   }
@@ -595,9 +677,10 @@ function setConnected(value) {
   // Protocol 3 has no roles: everyone in the room may drive it.
   // Only what needs something already playing is turned off. Everything that
   // starts music stays live: pressing it raises a room on this PC first.
-  for (const node of [ui.prev, ui.toggle, ui.next, ui.seek, ui.dlTrack, ui.dlQueue]) {
+  for (const node of [ui.prev, ui.toggle, ui.next, ui.seek, ui.dlTrack, ui.dlQueue, ui.shuffle, ui.repeat]) {
     node.disabled = !value;
   }
+  ui.listenersCard.classList.toggle("hidden", !value);
   updateLibraryButtons();
 
   if (!value) {
@@ -634,6 +717,8 @@ function setConnected(value) {
     fillCover(ui.nowCover, null, 400);
     document.body.classList.remove("playing");
     setIcon(ui.toggle, "i-play");
+    renderModes(null);
+    ui.listeners.replaceChildren();
     ui.seek.value = 0;
     paintRange(ui.seek);
     ui.position.textContent = "0:00";
@@ -749,7 +834,7 @@ function trackItem(track, index, { current, onClick, trailing, extra, queueable 
   item.append(entry);
   // Pressing the row plays it; this adds it to the end without interrupting.
   // Not on the queue's own rows, where every track is already queued.
-  if (queueable) item.append(queueButton(track));
+  if (queueable) item.append(playNextButton(track), queueButton(track));
   item.append(heartButton(track));
   if (extra) item.append(extra);
   return item;
@@ -771,6 +856,22 @@ function queueButton(track) {
     );
     button.disabled = false;
     if (done) toast(`в очереди: ${track.artist} — ${track.title}`);
+  });
+  return button;
+}
+
+/// «Играть следующим»: right after the current track, for the whole room.
+function playNextButton(track) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "enqueue";
+  button.append(icon("i-playnext"));
+  button.title = "играть следующим";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    const done = await withRoom(() => attempt("play_next", { tracks: [track] }));
+    button.disabled = false;
+    if (done) toast(`следующим: ${track.artist} — ${track.title}`);
   });
   return button;
 }
@@ -838,7 +939,14 @@ function renderLibrary() {
   ui.libArt.className = `playlist-art ${head.art}`;
   setIcon(ui.libArt, head.icon);
 
-  if (tab === "likes") {
+  const onPlaylists = tab === "playlists";
+  ui.playlists.classList.toggle("hidden", !onPlaylists);
+  ui.library.classList.toggle("hidden", onPlaylists);
+  for (const node of [ui.libPlay, ui.libQueue, ui.libImport]) node.classList.toggle("hidden", onPlaylists);
+
+  if (onPlaylists) {
+    renderPlaylists();
+  } else if (tab === "likes") {
     renderLikes();
   } else if (tab === "albums") {
     renderAlbums();
@@ -884,6 +992,62 @@ function renderLikes() {
       }),
     ),
   );
+}
+
+/// The account's playlists as cards; a card opens the playlist's page. Fetched
+/// the first time the tab is opened, since unlike the rest this needs Yandex.
+function renderPlaylists() {
+  if (playlists === null) {
+    ui.playlists.replaceChildren(emptyNote("загружаю плейлисты…"));
+    loadPlaylists();
+    return;
+  }
+  if (!playlists.length) {
+    ui.playlists.replaceChildren(emptyNote("У аккаунта нет своих плейлистов"));
+    return;
+  }
+  ui.playlists.replaceChildren(
+    ...playlists.map((playlist) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "album-card";
+      card.title = `открыть плейлист «${playlist.title}»`;
+      const art = document.createElement("span");
+      art.className = "art";
+      fillCover(art, playlist, 200);
+      const name = document.createElement("span");
+      name.className = "album-name";
+      name.textContent = playlist.title;
+      const by = document.createElement("span");
+      by.className = "album-by";
+      by.textContent = tracksWord(playlist.track_count);
+      card.append(art, name, by);
+      card.addEventListener("click", () => openPlaylist(playlist));
+      return card;
+    }),
+  );
+}
+
+let loadingPlaylists = false;
+async function loadPlaylists() {
+  if (loadingPlaylists) return;
+  loadingPlaylists = true;
+  const found = await call("my_playlists");
+  loadingPlaylists = false;
+  playlists = found ?? [];
+  if (!found) {
+    ui.playlists.replaceChildren(emptyNote("не удалось загрузить — нужен интернет и вход в Яндекс; ↻ — повторить"));
+    playlists = null;
+    return;
+  }
+  if (tab === "playlists") renderLibrary();
+}
+
+function emptyNote(text) {
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent = text;
+  return note;
 }
 
 /// The downloads grouped by album, with a header per album that queues the whole
@@ -971,12 +1135,18 @@ function dropButton(entry) {
 
 /// What «Играть» and «В очередь» act on: whatever the open tab is showing.
 function visibleTracks() {
+  if (tab === "playlists") return [];
   if (tab === "likes") return likes;
   if (tab === "albums") return albumGroups().flatMap((group) => group.tracks);
   return library;
 }
 
 function updateLibraryHint() {
+  if (tab === "playlists") {
+    ui.libCount.textContent = playlists?.length ? `${playlists.length} шт.` : "";
+    ui.libHint.textContent = "свои плейлисты аккаунта Яндекса";
+    return;
+  }
   if (tab === "likes") {
     const marked = likes.filter((track) => cachedIds.has(track.track_id)).length;
     ui.libCount.textContent = likes.length ? `${tracksWord(likes.length)} · ${marked} на этом устройстве` : "";
@@ -1067,6 +1237,9 @@ function render(snapshot) {
 
   renderNow(snapshot.track);
   updateHeart();
+  renderModes(snapshot);
+  renderListeners(snapshot.listeners || []);
+  followLyrics(snapshot);
 
   const place = snapshot.queue.length ? `${snapshot.index + 1} из ${snapshot.queue.length}` : "";
   const note = snapshot.loading ? "загрузка…" : (snapshot.notice || "");
@@ -1161,6 +1334,221 @@ function render(snapshot) {
   }
 }
 
+/// Shuffle and repeat are the room's, so the buttons show what the room has.
+function renderModes(snapshot) {
+  const repeat = snapshot?.repeat ?? "off";
+  ui.repeat.classList.toggle("on", repeat !== "off");
+  setIcon(ui.repeat, repeat === "one" ? "i-repeat-one" : "i-repeat");
+  ui.repeat.title = REPEAT_TITLES[repeat] ?? REPEAT_TITLES.off;
+  ui.repeat.dataset.mode = repeat;
+  const shuffled = Boolean(snapshot?.shuffle);
+  ui.shuffle.classList.toggle("on", shuffled);
+  ui.shuffle.title = shuffled ? "перемешано — нажмите, чтобы выключить" : "перемешать — для всей комнаты";
+}
+
+ui.repeat.addEventListener("click", () =>
+  call("control", { action: "repeat", value: REPEAT_NEXT[ui.repeat.dataset.mode ?? "off"] ?? 1 }),
+);
+ui.shuffle.addEventListener("click", () =>
+  call("control", { action: "shuffle", value: latest?.shuffle ? 0 : 1 }),
+);
+
+let listenersKey = "";
+/// Who is in the room, by the names they chose.
+function renderListeners(listeners) {
+  const key = listeners.map((one) => `${one.you ? "*" : ""}${one.name}`).join("\n");
+  if (key === listenersKey) return;
+  listenersKey = key;
+  ui.listeners.replaceChildren(
+    ...listeners.map((one) => {
+      const item = document.createElement("li");
+      const avatar = document.createElement("span");
+      avatar.className = "avatar";
+      avatar.textContent = (one.name || "?").trim().charAt(0).toUpperCase() || "?";
+      const name = document.createElement("span");
+      name.className = "listener-name";
+      name.textContent = one.name || "без имени";
+      item.append(avatar, name);
+      if (one.you) {
+        const you = document.createElement("span");
+        you.className = "chip";
+        you.textContent = "вы";
+        item.append(you);
+      }
+      return item;
+    }),
+  );
+}
+
+ui.rename.addEventListener("click", () => {
+  showView("settings");
+  ui.setName.focus();
+});
+
+// ---------- lyrics ----------
+
+ui.lyricsBtn.addEventListener("click", () => {
+  const open = !document.querySelector('.view[data-view="lyrics"]').classList.contains("hidden");
+  if (open) {
+    showView(beforeLyrics);
+    return;
+  }
+  const current = document.querySelector(".view:not(.hidden)");
+  beforeLyrics = current?.dataset.view ?? "home";
+  showView("lyrics");
+  ui.lyricsBtn.classList.add("on");
+  loadLyrics(latest?.track ?? null);
+});
+
+/// Fetches the words of a track, once per track.
+async function loadLyrics(track) {
+  const id = track?.track_id ?? null;
+  if (id === lyricsFor) return;
+  lyricsFor = id;
+  lyricsLines = [];
+  lyricsLit = -1;
+  const mine = ++lyricsToken;
+  ui.lyricsTitle.textContent = track ? track.title : "Тишина";
+  ui.lyricsArtist.textContent = track ? track.artist : "";
+  ui.lyricsWriters.textContent = "";
+  fillCover(ui.lyricsCover, track, 200);
+  if (!track) {
+    ui.lyrics.replaceChildren(emptyNote("сейчас ничего не играет"));
+    return;
+  }
+  ui.lyrics.replaceChildren(emptyNote("ищу текст…"));
+  let found = null;
+  try {
+    found = await invoke("lyrics", { id });
+  } catch (err) {
+    if (mine !== lyricsToken) return;
+    ui.lyrics.replaceChildren(emptyNote(`не удалось загрузить текст: ${err}`));
+    lyricsFor = null;
+    return;
+  }
+  if (mine !== lyricsToken) return;
+  if (!found) {
+    ui.lyrics.replaceChildren(emptyNote("у этого трека нет текста"));
+    return;
+  }
+  ui.lyricsWriters.textContent = found.writers?.length ? `Авторы: ${found.writers.join(", ")}` : "";
+  if (found.synced) {
+    lyricsLines = found.lines;
+    ui.lyrics.classList.add("synced");
+    ui.lyrics.replaceChildren(
+      ...found.lines.map((line) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "lyric";
+        row.textContent = line.text || "♪";
+        row.title = "перейти к этому месту";
+        row.addEventListener("click", () => call("control", { action: "seek", value: line.at_ms }));
+        return row;
+      }),
+    );
+  } else {
+    ui.lyrics.classList.remove("synced");
+    const text = document.createElement("div");
+    text.className = "lyrics-text";
+    text.textContent = found.text;
+    ui.lyrics.replaceChildren(text);
+  }
+  if (latest) followLyrics(latest);
+}
+
+/// Keeps the lyrics page on the track playing and the line being sung.
+function followLyrics(snapshot) {
+  if (document.querySelector('.view[data-view="lyrics"]').classList.contains("hidden")) return;
+  const id = snapshot.track?.track_id ?? null;
+  if (id !== lyricsFor) {
+    loadLyrics(snapshot.track ?? null);
+    return;
+  }
+  if (!lyricsLines.length) return;
+  let lit = -1;
+  for (let i = 0; i < lyricsLines.length && lyricsLines[i].at_ms <= snapshot.position_ms; i++) lit = i;
+  if (lit === lyricsLit) return;
+  const rows = ui.lyrics.children;
+  rows[lyricsLit]?.classList.remove("lit");
+  lyricsLit = lit;
+  const row = rows[lit];
+  if (row) {
+    row.classList.add("lit");
+    row.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+// ---------- settings ----------
+
+/// Fills the settings page from what the backend says is saved.
+function fillSettings(settings) {
+  ui.setName.value = settings.name;
+  ui.setNameHint.textContent = settings.name
+    ? "Так вас видят остальные в комнате."
+    : `Пусто — будет «${settings.display_name}».`;
+  ui.setLimit.value = settings.cache_limit_bytes ? +(settings.cache_limit_bytes / 1024 ** 3).toFixed(2) : 0;
+  ui.setAuto.checked = settings.auto_cache;
+  ui.setDir.textContent = settings.cache_dir ? `папка: ${settings.cache_dir}` : "";
+  ui.setPath.textContent = settings.config_path ? `файл настроек: ${settings.config_path}` : "";
+  setAccount(settings.has_yandex_token);
+}
+
+function setAccount(signedIn) {
+  ui.setAccount.textContent = signedIn ? "вход выполнен" : "вход не выполнен — поиск, волна и «Мне нравится» недоступны";
+  ui.setAccount.className = `status ${signedIn ? "live" : "broken"}`;
+  ui.setLogin.innerHTML = "";
+  ui.setLogin.append(icon("i-user"), signedIn ? "Войти в другой аккаунт" : "Войти через Яндекс");
+  ui.tokenLine.classList.toggle("hidden", signedIn);
+}
+
+ui.setSave.addEventListener("click", async () => {
+  ui.setSave.disabled = true;
+  const saved = await call("save_settings", {
+    name: ui.setName.value,
+    cacheLimitGb: Number(ui.setLimit.value) || 0,
+    autoCache: ui.setAuto.checked,
+  });
+  ui.setSave.disabled = false;
+  if (!saved) return;
+  fillSettings(saved);
+  cacheLimit = saved.cache_limit_bytes;
+  autoCache = saved.auto_cache;
+  renderLibrary();
+  toast("настройки сохранены");
+});
+ui.setName.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") ui.setSave.click();
+});
+
+/// Opens Yandex's own sign-in in a window of its own; the result comes back as
+/// a `login` event.
+async function login() {
+  await call("yandex_login");
+}
+ui.login.addEventListener("click", login);
+ui.setLogin.addEventListener("click", login);
+
+listen("login", (event) => {
+  const { ok, message } = event.payload;
+  toast(message);
+  if (!ok) return;
+  setAccount(true);
+  playlists = null;
+  if (tab === "playlists") renderLibrary();
+}).catch(() => {});
+
+/// The token field on the settings page, for whoever has one already.
+ui.setSaveToken.addEventListener("click", async () => {
+  if (!ui.setToken.value.trim()) return;
+  ui.setSaveToken.disabled = true;
+  const verdict = await call("save_token", { token: ui.setToken.value });
+  ui.setSaveToken.disabled = false;
+  if (verdict === null) return;
+  ui.setToken.value = "";
+  setAccount(true);
+  toast(verdict);
+});
+
 /// Joins a room, or holds it here. The two buttons differ only in `host`.
 async function enter(button, host) {
   ui.connect.disabled = true;
@@ -1211,7 +1599,7 @@ ui.saveToken.addEventListener("click", async () => {
   if (verdict === null) return;
 
   ui.token.value = "";
-  ui.tokenLine.classList.add("hidden");
+  setAccount(true);
   toast(verdict);
 });
 
@@ -1437,6 +1825,11 @@ ui.libImport.addEventListener("click", async () => {
 // Re-reading means two different things: the folder on this disk, or the playlist
 // on Yandex. Which one depends on what is on screen.
 ui.libRefresh.addEventListener("click", async () => {
+  if (tab === "playlists") {
+    playlists = null;
+    renderLibrary();
+    return;
+  }
   if (tab !== "likes") {
     await refreshLibrary();
     return;
@@ -1561,6 +1954,7 @@ ui.update.addEventListener("click", async () => {
     ? `${settings.room} · в прошлый раз комнату держал этот ПК`
     : `${settings.room} · ${settings.relay}`;
 
+  fillSettings(settings);
   cacheDir = settings.cache_dir;
   cacheLimit = settings.cache_limit_bytes;
   autoCache = settings.auto_cache;
@@ -1572,8 +1966,7 @@ ui.update.addEventListener("click", async () => {
   // The Yandex token is the one thing a fresh install has nowhere to come from,
   // so the field appears exactly while it is missing. It stays out of the way
   // afterwards: the file is the place to change a token that already works.
-  ui.tokenLine.classList.toggle("hidden", settings.has_yandex_token);
   if (!settings.has_yandex_token) {
-    toast(`Впишите токен Яндекса на странице «Комната» — или в ${settings.config_path}`);
+    toast("Войдите в Яндекс на странице «Настройки» — без этого поиск и волна недоступны");
   }
 })();

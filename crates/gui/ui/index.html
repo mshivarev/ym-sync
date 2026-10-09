@@ -32,6 +32,13 @@
     <symbol id="i-add" viewBox="0 0 24 24"><path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z" /></symbol>
     <symbol id="i-power" viewBox="0 0 24 24"><path d="M13 3h-2v10h2V3zm4.83 2.17-1.42 1.42A6.92 6.92 0 0 1 19 12c0 3.87-3.13 7-7 7A6.995 6.995 0 0 1 7.58 6.58L6.17 5.17A8.932 8.932 0 0 0 3 12a9 9 0 0 0 18 0c0-2.74-1.23-5.18-3.17-6.83z" /></symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z" /></symbol>
+    <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" /></symbol>
+    <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" /></symbol>
+    <symbol id="i-repeat-one" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z" /></symbol>
+    <symbol id="i-lyrics" viewBox="0 0 24 24"><path d="M3 5h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm15-8v8.18A3 3 0 0 0 17 13c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V7h2V5h-4z" /></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M19.14 12.94a7.07 7.07 0 0 0 .06-.94c0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87a.47.47 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.47.47 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z" /></symbol>
+    <symbol id="i-playnext" viewBox="0 0 24 24"><path d="M3 10h11v2H3zm0-4h11v2H3zm0 8h7v2H3zm13-1v8l6-4z" /></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" /></symbol>
     <symbol id="i-wave" viewBox="0 0 24 24"><path d="M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z" /></symbol>
   </svg>
 
@@ -55,6 +62,9 @@
       </button>
       <button type="button" class="nav-item" data-view="room">
         <svg class="i"><use href="#i-devices" /></svg><span>Комната</span>
+      </button>
+      <button type="button" class="nav-item" data-view="settings">
+        <svg class="i"><use href="#i-settings" /></svg><span>Настройки</span>
       </button>
     </nav>
 
@@ -144,8 +154,8 @@
       <p id="results-hint" class="hint">Клик по треку включит его, кнопка «в очередь» при наведении — добавит в конец.</p>
     </section>
 
-    <!-- One album: opened from a card in the search results. Nothing plays until
-         one of the buttons, or a track, is pressed. -->
+    <!-- One album or playlist: opened from a card. Nothing plays until one of the
+         buttons, or a track, is pressed. -->
     <section class="view hidden" data-view="album">
       <button type="button" id="album-back" class="back">
         <svg class="i flip"><use href="#i-chevron" /></svg>Назад
@@ -153,18 +163,36 @@
       <div class="playlist-head">
         <div class="playlist-art album-cover" id="album-cover"></div>
         <div class="playlist-info">
-          <div class="eyebrow">Альбом</div>
+          <div class="eyebrow" id="album-eyebrow">Альбом</div>
           <div class="playlist-title" id="album-title"></div>
           <div class="now-meta" id="album-meta"></div>
           <div class="row">
-            <button id="album-play" class="round-play" title="играть альбом"><svg class="i"><use href="#i-play" /></svg></button>
-            <button id="album-queue" class="btn ghost" title="добавить весь альбом в конец очереди">
+            <button id="album-play" class="round-play" title="играть всё"><svg class="i"><use href="#i-play" /></svg></button>
+            <button id="album-next" class="btn ghost" title="поставить сразу после текущего трека">
+              <svg class="i"><use href="#i-playnext" /></svg>Играть следующим
+            </button>
+            <button id="album-queue" class="btn ghost" title="добавить всё в конец очереди">
               <svg class="i"><use href="#i-add" /></svg>В очередь
             </button>
           </div>
         </div>
       </div>
       <ul id="album-tracks" class="tracks"></ul>
+    </section>
+
+    <!-- The words of what is playing, following the music where Yandex has
+         timings for them. -->
+    <section class="view hidden" data-view="lyrics">
+      <div class="lyrics-head">
+        <div id="lyrics-cover" class="lyrics-cover"></div>
+        <div>
+          <div class="eyebrow">Текст песни</div>
+          <div id="lyrics-title" class="playlist-title small">—</div>
+          <div id="lyrics-artist" class="now-meta"></div>
+        </div>
+      </div>
+      <div id="lyrics" class="lyrics"></div>
+      <p id="lyrics-writers" class="hint"></p>
     </section>
 
     <!-- Queue: what the room is playing and what comes next. -->
@@ -216,14 +244,16 @@
         </div>
       </div>
 
-      <!-- Three views of one library: the flat list, what this account has
-           hearted, and the same downloads grouped by album. -->
+      <!-- Views of one library: the flat list, what this account has hearted,
+           the same downloads grouped by album, and the account's playlists. -->
       <div class="segmented" id="tabs">
         <button type="button" class="seg tab current" data-tab="all">Всё скачанное</button>
         <button type="button" class="seg tab" data-tab="likes">Мне нравится</button>
         <button type="button" class="seg tab" data-tab="albums">По альбомам</button>
+        <button type="button" class="seg tab" data-tab="playlists">Плейлисты</button>
       </div>
 
+      <div id="playlists" class="card-grid hidden"></div>
       <ul id="library" class="tracks"></ul>
       <p id="lib-hint" class="hint"></p>
     </section>
@@ -243,15 +273,30 @@
         </button>
       </div>
 
+      <div id="listeners-card" class="card listeners-card hidden">
+        <div class="card-head">
+          <h2>Кто в комнате</h2>
+          <button type="button" id="rename" class="btn ghost small" title="изменить, как вас видят остальные">
+            <svg class="i"><use href="#i-user" /></svg>Мой ник
+          </button>
+        </div>
+        <ul id="listeners" class="listeners"></ul>
+      </div>
+
       <div id="setup" class="setup">
         <!-- Only on screen while the config has no token. It is the one setting the
              window could not offer, so a fresh install had to go and edit TOML. -->
         <div id="token-line" class="card hidden">
-          <h2>Токен Яндекса</h2>
+          <h2>Аккаунт Яндекса</h2>
           <div class="row">
-            <input id="token" class="field" type="password" placeholder="y0_… — токен аккаунта этого ПК"
+            <button id="login" class="btn primary login-btn" title="откроется страница входа Яндекса; пароль вводится только там">
+              <svg class="i"><use href="#i-user" /></svg>Войти через Яндекс
+            </button>
+          </div>
+          <div class="row">
+            <input id="token" class="field" type="password" placeholder="или вставьте токен: y0_…"
               title="OAuth-токен аккаунта ИМЕННО этого ПК; где его взять — раздел «Токен Яндекса» в README" />
-            <button id="save-token" class="btn primary">Сохранить</button>
+            <button id="save-token" class="btn">Сохранить</button>
           </div>
           <p class="hint">У каждого устройства свой аккаунт с Плюсом.</p>
         </div>
@@ -297,6 +342,61 @@
         </div>
       </div>
     </section>
+
+    <!-- Settings: who you are to the room, the account, and the downloads. -->
+    <section class="view hidden" data-view="settings">
+      <div class="room-head">
+        <div>
+          <div class="eyebrow">ym-sync</div>
+          <div class="playlist-title">Настройки</div>
+        </div>
+      </div>
+
+      <div class="setup">
+        <div class="card">
+          <h2>Ник в комнате</h2>
+          <div class="row">
+            <input id="set-name" class="field" maxlength="32" placeholder="как вас видят остальные" />
+          </div>
+          <p class="hint" id="set-name-hint">Пусто — будет имя компьютера.</p>
+        </div>
+
+        <div class="card">
+          <h2>Аккаунт Яндекса</h2>
+          <div class="row">
+            <span id="set-account" class="status">—</span>
+          </div>
+          <div class="row">
+            <button id="set-login" class="btn primary login-btn" title="откроется страница входа Яндекса; пароль вводится только там">
+              <svg class="i"><use href="#i-user" /></svg>Войти через Яндекс
+            </button>
+          </div>
+          <div class="row">
+            <input id="set-token" class="field" type="password" placeholder="или вставьте токен: y0_…" />
+            <button id="set-save-token" class="btn">Сохранить</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Скачанное</h2>
+          <div class="grid2">
+            <label class="field-label">предел, ГБ (0 — без предела)
+              <input id="set-limit" class="field" type="number" min="0" step="0.5" />
+            </label>
+            <label class="check">
+              <input id="set-auto" type="checkbox" />
+              <span>сохранять всё, что играет, а не только скачанное</span>
+            </label>
+          </div>
+          <p class="hint" id="set-dir"></p>
+        </div>
+
+        <div class="row">
+          <button id="set-save" class="btn primary">Сохранить</button>
+          <span id="set-path" class="hint"></span>
+        </div>
+      </div>
+    </section>
   </main>
 
   <!-- ---------- player ---------- -->
@@ -312,9 +412,11 @@
 
     <div class="center">
       <div class="transport">
+        <button id="shuffle" class="icon-btn mode" title="перемешать — для всей комнаты"><svg class="i"><use href="#i-shuffle" /></svg></button>
         <button id="prev" class="icon-btn" title="предыдущий"><svg class="i"><use href="#i-prev" /></svg></button>
         <button id="toggle" class="play" title="пауза / продолжить"><svg class="i"><use href="#i-play" /></svg></button>
         <button id="next" class="icon-btn" title="следующий"><svg class="i"><use href="#i-next" /></svg></button>
+        <button id="repeat" class="icon-btn mode" title="повтор — для всей комнаты"><svg class="i"><use href="#i-repeat" /></svg></button>
       </div>
       <div class="progress">
         <span id="position" class="time">0:00</span>
@@ -325,6 +427,7 @@
 
     <div class="meters">
       <div id="drift" class="drift hidden"></div>
+      <button id="lyrics-btn" class="icon-btn mode" title="текст песни"><svg class="i"><use href="#i-lyrics" /></svg></button>
       <label class="volume" title="громкость">
         <svg class="i"><use href="#i-volume" /></svg>
         <input id="volume" type="range" min="0" max="100" value="80" />

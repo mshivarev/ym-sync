@@ -19,6 +19,7 @@ use ymsync::cache::{Cache, CachedTrack};
 use ymsync::config::Config;
 use ymsync::discover::{self, FoundRoom};
 use ymsync::engine::{Command, Snapshot};
+use ymsync_proto::RepeatMode;
 use ymsync::import;
 use ymsync::likes::Likes;
 use ymsync::player::Player;
@@ -137,6 +138,10 @@ struct Settings {
     cache_limit_bytes: u64,
     /// Everything that plays is kept, not only explicit downloads.
     auto_cache: bool,
+    /// The name chosen for the room's list; empty when none was.
+    name: String,
+    /// What the room will actually be told — the chosen name or the computer's.
+    display_name: String,
 }
 
 #[tauri::command]
@@ -161,7 +166,38 @@ fn settings(state: State<'_, AppState>) -> Settings {
             .unwrap_or_default(),
         cache_limit_bytes: cfg.cache.limit_bytes(),
         auto_cache: cfg.cache.auto,
+        name: cfg.name.clone(),
+        display_name: cfg.display_name(),
     }
+}
+
+/// Saves the settings page. Everything takes effect at once: a running room
+/// hears the new name, and the cache keeps to the new limit from the next track.
+#[tauri::command]
+async fn save_settings(
+    name: String,
+    cache_limit_gb: f64,
+    auto_cache: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, String> {
+    let mut cfg = state.config();
+    cfg.name = name.trim().to_string();
+    cfg.cache.limit_gb = if cache_limit_gb.is_finite() {
+        cache_limit_gb.max(0.0)
+    } else {
+        0.0
+    };
+    cfg.cache.auto = auto_cache;
+    state.remember(cfg.clone())?;
+
+    if let Some(cache) = state.cache.lock().await.as_ref() {
+        cache.set_limit_bytes(cfg.cache.limit_bytes());
+    }
+    if let Some(session) = state.session.lock().await.as_ref() {
+        session.handle().send(Command::SetName(cfg.display_name()));
+        session.handle().send(Command::SetAutoCache(auto_cache));
+    }
+    Ok(settings(state))
 }
 
 /// Connects, optionally running the room's relay in this process.
@@ -269,6 +305,10 @@ async fn connect(
 /// Returns what to tell the user: whose account it is, and whether it has Плюс.
 #[tauri::command]
 async fn save_token(token: String, state: State<'_, AppState>) -> Result<String, String> {
+    accept_token(token, &state).await
+}
+
+async fn accept_token(token: String, state: &AppState) -> Result<String, String> {
     let token = token.trim().to_string();
     if token.is_empty() {
         return Err("впишите токен — где его взять, написано в README".to_string());
@@ -432,6 +472,128 @@ async fn queue_tracks(
     send(&state, queue_command(tracks, start, replace)).await
 }
 
+/// Puts tracks right after the one playing, for the whole room.
+#[tauri::command]
+async fn play_next(tracks: Vec<TrackRef>, state: State<'_, AppState>) -> Result<(), String> {
+    if tracks.is_empty() {
+        return Err("пустой список".to_string());
+    }
+    send(&state, Command::PlayNext { tracks }).await
+}
+
+/// The account's own playlists, for the collection.
+#[tauri::command]
+async fn my_playlists(state: State<'_, AppState>) -> Result<Vec<api::PlaylistInfo>, String> {
+    let api = state.api().await?;
+    api.my_playlists().await.map_err(fail)
+}
+
+/// A playlist's tracks, for its page. Like an album's, nothing is queued here.
+#[tauri::command]
+async fn playlist_tracks(
+    owner: String,
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TrackRef>, String> {
+    let api = state.api().await?;
+    let tracks = api
+        .playlist_tracks(owner.trim(), kind.trim())
+        .await
+        .map_err(fail)?;
+    Ok(tracks.iter().map(Track::to_track_ref).collect())
+}
+
+/// The words of a track; `None` when Yandex has none.
+#[tauri::command]
+async fn lyrics(id: String, state: State<'_, AppState>) -> Result<Option<api::Lyrics>, String> {
+    let api = state.api().await?;
+    api.lyrics(id.trim()).await.map_err(fail)
+}
+
+/// Where the login window starts: Yandex's own sign-in, for the client id the
+/// Яндекс Музыка apps use, so the token it hands back works with the music API.
+const LOGIN_URL: &str = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d";
+
+/// The token in a redirect like `https://music.yandex.ru/#access_token=…&…`.
+fn token_from_redirect(url: &tauri::Url) -> Option<String> {
+    let fragment = url.fragment()?;
+    fragment
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "access_token")
+        .map(|(_, value)| value.to_string())
+        .filter(|token| !token.is_empty())
+}
+
+/// Opens Yandex's sign-in in a window of its own and takes the token from where
+/// it sends the browser afterwards.
+///
+/// The password goes to Yandex's page and nowhere else; this app only ever sees
+/// the token in the final redirect, which is caught before that page loads. The
+/// outcome comes back to the main window as a `login` event.
+#[tauri::command]
+async fn yandex_login(app: AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    if let Some(window) = app.get_webview_window("login") {
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    let url: tauri::Url = LOGIN_URL.parse().map_err(fail)?;
+    // Both hooks look, because which of them sees the fragment varies by
+    // webview; the flag makes sure the token is taken once.
+    let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let take = {
+        let app = app.clone();
+        move |url: &tauri::Url| -> bool {
+            let Some(token) = token_from_redirect(url) else {
+                return false;
+            };
+            if taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(window) = app.get_webview_window("login") {
+                    let _ = window.close();
+                }
+                let state = app.state::<AppState>();
+                let outcome = accept_token(token, &state).await;
+                let _ = app.emit("login", LoginOutcome::from(outcome));
+            });
+            true
+        }
+    };
+    let take = Arc::new(take);
+    let on_nav = Arc::clone(&take);
+    let on_load = Arc::clone(&take);
+    WebviewWindowBuilder::new(&app, "login", WebviewUrl::External(url))
+        .title("Вход в Яндекс")
+        .inner_size(480.0, 720.0)
+        .on_navigation(move |url| !on_nav(url))
+        .on_page_load(move |_, payload| {
+            on_load(payload.url());
+        })
+        .build()
+        .map_err(fail)?;
+    Ok(())
+}
+
+/// What the main window is told when the login window is done.
+#[derive(Clone, Serialize)]
+struct LoginOutcome {
+    ok: bool,
+    message: String,
+}
+
+impl From<Result<String, String>> for LoginOutcome {
+    fn from(outcome: Result<String, String>) -> Self {
+        match outcome {
+            Ok(message) => Self { ok: true, message },
+            Err(message) => Self { ok: false, message },
+        }
+    }
+}
+
 fn queue_command(tracks: Vec<TrackRef>, start: usize, replace: bool) -> Command {
     if replace {
         Command::SetQueue { tracks, start }
@@ -456,6 +618,12 @@ async fn control(
         "volume" => Command::SetVolume(number as f32),
         "index" => Command::PlayIndex(number.max(0.0) as usize),
         "stop_wave" => Command::StopStation,
+        "repeat" => Command::SetRepeat(match number as i64 {
+            1 => RepeatMode::All,
+            2 => RepeatMode::One,
+            _ => RepeatMode::Off,
+        }),
+        "shuffle" => Command::SetShuffle(number != 0.0),
         other => return Err(format!("неизвестное действие: {other}")),
     };
     send(&state, command).await
@@ -764,7 +932,13 @@ fn main() {
             find_rooms,
             import_tracks,
             check_update,
-            install_update
+            install_update,
+            save_settings,
+            play_next,
+            my_playlists,
+            playlist_tracks,
+            lyrics,
+            yandex_login
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");

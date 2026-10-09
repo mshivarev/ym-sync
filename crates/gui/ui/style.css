@@ -1597,6 +1597,176 @@ body:not(.playing) .eq span {
   color: var(--bad);
 }
 
+/* ---------- room modes ---------- */
+
+/* Shuffle, repeat and the lyrics button: dim when off, accent when on. */
+.icon-btn.mode {
+  width: 34px;
+  height: 34px;
+  color: var(--dim);
+}
+
+.icon-btn.mode .i {
+  width: 20px;
+  height: 20px;
+}
+
+.icon-btn.mode.on {
+  color: var(--accent);
+}
+
+/* ---------- playlists ---------- */
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.card-grid .album-card .art {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+}
+
+/* ---------- lyrics ---------- */
+
+.lyrics-head {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-bottom: 24px;
+}
+
+.lyrics-cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 96px;
+  height: 96px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface-3);
+}
+
+.lyrics-cover img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.playlist-title.small {
+  font-size: 30px;
+}
+
+.lyrics {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  max-width: 760px;
+}
+
+.lyric {
+  padding: 4px 0;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.3;
+  text-align: left;
+  color: var(--faint);
+  transition: color 0.25s;
+}
+
+.lyric:hover {
+  color: var(--dim);
+}
+
+.lyric.lit {
+  color: var(--text);
+}
+
+.lyrics-text {
+  font-size: 18px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+/* ---------- who is in the room ---------- */
+
+.listeners-card {
+  margin-bottom: 16px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-head h2 {
+  margin: 0;
+}
+
+.btn.small {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+.listeners {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.listeners li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.listeners .chip {
+  margin-top: 0;
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.listener-name {
+  font-weight: 600;
+}
+
+/* ---------- settings ---------- */
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 /* ---------- toast ---------- */
 
 .toast {
