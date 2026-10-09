@@ -40,6 +40,15 @@ object Native {
     /** An album's tracks, for its screen. Queues nothing. */
     external fun albumTracks(handle: Long, albumId: String): String
 
+    /** The account's own playlists. */
+    external fun myPlaylists(handle: Long): String
+
+    /** A playlist's tracks, for its screen. Queues nothing. */
+    external fun playlistTracks(handle: Long, owner: String, kind: String): String
+
+    /** A track's words; `lyrics` is null when Yandex has none. */
+    external fun lyrics(handle: Long, trackId: String): String
+
     /**
      * Queues tracks the screen already holds in full — a search result, a row of
      * the offline library. Costs no Yandex request, which is the point.

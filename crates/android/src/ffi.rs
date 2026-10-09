@@ -12,6 +12,9 @@
 //!     external fun suggest(handle: Long, part: String): String
 //!     external fun searchAlbums(handle: Long, query: String, limit: Int): String
 //!     external fun albumTracks(handle: Long, albumId: String): String
+//!     external fun myPlaylists(handle: Long): String
+//!     external fun playlistTracks(handle: Long, owner: String, kind: String): String
+//!     external fun lyrics(handle: Long, trackId: String): String
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean, start: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
@@ -199,6 +202,66 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_albumTracks(
             None => failed("сессия не запущена"),
             Some(session) => match session.album_tracks(&id) {
                 Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// The account's own playlists.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_myPlaylists(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let text = match unsafe { borrow(handle) } {
+        None => failed("сессия не запущена"),
+        Some(session) => match session.my_playlists() {
+            Ok(value) => ok(value),
+            Err(err) => failed(err),
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// A playlist's tracks, for its page.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_playlistTracks(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    owner: JString,
+    kind: JString,
+) -> jstring {
+    let text = match (read(&mut env, &owner), read(&mut env, &kind)) {
+        (Err(err), _) | (_, Err(err)) => failed(err),
+        (Ok(owner), Ok(kind)) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.playlist_tracks(&owner, &kind) {
+                Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// The words of a track.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_lyrics(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    track_id: JString,
+) -> jstring {
+    let text = match read(&mut env, &track_id) {
+        Err(err) => failed(err),
+        Ok(id) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.lyrics(&id) {
+                Ok(value) => ok(value),
                 Err(err) => failed(err),
             },
         },

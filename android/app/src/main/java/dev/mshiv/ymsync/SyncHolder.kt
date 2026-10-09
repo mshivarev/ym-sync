@@ -161,6 +161,47 @@ object Commands {
         }
     }
 
+    /** The account's own playlists. */
+    suspend fun myPlaylists(): Result<List<PlaylistInfo>> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.myPlaylists(handle)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(
+                reply.value.optJSONArray("playlists")
+                    ?.let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toPlaylistInfo() } }
+                    ?: emptyList(),
+            )
+        }
+    }
+
+    /** A playlist's tracks, for its screen. */
+    suspend fun playlistTracks(owner: String, kind: String): Result<List<TrackInfo>> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.playlistTracks(handle, owner, kind)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.optJSONArray("tracks")?.toTrackList() ?: emptyList())
+        }
+    }
+
+    /** A track's words; success with null when the track has none. */
+    suspend fun lyrics(trackId: String): Result<Lyrics?> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        val reply = withContext(Dispatchers.IO) { parseReply(Native.lyrics(handle, trackId)) }
+        return when (reply) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.optJSONObject("lyrics")?.toLyrics())
+        }
+    }
+
+    /** Puts tracks right after the one playing, for the whole room. */
+    suspend fun playNext(tracks: List<TrackInfo>): String? =
+        send("play_next") { put("tracks", tracks.toJsonArray()) }
+
     /**
      * What to offer while the listener is typing.
      *

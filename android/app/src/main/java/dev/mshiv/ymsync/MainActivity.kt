@@ -50,12 +50,15 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -106,6 +109,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -212,6 +216,32 @@ private class Room(
         }
     }
 
+    /// Right after the track playing, for the whole room.
+    fun playNext(tracks: List<TrackInfo>, what: String) {
+        if (tracks.isEmpty()) return
+        inRoom {
+            scope.launch {
+                val problem = Commands.playNext(tracks)
+                SyncHolder.say(problem ?: "следующим: $what")
+            }
+        }
+    }
+
+    /// Off → the queue → one track → off. The room's setting, not this phone's.
+    fun cycleRepeat() {
+        val next = when (snapshot?.repeat) {
+            "off", null -> "all"
+            "all" -> "one"
+            else -> "off"
+        }
+        scope.launch { Commands.send("repeat") { put("mode", next) }?.let { SyncHolder.say(it) } }
+    }
+
+    fun toggleShuffle() {
+        val on = snapshot?.shuffle != true
+        scope.launch { Commands.send("shuffle") { put("on", on) }?.let { SyncHolder.say(it) } }
+    }
+
     /// One track onto the end of the queue, without touching what plays.
     fun addToQueue(track: TrackInfo) {
         inRoom {
@@ -260,6 +290,12 @@ private fun App(settings: Settings) {
     var playerOpen by rememberSaveable { mutableStateOf(false) }
     // An album opened from search: its page, until back or a menu tab.
     var openAlbum by remember { mutableStateOf<AlbumInfo?>(null) }
+    // One of the account's playlists, opened from the collection.
+    var openPlaylist by remember { mutableStateOf<PlaylistInfo?>(null) }
+    // The lyrics, over everything like the full player.
+    var lyricsOpen by rememberSaveable { mutableStateOf(false) }
+    // Yandex's sign-in page, over everything.
+    var loginOpen by rememberSaveable { mutableStateOf(false) }
     // Lifted out of the collection page so the home tiles can open a given view
     // of it: «Мне нравится» is a tile there and a tab here.
     var libraryTab by rememberSaveable { mutableStateOf(LibraryTab.ALL) }
@@ -354,9 +390,12 @@ private fun App(settings: Settings) {
 
     val room = Room(snapshot, running, likes?.ids ?: emptySet(), scope, inRoom)
 
-    BackHandler(enabled = playerOpen) { playerOpen = false }
+    BackHandler(enabled = playerOpen && !lyricsOpen) { playerOpen = false }
+    BackHandler(enabled = lyricsOpen) { lyricsOpen = false }
+    BackHandler(enabled = loginOpen) { loginOpen = false }
     // An open album sits on top of the home page; back returns to it.
     BackHandler(enabled = openAlbum != null && !playerOpen) { openAlbum = null }
+    BackHandler(enabled = openPlaylist != null && openAlbum == null && !playerOpen) { openPlaylist = null }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -370,6 +409,7 @@ private fun App(settings: Settings) {
                     BottomNav(screen) {
                         screen = it
                         openAlbum = null
+                        openPlaylist = null
                     }
                 }
             },
@@ -380,8 +420,11 @@ private fun App(settings: Settings) {
                     .padding(insets),
             ) {
                 val album = openAlbum
+                val playlist = openPlaylist
                 if (album != null) {
                     AlbumScreen(album, room, onBack = { openAlbum = null })
+                } else if (playlist != null) {
+                    PlaylistScreen(playlist, room, onBack = { openPlaylist = null })
                 } else when (screen) {
                     Screen.HOME -> HomeScreen(
                         room = room,
@@ -411,6 +454,7 @@ private fun App(settings: Settings) {
                         onTab = { libraryTab = it },
                         raising = raising,
                         onChanged = { library = it },
+                        onOpenPlaylist = { openPlaylist = it },
                     )
                     Screen.ROOM -> RoomScreen(
                         settings,
@@ -418,6 +462,7 @@ private fun App(settings: Settings) {
                         running,
                         update = update,
                         onUpdate = { update = it },
+                        onLogin = { loginOpen = true },
                     ) { host ->
                         val absent = settings.missing
                         if (absent.isEmpty()) {
@@ -441,6 +486,32 @@ private fun App(settings: Settings) {
                 onQueue = {
                     playerOpen = false
                     screen = Screen.QUEUE
+                },
+                onLyrics = { lyricsOpen = true },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = lyricsOpen,
+            enter = slideInVertically(tween(320, easing = FastOutSlowInEasing)) { it },
+            exit = slideOutVertically(tween(260)) { it },
+        ) {
+            LyricsScreen(room, onClose = { lyricsOpen = false })
+        }
+
+        if (loginOpen) {
+            LoginScreen(
+                onClose = { loginOpen = false },
+                onToken = { token ->
+                    loginOpen = false
+                    settings.yandexToken = token
+                    SyncHolder.say(
+                        if (running) {
+                            "вход выполнен — переподключитесь к комнате, чтобы он заработал"
+                        } else {
+                            "вход выполнен"
+                        },
+                    )
                 },
             )
         }
@@ -915,14 +986,57 @@ private fun albumFacts(album: AlbumInfo, tracks: Int?): String =
 @Composable
 private fun AlbumScreen(album: AlbumInfo, room: Room, onBack: () -> Unit) {
     var tracks by remember(album.id) { mutableStateOf<List<TrackInfo>?>(null) }
-    var problem by remember(album.id) { mutableStateOf<String?>(null) }
+    TrackListPage(
+        key = "album:${album.id}",
+        eyebrow = "АЛЬБОМ",
+        title = album.title,
+        facts = albumFacts(album, tracks?.size),
+        coverUrl = album.coverUrl(400),
+        room = room,
+        onBack = onBack,
+        load = { Commands.albumTracks(album.id) },
+        onLoaded = { tracks = it },
+    )
+}
 
-    LaunchedEffect(album.id) {
+/// One of the account's playlists, on the same page an album gets.
+@Composable
+private fun PlaylistScreen(playlist: PlaylistInfo, room: Room, onBack: () -> Unit) {
+    var count by remember(playlist.kind) { mutableStateOf<Int?>(null) }
+    TrackListPage(
+        key = "playlist:${playlist.owner}:${playlist.kind}",
+        eyebrow = "ПЛЕЙЛИСТ",
+        title = playlist.title,
+        facts = tracksWord(count ?: playlist.trackCount),
+        coverUrl = playlist.coverUrl(400),
+        room = room,
+        onBack = onBack,
+        load = { Commands.playlistTracks(playlist.owner, playlist.kind) },
+        onLoaded = { count = it.size },
+    )
+}
+
+@Composable
+private fun TrackListPage(
+    key: String,
+    eyebrow: String,
+    title: String,
+    facts: String,
+    coverUrl: String?,
+    room: Room,
+    onBack: () -> Unit,
+    load: suspend () -> Result<List<TrackInfo>>,
+    onLoaded: (List<TrackInfo>) -> Unit,
+) {
+    var tracks by remember(key) { mutableStateOf<List<TrackInfo>?>(null) }
+    var problem by remember(key) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(key) {
         room.inRoom {
             room.scope.launch {
-                Commands.albumTracks(album.id)
-                    .onSuccess { tracks = it }
-                    .onFailure { problem = it.message ?: "не удалось загрузить альбом" }
+                load()
+                    .onSuccess { tracks = it; onLoaded(it) }
+                    .onFailure { problem = it.message ?: "не удалось загрузить" }
             }
         }
     }
@@ -953,22 +1067,22 @@ private fun AlbumScreen(album: AlbumInfo, room: Room, onBack: () -> Unit) {
                 modifier = Modifier.padding(horizontal = 8.dp),
             ) {
                 CoverArt(
-                    url = album.coverUrl(400),
+                    url = coverUrl,
                     size = 120.dp,
                     corner = 14.dp,
                     modifier = Modifier.shadow(12.dp, RoundedCornerShape(14.dp)),
                 )
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("АЛЬБОМ", color = Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(eyebrow, color = Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     Text(
-                        album.title,
+                        title,
                         fontSize = 24.sp,
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(albumFacts(album, tracks?.size), color = Dim, fontSize = 13.sp)
+                    Text(facts, color = Dim, fontSize = 13.sp)
                 }
             }
         }
@@ -980,9 +1094,12 @@ private fun AlbumScreen(album: AlbumInfo, room: Room, onBack: () -> Unit) {
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
             ) {
                 RoundPlay(enabled = list.isNotEmpty()) { room.playFrom(list, 0) }
+                GhostButton("Следующим", AppIcons.PlayNext, enabled = list.isNotEmpty()) {
+                    room.playNext(list, "«$title»")
+                }
                 GhostButton("В очередь", AppIcons.Add, enabled = list.isNotEmpty()) {
                     room.enqueue(list)
-                    SyncHolder.say("в очереди: альбом «${album.title}»")
+                    SyncHolder.say("в очереди: «$title»")
                 }
             }
         }
@@ -990,7 +1107,7 @@ private fun AlbumScreen(album: AlbumInfo, room: Room, onBack: () -> Unit) {
         when {
             problem != null -> item { Empty(problem ?: "") }
             tracks == null -> item { Empty("загружаю треки…") }
-            list.isEmpty() -> item { Empty("в альбоме нет доступных треков") }
+            list.isEmpty() -> item { Empty("здесь нет доступных треков") }
         }
 
         itemsIndexed(list, key = { index, track -> "at${track.trackId}$index" }) { index, track ->
@@ -1144,6 +1261,7 @@ private enum class LibraryTab(val label: String, val title: String) {
     ALL("всё скачанное", "Скачанное"),
     LIKES("мне нравится", "Мне нравится"),
     ALBUMS("по альбомам", "По альбомам"),
+    PLAYLISTS("плейлисты", "Плейлисты"),
 }
 
 @Composable
@@ -1156,11 +1274,24 @@ private fun LibraryScreen(
     /// A room is coming up for these lists; they are read from the core.
     raising: Boolean,
     onChanged: (Library?) -> Unit,
+    onOpenPlaylist: (PlaylistInfo) -> Unit,
 ) {
     val downloaded = library?.tracks ?: emptyList()
+    // Fetched once the tab is first opened: unlike the rest, these need Yandex.
+    var playlists by remember { mutableStateOf<List<PlaylistInfo>?>(null) }
+    var playlistsProblem by remember { mutableStateOf<String?>(null) }
+    var playlistsAsked by remember { mutableStateOf(0) }
+    LaunchedEffect(tab, room.running, playlistsAsked) {
+        if (tab == LibraryTab.PLAYLISTS && room.running && playlists == null) {
+            Commands.myPlaylists()
+                .onSuccess { playlists = it; playlistsProblem = null }
+                .onFailure { playlistsProblem = it.message ?: "не удалось загрузить плейлисты" }
+        }
+    }
     val likedTracks = likes?.tracks ?: emptyList()
     val shown: List<TrackInfo> = when (tab) {
         LibraryTab.LIKES -> likedTracks
+        LibraryTab.PLAYLISTS -> emptyList()
         else -> downloaded.map { it.track }
     }
 
@@ -1183,7 +1314,7 @@ private fun LibraryScreen(
                             when (tab) {
                                 LibraryTab.ALL -> OfflineGradient
                                 LibraryTab.LIKES -> LikesGradient
-                                LibraryTab.ALBUMS -> AlbumsGradient
+                                LibraryTab.ALBUMS, LibraryTab.PLAYLISTS -> AlbumsGradient
                             },
                         ),
                     contentAlignment = Alignment.Center,
@@ -1193,6 +1324,7 @@ private fun LibraryScreen(
                             LibraryTab.ALL -> AppIcons.Download
                             LibraryTab.LIKES -> AppIcons.Heart
                             LibraryTab.ALBUMS -> AppIcons.Library
+                            LibraryTab.PLAYLISTS -> AppIcons.Queue
                         },
                         null,
                         tint = Color.White,
@@ -1206,6 +1338,7 @@ private fun LibraryScreen(
                     Text(
                         when (tab) {
                             LibraryTab.LIKES -> tracksWord(likedTracks.size)
+                            LibraryTab.PLAYLISTS -> playlists?.let { "${it.size} шт." } ?: ""
                             else -> "${tracksWord(downloaded.size)} · ${librarySize(library)}"
                         },
                         color = Dim,
@@ -1223,13 +1356,19 @@ private fun LibraryScreen(
             ) {
                 // Playing the whole collection is how you listen with no internet:
                 // every one of the downloads comes off the disk.
-                RoundPlay(enabled = room.canDrive && shown.isNotEmpty()) {
-                    room.enqueue(shown, replace = true)
+                if (tab != LibraryTab.PLAYLISTS) {
+                    RoundPlay(enabled = room.canDrive && shown.isNotEmpty()) {
+                        room.enqueue(shown, replace = true)
+                    }
+                    GhostButton("В очередь", AppIcons.Add, enabled = room.canDrive && shown.isNotEmpty()) {
+                        room.enqueue(shown)
+                    }
+                    ImportButton(room, onChanged)
+                } else {
+                    IconButton(onClick = { playlists = null; playlistsAsked++ }, enabled = room.canDrive) {
+                        Icon(AppIcons.Refresh, "перечитать с Яндекса", tint = Color.White)
+                    }
                 }
-                GhostButton("В очередь", AppIcons.Add, enabled = room.canDrive && shown.isNotEmpty()) {
-                    room.enqueue(shown)
-                }
-                ImportButton(room, onChanged)
                 // Only «Мне нравится» has anything to re-read: the other two views
                 // are this disk, and the core watches that.
                 if (tab == LibraryTab.LIKES) {
@@ -1290,7 +1429,45 @@ private fun LibraryScreen(
             }
 
             LibraryTab.ALBUMS -> albums(downloaded, room, onChanged)
+
+            LibraryTab.PLAYLISTS -> {
+                val found = playlists
+                when {
+                    found == null && playlistsProblem != null -> item { Empty(playlistsProblem ?: "") }
+                    found == null -> item { Empty("загружаю плейлисты…") }
+                    found.isEmpty() -> item { Empty("У аккаунта нет своих плейлистов") }
+                    else -> items(found.chunked(2).size) { row ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            for (playlist in found.chunked(2)[row]) {
+                                PlaylistCard(playlist, Modifier.weight(1f)) { onOpenPlaylist(playlist) }
+                            }
+                            if (found.chunked(2)[row].size == 1) Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// A playlist card in the collection's grid.
+@Composable
+private fun PlaylistCard(playlist: PlaylistInfo, modifier: Modifier, onClick: () -> Unit) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(4.dp),
+    ) {
+        Box(Modifier.fillMaxWidth().aspectRatio(1f)) {
+            CoverArt(url = playlist.coverUrl(400), corner = 12.dp, modifier = Modifier.fillMaxSize())
+        }
+        Text(playlist.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(tracksWord(playlist.trackCount), color = Dim, fontSize = 12.sp)
     }
 }
 
@@ -1471,6 +1648,7 @@ private fun RoomScreen(
     running: Boolean,
     update: Release?,
     onUpdate: (Release?) -> Unit,
+    onLogin: () -> Unit,
     onEnter: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -1490,6 +1668,7 @@ private fun RoomScreen(
         }
 
         if (running) {
+            item { ListenersCard(snapshot?.listeners ?: emptyList()) }
             item {
                 Button(
                     onClick = { SyncService.stop(context) },
@@ -1506,7 +1685,7 @@ private fun RoomScreen(
             item { RoomCard(settings, onEnter) }
         }
 
-        item { SettingsCard(settings) }
+        item { SettingsCard(settings, running, onLogin) }
 
         item { AboutCard(update, onUpdate) }
     }
@@ -1750,15 +1929,80 @@ private fun RoomCard(settings: Settings, onEnter: (Boolean) -> Unit) {
     }
 }
 
+/// Who is in the room, by the names they chose.
 @Composable
-private fun SettingsCard(settings: Settings) {
+private fun ListenersCard(listeners: List<Listener>) {
+    Card {
+        Text("Кто в комнате", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        if (listeners.isEmpty()) Hint("список придёт от комнаты через секунду")
+        for (listener in listeners) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(Surface3),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        listener.name.trim().take(1).uppercase().ifEmpty { "?" },
+                        color = Accent,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(listener.name.ifBlank { "без имени" }, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                if (listener.you) {
+                    Text(
+                        "вы",
+                        color = Accent,
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(Accent.copy(alpha = 0.12f))
+                            .padding(horizontal = 10.dp, vertical = 3.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsCard(settings: Settings, running: Boolean, onLogin: () -> Unit) {
+    val scope = rememberCoroutineScope()
     var yandexToken by remember { mutableStateOf(settings.yandexToken) }
     var autoCache by remember { mutableStateOf(settings.autoCache) }
     var cacheLimit by remember { mutableStateOf(settings.cacheLimitGb.toString()) }
+    var name by remember { mutableStateOf(settings.name) }
+    // The token can change under this card: the login page writes it.
+    LaunchedEffect(Unit) { yandexToken = settings.yandexToken }
 
     Card {
         Text("Настройки", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-        Field(yandexToken, { yandexToken = it; settings.yandexToken = it }, "токен Яндекса (этого устройства)", secret = true)
+        Field(name, { name = it.take(32); settings.name = name }, "ваш ник в комнате")
+        Hint("Пусто — будет «${settings.displayName}».")
+        if (running) {
+            GhostButton("Сообщить комнате", AppIcons.User) {
+                scope.launch {
+                    Commands.send("name") { put("name", settings.displayName) }
+                        ?.let { SyncHolder.say(it) } ?: SyncHolder.say("ник: ${settings.displayName}")
+                }
+            }
+        }
+
+        HorizontalDivider(color = Surface3)
+
+        Text(
+            if (settings.yandexToken.isBlank()) "Вход в Яндекс не выполнен" else "Вход в Яндекс выполнен",
+            color = if (settings.yandexToken.isBlank()) Dim else Good,
+        )
+        PrimaryButton(
+            if (settings.yandexToken.isBlank()) "Войти через Яндекс" else "Войти в другой аккаунт",
+            AppIcons.User,
+            onClick = onLogin,
+        )
+        Field(yandexToken, { yandexToken = it; settings.yandexToken = it }, "или вставьте токен", secret = true)
         Hint("У каждого устройства свой аккаунт с Плюсом. В эмуляторе релей на компьютере доступен как 10.0.2.2")
 
         HorizontalDivider(color = Surface3)
@@ -1877,7 +2121,7 @@ private fun MiniPlayer(room: Room, onOpen: () -> Unit) {
 
 /// The full-screen player, painted in its cover's colour as the Yandex app does.
 @Composable
-private fun FullPlayer(room: Room, onClose: () -> Unit, onQueue: () -> Unit) {
+private fun FullPlayer(room: Room, onClose: () -> Unit, onQueue: () -> Unit, onLyrics: () -> Unit) {
     val snapshot = room.snapshot ?: return
     val track = snapshot.track
     val cover = rememberCover(track, 800)
@@ -1998,6 +2242,14 @@ private fun FullPlayer(room: Room, onClose: () -> Unit, onQueue: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceEvenly,
             modifier = Modifier.fillMaxWidth(),
         ) {
+            IconButton(onClick = { room.toggleShuffle() }, enabled = room.canDrive) {
+                Icon(
+                    AppIcons.Shuffle,
+                    if (snapshot.shuffle) "перемешано" else "перемешать",
+                    tint = if (snapshot.shuffle) Accent else Color.White.copy(alpha = 0.6f),
+                    modifier = Modifier.size(24.dp),
+                )
+            }
             IconButton(onClick = { room.send("prev") }, enabled = room.canDrive, modifier = Modifier.size(56.dp)) {
                 Icon(AppIcons.Prev, "предыдущий", tint = Color.White, modifier = Modifier.size(36.dp))
             }
@@ -2019,6 +2271,18 @@ private fun FullPlayer(room: Room, onClose: () -> Unit, onQueue: () -> Unit) {
             IconButton(onClick = { room.send("next") }, enabled = room.canDrive, modifier = Modifier.size(56.dp)) {
                 Icon(AppIcons.Next, "следующий", tint = Color.White, modifier = Modifier.size(36.dp))
             }
+            IconButton(onClick = { room.cycleRepeat() }, enabled = room.canDrive) {
+                Icon(
+                    if (snapshot.repeat == "one") AppIcons.RepeatOne else AppIcons.Repeat,
+                    when (snapshot.repeat) {
+                        "all" -> "повтор очереди"
+                        "one" -> "повтор трека"
+                        else -> "повтор выключен"
+                    },
+                    tint = if (snapshot.repeat != "off") Accent else Color.White.copy(alpha = 0.6f),
+                    modifier = Modifier.size(24.dp),
+                )
+            }
         }
 
         Spacer(Modifier.height(20.dp))
@@ -2038,6 +2302,9 @@ private fun FullPlayer(room: Room, onClose: () -> Unit, onQueue: () -> Unit) {
                     "скачать трек",
                     tint = if (track != null && track.trackId in snapshot.cached) Good else Color.White.copy(alpha = 0.8f),
                 )
+            }
+            IconButton(onClick = onLyrics, enabled = track != null) {
+                Icon(AppIcons.Lyrics, "текст песни", tint = Color.White.copy(alpha = 0.8f))
             }
             Spacer(Modifier.weight(1f))
             snapshot.driftMs?.let { drift ->
@@ -2083,6 +2350,147 @@ private fun Color.compositeOn(background: Color): Color {
         green = green * a + background.green * (1 - a),
         blue = blue * a + background.blue * (1 - a),
     )
+}
+
+// ---------------------------------------------------------------- lyrics
+
+/// The words of what is playing, following the music where Yandex has timings.
+@Composable
+private fun LyricsScreen(room: Room, onClose: () -> Unit) {
+    val snapshot = room.snapshot
+    val track = snapshot?.track
+    var lyrics by remember(track?.trackId) { mutableStateOf<Lyrics?>(null) }
+    var state by remember(track?.trackId) { mutableStateOf("ищу текст…") }
+
+    LaunchedEffect(track?.trackId) {
+        val id = track?.trackId ?: run { state = "сейчас ничего не играет"; return@LaunchedEffect }
+        Commands.lyrics(id)
+            .onSuccess { found ->
+                lyrics = found
+                if (found == null) state = "у этого трека нет текста"
+            }
+            .onFailure { state = "не удалось загрузить текст: ${it.message}" }
+    }
+
+    val lines = lyrics?.takeIf { it.synced }?.lines.orEmpty()
+    val position = snapshot?.positionMs ?: 0
+    val lit = lines.indexOfLast { it.atMs <= position }
+    val list = rememberLazyListState()
+    LaunchedEffect(lit) {
+        if (lit >= 0) list.animateScrollToItem((lit - 2).coerceAtLeast(0))
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Bg)
+            .clickable(enabled = true, onClick = {}, indication = null, interactionSource = null)
+            .systemBarsPadding()
+            .padding(horizontal = 20.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
+            IconButton(onClick = onClose) {
+                Icon(AppIcons.ChevronDown, "свернуть", tint = Color.White, modifier = Modifier.size(30.dp))
+            }
+            Column(Modifier.weight(1f)) {
+                Text(track?.title ?: "—", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(track?.artist ?: "", color = Dim, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        val found = lyrics
+        when {
+            found == null -> Empty(state)
+            found.synced -> LazyColumn(state = list, modifier = Modifier.weight(1f)) {
+                itemsIndexed(lines) { index, line ->
+                    Text(
+                        line.text.ifBlank { "♪" },
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (index == lit) Color.White else Color.White.copy(alpha = 0.35f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = room.canDrive) {
+                                room.scope.launch { Commands.send("seek") { put("to_ms", line.atMs) } }
+                            }
+                            .padding(vertical = 6.dp),
+                    )
+                }
+                if (found.writers.isNotEmpty()) {
+                    item { Hint("Авторы: ${found.writers.joinToString(", ")}") }
+                }
+            }
+            else -> LazyColumn(modifier = Modifier.weight(1f)) {
+                item { Text(found.text, fontSize = 18.sp, lineHeight = 30.sp) }
+                if (found.writers.isNotEmpty()) {
+                    item { Hint("Авторы: ${found.writers.joinToString(", ")}") }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- login
+
+/// Where the sign-in starts: Yandex's own page, for the client id the Яндекс
+/// Музыка apps use, so the token it hands back works with the music API.
+private const val LOGIN_URL =
+    "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
+
+/// The token in a redirect like `https://music.yandex.ru/#access_token=…&…`.
+private fun tokenFromRedirect(url: String?): String? {
+    val fragment = url?.substringAfter('#', "")?.takeIf { it.isNotEmpty() } ?: return null
+    return fragment.split('&')
+        .map { it.split('=', limit = 2) }
+        .firstOrNull { it.size == 2 && it[0] == "access_token" }
+        ?.get(1)
+        ?.takeIf { it.isNotEmpty() }
+}
+
+/// Yandex's sign-in in a WebView. The password goes to Yandex's page and nowhere
+/// else; only the token in the final redirect is taken, before that page loads.
+@Composable
+private fun LoginScreen(onClose: () -> Unit, onToken: (String) -> Unit) {
+    var taken by remember { mutableStateOf(false) }
+    val take: (String?) -> Boolean = { url ->
+        val token = tokenFromRedirect(url)
+        if (token != null && !taken) {
+            taken = true
+            onToken(token)
+        }
+        token != null
+    }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Bg)
+            .systemBarsPadding(),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(8.dp)) {
+            IconButton(onClick = onClose) { Icon(AppIcons.Close, "закрыть", tint = Color.White) }
+            Text("Вход в Яндекс", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        }
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                android.webkit.WebView(context).apply {
+                    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: android.webkit.WebView,
+                            request: android.webkit.WebResourceRequest,
+                        ): Boolean = take(request.url.toString())
+
+                        override fun onPageStarted(view: android.webkit.WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                            if (take(url)) view.stopLoading()
+                        }
+                    }
+                    loadUrl(LOGIN_URL)
+                }
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------- rows
@@ -2168,8 +2576,29 @@ private fun TrackRow(
         // A phone has no hover, so the button that the desktop shows on hover is
         // simply always there: pressing the row plays, this adds to the end.
         if (queueable) {
-            IconButton(onClick = { room.addToQueue(track) }) {
-                Icon(AppIcons.Add, "в очередь", tint = Dim, modifier = Modifier.size(22.dp))
+            var menu by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { menu = true }) {
+                    Icon(AppIcons.More, "ещё", tint = Dim, modifier = Modifier.size(22.dp))
+                }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Surface2) {
+                    DropdownMenuItem(
+                        text = { Text("Играть следующим") },
+                        leadingIcon = { Icon(AppIcons.PlayNext, null, tint = Color.White) },
+                        onClick = {
+                            menu = false
+                            room.playNext(listOf(track), "${track.artist} — ${track.title}")
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("В очередь") },
+                        leadingIcon = { Icon(AppIcons.Add, null, tint = Color.White) },
+                        onClick = {
+                            menu = false
+                            room.addToQueue(track)
+                        },
+                    )
+                }
             }
         }
         HeartButton(track.trackId in room.likedIds) { room.like(track) }

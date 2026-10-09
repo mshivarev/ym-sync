@@ -133,6 +133,53 @@ fun JSONObject.toAlbumInfo(): AlbumInfo =
         trackCount = if (isNull("track_count")) null else optInt("track_count"),
     )
 
+/** One of the account's own playlists, as a card shows it. */
+data class PlaylistInfo(
+    val owner: String,
+    val kind: String,
+    val title: String,
+    val trackCount: Int,
+    val coverUri: String?,
+) {
+    fun coverUrl(size: Int): String? = coverUrlOf(coverUri, size)
+}
+
+fun JSONObject.toPlaylistInfo(): PlaylistInfo =
+    PlaylistInfo(
+        owner = optString("owner"),
+        kind = optString("kind"),
+        title = optString("title"),
+        trackCount = optInt("track_count"),
+        coverUri = if (isNull("cover_uri")) null else optString("cover_uri"),
+    )
+
+/** A track's words; [lines] carries timings when [synced]. */
+data class Lyrics(
+    val synced: Boolean,
+    val lines: List<LyricLine>,
+    val text: String,
+    val writers: List<String>,
+)
+
+data class LyricLine(val atMs: Long, val text: String)
+
+fun JSONObject.toLyrics(): Lyrics =
+    Lyrics(
+        synced = optBoolean("synced"),
+        lines = optJSONArray("lines")?.let { array ->
+            (0 until array.length()).mapNotNull { index ->
+                array.optJSONObject(index)?.let { LyricLine(it.optLong("at_ms"), it.optString("text")) }
+            }
+        } ?: emptyList(),
+        text = optString("text"),
+        writers = optJSONArray("writers")?.let { array ->
+            (0 until array.length()).mapNotNull { array.optString(it).ifBlank { null } }
+        } ?: emptyList(),
+    )
+
+/** One person in the room. */
+data class Listener(val name: String, val you: Boolean)
+
 /** A list of tracks as the core expects it. */
 fun List<TrackInfo>.toJsonArray(): JSONArray =
     JSONArray().apply { this@toJsonArray.forEach { put(it.toJson()) } }
@@ -215,6 +262,12 @@ data class Snapshot(
     val downloadQueue: Int,
     /** Set when this device runs the room's relay: the address to give others. */
     val hosting: String?,
+    /** `off`, `all` or `one` — the room's setting. */
+    val repeat: String = "off",
+    /** Whether the room's upcoming tracks are shuffled. */
+    val shuffle: Boolean = false,
+    /** Everybody in the room, this phone included. */
+    val listeners: List<Listener> = emptyList(),
 )
 
 /** Either the `ok` payload or the `error` text from a native call. */
@@ -318,6 +371,13 @@ fun JSONObject.toSnapshot(previous: Snapshot? = null) =
         downloading = if (isNull("downloading")) null else optString("downloading"),
         downloadQueue = optInt("download_queue"),
         hosting = if (isNull("hosting")) null else optString("hosting"),
+        repeat = optString("repeat", "off"),
+        shuffle = optBoolean("shuffle"),
+        listeners = optJSONArray("listeners")?.let { array ->
+            (0 until array.length()).mapNotNull { index ->
+                array.optJSONObject(index)?.let { Listener(it.optString("name"), it.optBoolean("you")) }
+            }
+        } ?: emptyList(),
     )
 
 fun formatMs(ms: Long): String {
@@ -371,6 +431,15 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_AUTO_CACHE, false)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_CACHE, value).apply()
 
+    /** What the room calls this phone. Empty means the phone's model name. */
+    var name: String
+        get() = prefs.getString(KEY_NAME, "")!!
+        set(value) = prefs.edit().putString(KEY_NAME, value.trim()).apply()
+
+    /** What the room will actually be told. */
+    val displayName: String
+        get() = name.ifBlank { android.os.Build.MODEL ?: "телефон" }
+
     /** Gigabytes. Smaller than the desktop default: this is a phone. */
     var cacheLimitGb: Float
         get() = prefs.getFloat(KEY_CACHE_LIMIT, 2f)
@@ -417,6 +486,7 @@ class Settings(context: Context) {
             .put("room_token", password)
             .put("yandex_token", yandexToken)
             .put("volume", volume.toDouble())
+            .put("name", displayName)
             .put(
                 "cache",
                 JSONObject()
@@ -444,5 +514,6 @@ class Settings(context: Context) {
         const val KEY_VOLUME = "volume"
         const val KEY_AUTO_CACHE = "auto_cache"
         const val KEY_CACHE_LIMIT = "cache_limit_gb"
+        const val KEY_NAME = "name"
     }
 }

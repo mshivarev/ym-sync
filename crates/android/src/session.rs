@@ -14,7 +14,7 @@ use ymsync::engine::{Command, Handle};
 use ymsync::playback::Playback;
 use ymsync::player::Player;
 use ymsync::session::{self as core, Session as CoreSession};
-use ymsync_proto::TrackRef;
+use ymsync_proto::{RepeatMode, TrackRef};
 
 /// A playback request from the UI. Mirrors [`engine::Command`], minus the parts
 /// the Android UI has no business sending.
@@ -41,6 +41,14 @@ pub enum Request {
     Like { track: TrackRef, liked: bool },
     /// Re-reads «Мне нравится» from Yandex.
     RefreshLikes,
+    /// Puts tracks right after the one playing, for the whole room.
+    PlayNext { tracks: Vec<TrackRef> },
+    /// What happens when a track ends, for the whole room.
+    Repeat { mode: RepeatMode },
+    /// Shuffles the upcoming tracks, for the whole room.
+    Shuffle { on: bool },
+    /// The name the room shows for this phone.
+    Name { name: String },
 }
 
 impl Request {
@@ -64,6 +72,10 @@ impl Request {
             Request::Forget { track_id } => Command::Forget { track_id },
             Request::Like { track, liked } => Command::Like { track, liked },
             Request::RefreshLikes => Command::RefreshLikes,
+            Request::PlayNext { tracks } => Command::PlayNext { tracks },
+            Request::Repeat { mode } => Command::SetRepeat(mode),
+            Request::Shuffle { on } => Command::SetShuffle(on),
+            Request::Name { name } => Command::SetName(name),
             Request::Download { .. } => return None,
         })
     }
@@ -239,6 +251,29 @@ impl Session {
         Ok(tracks.iter().map(Track::to_track_ref).collect())
     }
 
+    /// The account's own playlists, for the collection.
+    pub fn my_playlists(&self) -> Result<serde_json::Value> {
+        let api = self.api()?;
+        let playlists = self.runtime.block_on(api.my_playlists())?;
+        Ok(serde_json::json!({ "playlists": playlists }))
+    }
+
+    /// A playlist's tracks, for its page. Nothing is queued.
+    pub fn playlist_tracks(&self, owner: &str, kind: &str) -> Result<Vec<TrackRef>> {
+        let api = self.api()?;
+        let tracks = self
+            .runtime
+            .block_on(api.playlist_tracks(owner.trim(), kind.trim()))?;
+        Ok(tracks.iter().map(Track::to_track_ref).collect())
+    }
+
+    /// The words of a track; `lyrics` is null when Yandex has none.
+    pub fn lyrics(&self, track_id: &str) -> Result<serde_json::Value> {
+        let api = self.api()?;
+        let lyrics = self.runtime.block_on(api.lyrics(track_id.trim()))?;
+        Ok(serde_json::json!({ "lyrics": lyrics }))
+    }
+
     /// What to offer while the listener is still typing; see `api::suggest`.
     pub fn suggest(&self, part: &str) -> Result<serde_json::Value> {
         let part = part.trim();
@@ -410,6 +445,9 @@ mod tests {
                 },
             ),
             (r#"{"action":"refresh_likes"}"#, Command::RefreshLikes),
+            (r#"{"action":"repeat","mode":"one"}"#, Command::SetRepeat(RepeatMode::One)),
+            (r#"{"action":"shuffle","on":true}"#, Command::SetShuffle(true)),
+            (r#"{"action":"name","name":"Аня"}"#, Command::SetName("Аня".into())),
         ];
         for (json, expected) in cases {
             let request: Request = serde_json::from_str(json).expect(json);
