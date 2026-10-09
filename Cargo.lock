@@ -5879,6 +5879,7 @@ name = "ymsync"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "directories",
@@ -5892,6 +5893,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "symphonia",
  "tokio",
  "tokio-tungstenite",

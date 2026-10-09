@@ -193,6 +193,62 @@ impl YandexMusic {
         Ok(tracks)
     }
 
+    /// The account's own playlists, as Yandex lists them — «Мне нравится» is not
+    /// among them, it has its own place.
+    pub async fn my_playlists(&self) -> Result<Vec<PlaylistInfo>> {
+        let uid = self.uid().await?;
+        let raw: Vec<RawPlaylist> = self
+            .get_result(&format!("/users/{uid}/playlists/list"), &[])
+            .await
+            .context("запрос списка плейлистов")?;
+        Ok(raw
+            .into_iter()
+            .filter(|p| p.kind.0 != LIKES_KIND)
+            .map(RawPlaylist::into_info)
+            .collect())
+    }
+
+    /// A track's words, synced to the music where Yandex has timings.
+    ///
+    /// The endpoint wants a signature of the track id and the time, made with a
+    /// key the official apps carry. Timed (LRC) words are asked for first, plain
+    /// text second; `None` means the track has none at all.
+    pub async fn lyrics(&self, track_id: &str) -> Result<Option<Lyrics>> {
+        // A track id may arrive as `id:album`; the endpoint wants the bare id.
+        let id = track_id.split(':').next().unwrap_or(track_id);
+        for (format, synced) in [("LRC", true), ("TEXT", false)] {
+            let stamp = (ymsync_proto::unix_ms() / 1000).to_string();
+            let sign = lyrics_sign(id, &stamp);
+            let path = format!("/tracks/{id}/lyrics");
+            let found: Result<RawLyrics> = self
+                .get_result(
+                    &path,
+                    &[("format", format), ("timeStamp", &stamp), ("sign", &sign)],
+                )
+                .await;
+            let Ok(found) = found else {
+                // 404 for a format the track has not got; try the next one.
+                continue;
+            };
+            if found.download_url.is_empty() {
+                continue;
+            }
+            let text = self.get_text(&found.download_url).await?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            let lines = if synced { parse_lrc(&text) } else { Vec::new() };
+            return Ok(Some(Lyrics {
+                // A file that claimed to be LRC but had no timings reads as text.
+                synced: !lines.is_empty(),
+                lines,
+                text: if synced { strip_lrc(&text) } else { text },
+                writers: found.writers,
+            }));
+        }
+        Ok(None)
+    }
+
     /// The account's own «Мне нравится», newest first.
     ///
     /// This is playlist 3 of the account, which answers with whole tracks —
@@ -807,6 +863,174 @@ pub struct Plus {
     pub has_plus: bool,
 }
 
+/// One of the account's playlists, as a card shows it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PlaylistInfo {
+    /// Whose playlist it is; with `kind`, what [`YandexMusic::playlist_tracks`] takes.
+    pub owner: String,
+    pub kind: String,
+    pub title: String,
+    pub track_count: u32,
+    /// A cover template, like a track's — the playlist's own picture, or the
+    /// first of the album covers Yandex tiles it from.
+    pub cover_uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlaylist {
+    uid: Id,
+    kind: Id,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    track_count: u32,
+    #[serde(default)]
+    cover: Option<PlaylistCover>,
+    #[serde(default)]
+    og_image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistCover {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    items_uri: Vec<String>,
+}
+
+impl RawPlaylist {
+    fn into_info(self) -> PlaylistInfo {
+        let cover_uri = self
+            .cover
+            .and_then(|cover| cover.uri.or_else(|| cover.items_uri.into_iter().next()))
+            .or(self.og_image)
+            .filter(|uri| !uri.trim().is_empty());
+        PlaylistInfo {
+            owner: self.uid.0,
+            kind: self.kind.0,
+            title: self.title,
+            track_count: self.track_count,
+            cover_uri,
+        }
+    }
+}
+
+/// A track's words.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Lyrics {
+    /// `lines` carries timings and a player can follow along.
+    pub synced: bool,
+    /// Timed lines, in order; empty when the words are plain text.
+    pub lines: Vec<LyricLine>,
+    /// The whole text without timings, for when following along is off.
+    pub text: String,
+    pub writers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LyricLine {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLyrics {
+    #[serde(default)]
+    download_url: String,
+    #[serde(default)]
+    writers: Vec<String>,
+}
+
+/// The key the official apps sign lyrics requests with.
+const LYRICS_KEY: &[u8] = b"p93jhgh689SBReK6ghtw62";
+
+/// `base64(HMAC-SHA256(key, track_id + timestamp))`, as the lyrics endpoint wants.
+fn lyrics_sign(track_id: &str, stamp: &str) -> String {
+    use base64::Engine as _;
+    let message = format!("{track_id}{stamp}");
+    base64::engine::general_purpose::STANDARD.encode(hmac_sha256(LYRICS_KEY, message.as_bytes()))
+}
+
+/// HMAC per RFC 2104. Short enough to write out rather than pull in a crate for
+/// the one signature this client makes.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let inner_pad: Vec<u8> = block.iter().map(|b| b ^ 0x36).collect();
+    let outer_pad: Vec<u8> = block.iter().map(|b| b ^ 0x5c).collect();
+    let inner = Sha256::new().chain_update(&inner_pad).chain_update(message).finalize();
+    Sha256::new()
+        .chain_update(&outer_pad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Splits `[mm:ss.xx] words` lines into timings. Lines without a timing — the
+/// `[ar:…]` style headers among them — are dropped; a line with several stamps
+/// is repeated at each.
+fn parse_lrc(text: &str) -> Vec<LyricLine> {
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let mut rest = raw.trim();
+        let mut stamps = Vec::new();
+        while let Some(after) = rest.strip_prefix('[') {
+            let Some(end) = after.find(']') else { break };
+            match lrc_stamp(&after[..end]) {
+                Some(at_ms) => stamps.push(at_ms),
+                None => break,
+            }
+            rest = &after[end + 1..];
+        }
+        let words = rest.trim().to_string();
+        for at_ms in stamps {
+            lines.push(LyricLine {
+                at_ms,
+                text: words.clone(),
+            });
+        }
+    }
+    lines.sort_by_key(|line| line.at_ms);
+    lines
+}
+
+/// `mm:ss`, `mm:ss.xx` or `mm:ss.xxx`, in milliseconds.
+fn lrc_stamp(stamp: &str) -> Option<u64> {
+    let (minutes, seconds) = stamp.split_once(':')?;
+    let minutes: u64 = minutes.trim().parse().ok()?;
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    let whole: u64 = whole.trim().parse().ok()?;
+    let fraction_ms = match fraction.len() {
+        0 => 0,
+        1 => fraction.parse::<u64>().ok()? * 100,
+        2 => fraction.parse::<u64>().ok()? * 10,
+        _ => fraction[..3].parse::<u64>().ok()?,
+    };
+    Some(minutes * 60_000 + whole * 1000 + fraction_ms)
+}
+
+/// The words of an LRC file without its timings.
+fn strip_lrc(text: &str) -> String {
+    let lines = parse_lrc(text);
+    if lines.is_empty() {
+        return text.to_string();
+    }
+    lines
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Track {
@@ -1043,6 +1267,54 @@ mod tests {
         assert_eq!(sign.len(), 32, "md5 hex digest");
         assert!(sign.chars().all(|c| c.is_ascii_hexdigit()), "{sign}");
         assert_eq!(tail, "6512ab00/get-mp3/abc/1.mp3");
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // Test case 2: key "Jefe".
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than the block is hashed first.
+        let mac = hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First");
+        assert_eq!(
+            hex::encode(mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn lrc_lines_become_timings() {
+        let lrc = "[ar:Кино]\n[00:01.50]Белый снег\n[00:12.345][01:00]Припев\n\n[00:05]Серый лёд";
+        let lines = parse_lrc(lrc);
+        let got: Vec<(u64, &str)> = lines.iter().map(|l| (l.at_ms, l.text.as_str())).collect();
+        assert_eq!(
+            got,
+            [(1_500, "Белый снег"), (5_000, "Серый лёд"), (12_345, "Припев"), (60_000, "Припев")]
+        );
+        assert_eq!(strip_lrc(lrc), "Белый снег\nСерый лёд\nПрипев\nПрипев");
+        assert_eq!(strip_lrc("просто текст"), "просто текст");
+    }
+
+    #[test]
+    fn a_playlist_list_reads_what_a_card_shows() {
+        let raw: Vec<RawPlaylist> = serde_json::from_str(
+            r#"[
+                {"uid": 42, "kind": 1003, "title": "В дорогу", "trackCount": 17,
+                 "cover": {"type": "mosaic", "itemsUri": ["avatars.yandex.net/get-music-content/1/a/%%"]}},
+                {"uid": 42, "kind": 1004, "title": "Пустой", "trackCount": 0,
+                 "ogImage": "avatars.yandex.net/get-music-content/2/b/%%"}
+            ]"#,
+        )
+        .unwrap();
+        let cards: Vec<PlaylistInfo> = raw.into_iter().map(RawPlaylist::into_info).collect();
+        assert_eq!(cards[0].owner, "42");
+        assert_eq!(cards[0].kind, "1003");
+        assert_eq!(cards[0].track_count, 17);
+        assert_eq!(cards[0].cover_uri.as_deref(), Some("avatars.yandex.net/get-music-content/1/a/%%"));
+        assert_eq!(cards[1].cover_uri.as_deref(), Some("avatars.yandex.net/get-music-content/2/b/%%"));
     }
 
     #[test]

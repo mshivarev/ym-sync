@@ -43,6 +43,10 @@ hex = "0.4.3"
 # the only way to reach a phone on the Wi-Fi from a machine that also has a VPN.
 if-addrs = "0.13.4"
 md-5 = "0.11.0"
+# The lyrics endpoint wants an HMAC-SHA256 signature, base64-encoded. HMAC itself
+# is a dozen lines over `sha2`; both crates are already in the tree.
+sha2 = "0.10.9"
+base64 = "0.22.1"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
 # `form` is for the two «Мне нравится» endpoints: they are the only writes this
 # app makes, and Yandex takes them as a urlencoded form rather than as JSON.
