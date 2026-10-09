@@ -43,8 +43,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 use ymsync_proto::discovery::{DISCOVERY_PORT, Discovery, MAX_DATAGRAM, MAX_ROOMS_IN_REPLY, RoomBrief};
 use ymsync_proto::{
-    ClientMsg, Command, PROTOCOL_VERSION, PeerShare, PlaybackState, ServerMsg, TrackRef, secret_eq,
-    unix_ms,
+    ClientMsg, Command, PROTOCOL_VERSION, PeerShare, PlaybackState, RepeatMode, RosterEntry,
+    ServerMsg, TrackRef, secret_eq, unix_ms,
 };
 
 /// A client that says nothing at all for this long is assumed dead. Every peer
@@ -368,6 +368,21 @@ struct Peer {
     /// The `peer` field inside repeats the map key, which costs a few bytes and
     /// makes rebroadcasting the room's map a plain `collect`.
     share: Option<PeerShare>,
+    /// The listener's chosen name, as the room's list shows it.
+    name: String,
+}
+
+/// Longest name kept, in characters. A name is a label in a list, not a message.
+const MAX_NAME_CHARS: usize = 32;
+
+/// A name as the room will show it: trimmed, without control characters, and
+/// cut to [`MAX_NAME_CHARS`].
+fn clean_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_CHARS)
+        .collect()
 }
 
 /// What a mutation touched, so we send only the frames that changed. The queue
@@ -414,9 +429,43 @@ struct RoomState {
     /// leaves, the room still follows the wave and simply has nobody topping it
     /// up, which is what [`PlaybackState::station_unfed`] tells everyone.
     station: Option<(String, Option<u64>)>,
+    repeat: RepeatMode,
+    shuffle: bool,
+    /// For shuffling. A plain xorshift: the order only has to look random to a
+    /// listener, and a dependency for that would be out of all proportion.
+    rng: u64,
 }
 
 impl RoomState {
+    /// A number in `0..bound`, for picking shuffled positions.
+    fn random_below(&mut self, bound: usize) -> usize {
+        if bound <= 1 {
+            return 0;
+        }
+        if self.rng == 0 {
+            // Seeded on first use from the clock; never zero, which xorshift
+            // would never leave.
+            self.rng = (ymsync_proto::unix_ms() as u64) | 1;
+        }
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        (x % bound as u64) as usize
+    }
+
+    /// Puts the tracks after the current one in random order. What is playing
+    /// stays where it is: shuffling must never interrupt it.
+    fn shuffle_upcoming(&mut self) {
+        let start = (self.index + 1).min(self.queue.len());
+        // Fisher–Yates over the upcoming part only.
+        for i in (start + 1..self.queue.len()).rev() {
+            let j = start + self.random_below(i - start + 1);
+            self.queue.swap(i, j);
+        }
+    }
+
     fn snapshot(&self) -> PlaybackState {
         PlaybackState {
             seq: self.seq,
@@ -428,6 +477,8 @@ impl RoomState {
             at_server_ms: self.at_server_ms,
             station: self.station.as_ref().map(|(id, _)| id.clone()),
             station_unfed: matches!(&self.station, Some((_, None))),
+            repeat: self.repeat,
+            shuffle: self.shuffle,
         }
     }
 
@@ -479,8 +530,16 @@ impl RoomState {
             return false;
         }
 
-        if self.index + 1 < self.queue.len() {
+        if self.repeat == RepeatMode::One {
+            // The same track from the top, until somebody skips it.
+            self.start_at(self.index, now);
+        } else if self.index + 1 < self.queue.len() {
             self.start_at(self.index + 1, now);
+        } else if self.repeat == RepeatMode::All && !self.queue.is_empty() {
+            // Round again, in the same order — shuffled or not. Reshuffling here
+            // would change the queue from the ticker, which only ever speaks the
+            // playhead; turning shuffle off and on gives a new order.
+            self.start_at(0, now);
         } else {
             // Stop on the last track rather than past it, so a station's next
             // batch has somewhere to take over from.
@@ -520,12 +579,67 @@ impl RoomState {
                 }
                 let take_over = self.queue.is_empty() || self.played_out();
                 let start = self.queue.len();
-                self.queue.extend(tracks);
+                if self.shuffle && !take_over {
+                    // A shuffled room scatters new tracks among the upcoming ones
+                    // instead of lining them up at the end.
+                    for track in tracks {
+                        let first = (self.index + 1).min(self.queue.len());
+                        let at = first + self.random_below(self.queue.len() - first + 1);
+                        self.queue.insert(at, track);
+                    }
+                } else {
+                    self.queue.extend(tracks);
+                }
                 self.queue_revision += 1;
                 if take_over {
                     self.start_at(start, now);
                 }
                 Changed::BOTH
+            }
+            Command::PlayNext { tracks } => {
+                if tracks.is_empty() {
+                    return Err("empty_queue");
+                }
+                if self.queue.len() + tracks.len() > MAX_QUEUE {
+                    return Err("queue_too_long");
+                }
+                // Nothing playing or the queue played out: «next» is simply «now».
+                let take_over = self.queue.is_empty() || self.played_out();
+                let at = if take_over {
+                    self.queue.len()
+                } else {
+                    (self.index + 1).min(self.queue.len())
+                };
+                let count = tracks.len();
+                self.queue.splice(at..at, tracks);
+                self.queue_revision += 1;
+                if take_over {
+                    self.start_at(at, now);
+                }
+                debug_assert!(at + count <= self.queue.len());
+                Changed::BOTH
+            }
+            Command::SetRepeat { mode } => {
+                if self.repeat == mode {
+                    return Ok(Changed::NOTHING);
+                }
+                self.repeat = mode;
+                Changed::STATE
+            }
+            Command::SetShuffle { on } => {
+                if self.shuffle == on {
+                    return Ok(Changed::NOTHING);
+                }
+                self.shuffle = on;
+                if on {
+                    self.shuffle_upcoming();
+                    self.queue_revision += 1;
+                    Changed::BOTH
+                } else {
+                    // Turning it off keeps the order as it now stands: tracks are
+                    // not yanked back into place under the listener.
+                    Changed::STATE
+                }
             }
             Command::PlayIndex { index } => {
                 if index >= self.queue.len() {
@@ -539,6 +653,11 @@ impl RoomState {
                     return Err("empty_queue");
                 }
                 if self.index + 1 >= self.queue.len() {
+                    // With repeat on, «next» after the last track is the first.
+                    if self.repeat == RepeatMode::All {
+                        self.start_at(0, now);
+                        return Ok(self.bump(Changed::STATE));
+                    }
                     return Err("end_of_queue");
                 }
                 self.start_at(self.index + 1, now);
@@ -612,10 +731,16 @@ impl RoomState {
             },
         };
 
+        Ok(self.bump(changed))
+    }
+
+    /// Every accepted change to the playhead moves `seq` on, so peers can tell a
+    /// newer snapshot from an older one arriving late.
+    fn bump(&mut self, changed: Changed) -> Changed {
         if changed.state {
             self.seq += 1;
         }
-        Ok(changed)
+        changed
     }
 }
 
@@ -662,6 +787,29 @@ impl Room {
         // time, which the clients would take for a change.
         shares.sort_by_key(|share| share.peer);
         shares
+    }
+
+    /// Everybody in the room, in the order they arrived.
+    fn roster(&self) -> Vec<RosterEntry> {
+        let mut roster: Vec<RosterEntry> = self
+            .peers
+            .iter()
+            .map(|(id, peer)| RosterEntry {
+                peer: *id,
+                name: peer.name.clone(),
+            })
+            .collect();
+        // Ids are handed out in arrival order, so this is also «who came first».
+        roster.sort_by_key(|entry| entry.peer);
+        roster
+    }
+
+    /// Tells the room who is in it. Whole, like the sharing map: it only moves
+    /// when somebody joins, leaves or renames themselves.
+    fn publish_roster(&self) {
+        self.tell_everyone(&ServerMsg::Roster {
+            peers: self.roster(),
+        });
     }
 
     /// Tells the room who can serve what. Sent whole rather than as a diff: the
@@ -777,12 +925,13 @@ async fn session(
         Ok(Some(msg)) => msg,
     };
 
-    let (room_name, client) = match hello {
+    let (room_name, client, name) = match hello {
         ClientMsg::Hello {
             protocol,
             room,
             token: given,
             client,
+            name,
         } => {
             if protocol != PROTOCOL_VERSION {
                 reject(
@@ -801,7 +950,7 @@ async fn session(
                 reject(tx, "bad_room", "room must be 1..=64 characters");
                 return Ok(());
             }
-            (room, client)
+            (room, client, clean_name(&name))
         }
         _ => {
             reject(tx, "expected_hello", "first message must be hello");
@@ -819,6 +968,7 @@ async fn session(
             Peer {
                 tx: tx.clone(),
                 share: None,
+                name,
             },
         );
         // Someone is listening again, so the room is no longer up for reaping.
@@ -838,7 +988,10 @@ async fn session(
             protocol: PROTOCOL_VERSION,
             server_ms: unix_ms(),
             peers,
+            you: id,
         }));
+        // Everybody, the newcomer included, gets the list with the newcomer in it.
+        room.publish_roster();
         // Who can serve cached tracks, before anything that could start a load:
         // the state below is what makes a peer fetch a track, and by then it
         // should already know whether a neighbour has it. Sent even when empty,
@@ -895,6 +1048,7 @@ async fn session(
             joined: false,
             peers,
         });
+        room.publish_roster();
         if orphaned_station {
             room.publish(Changed::STATE);
         }
@@ -1010,6 +1164,21 @@ async fn pump(
                 );
                 peer.share = offer;
                 room.publish_shares();
+            }
+            ClientMsg::SetName { name } => {
+                let name = clean_name(&name);
+                let mut guard = rooms.lock().await;
+                let Some(room) = guard.get_mut(room_name) else {
+                    continue;
+                };
+                let Some(peer) = room.peers.get_mut(&id) else {
+                    continue;
+                };
+                if peer.name == name {
+                    continue;
+                }
+                peer.name = name;
+                room.publish_roster();
             }
             ClientMsg::Bye => return Ok(()),
             ClientMsg::Hello { .. } => {
@@ -1246,6 +1415,123 @@ mod tests {
         assert!(state.played_out());
     }
 
+    fn ids(state: &RoomState) -> Vec<&str> {
+        state.queue.iter().map(|t| t.track_id.as_str()).collect()
+    }
+
+    fn room_of(count: usize) -> RoomState {
+        let mut state = RoomState::default();
+        state
+            .apply(
+                Command::SetQueue {
+                    tracks: (1..=count).map(|i| track(&i.to_string(), 10_000)).collect(),
+                    start: 0,
+                },
+                1,
+                0,
+            )
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn play_next_goes_right_after_the_current_track_without_interrupting_it() {
+        let mut state = room_of(3);
+        state.apply(Command::Next, 1, 1_000).unwrap(); // now on «2», anchored at 1 000
+        let changed = state
+            .apply(Command::PlayNext { tracks: vec![track("x", 5_000), track("y", 5_000)] }, 1, 2_000)
+            .unwrap();
+        assert_eq!(ids(&state), ["1", "2", "x", "y", "3"]);
+        assert_eq!(state.index, 1, "what plays stays put");
+        assert!(changed.queue);
+        // The playhead's anchor is untouched: «2» keeps playing from where it was.
+        assert!(state.playing);
+        assert_eq!(state.position_ms, 0);
+        assert_eq!(state.at_server_ms, 1_000);
+    }
+
+    #[test]
+    fn play_next_on_an_empty_room_simply_plays() {
+        let mut state = RoomState::default();
+        state.apply(Command::PlayNext { tracks: vec![track("x", 5_000)] }, 1, 0).unwrap();
+        assert_eq!(ids(&state), ["x"]);
+        assert!(state.playing);
+    }
+
+    #[test]
+    fn repeat_one_plays_the_same_track_again() {
+        let mut state = room_with_two_tracks(0);
+        state.apply(Command::SetRepeat { mode: RepeatMode::One }, 1, 0).unwrap();
+        assert!(state.advance_if_ended(10_000));
+        assert_eq!(state.index, 0);
+        assert!(state.playing);
+        assert_eq!(state.position_ms, 0);
+        // A skip is still a skip.
+        state.apply(Command::Next, 1, 11_000).unwrap();
+        assert_eq!(state.index, 1);
+    }
+
+    #[test]
+    fn repeat_all_goes_round_after_the_last_track() {
+        let mut state = room_with_two_tracks(0);
+        state.apply(Command::SetRepeat { mode: RepeatMode::All }, 1, 0).unwrap();
+        state.advance_if_ended(10_000);
+        assert!(state.advance_if_ended(30_000));
+        assert_eq!(state.index, 0, "back to the first track");
+        assert!(state.playing);
+        // And «next» on the last track goes round too, instead of refusing.
+        state.apply(Command::Next, 1, 31_000).unwrap();
+        state.apply(Command::Next, 1, 32_000).unwrap();
+        assert_eq!(state.index, 0);
+    }
+
+    #[test]
+    fn the_modes_reach_everybody_in_the_snapshot() {
+        let mut state = room_with_two_tracks(0);
+        state.apply(Command::SetRepeat { mode: RepeatMode::All }, 1, 0).unwrap();
+        state.apply(Command::SetShuffle { on: true }, 1, 0).unwrap();
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.repeat, RepeatMode::All);
+        assert!(snapshot.shuffle);
+        // Setting what is already set changes nothing and says nothing.
+        assert_eq!(state.apply(Command::SetRepeat { mode: RepeatMode::All }, 1, 0), Ok(Changed::NOTHING));
+    }
+
+    #[test]
+    fn shuffle_reorders_only_what_is_still_to_come() {
+        let mut state = room_of(30);
+        state.apply(Command::PlayIndex { index: 4 }, 1, 0).unwrap();
+        let before: Vec<String> = state.queue.iter().map(|t| t.track_id.clone()).collect();
+
+        let changed = state.apply(Command::SetShuffle { on: true }, 1, 0).unwrap();
+        assert!(changed.queue);
+
+        // Played and playing tracks are where they were.
+        assert_eq!(ids(&state)[..5], ["1", "2", "3", "4", "5"]);
+        assert_eq!(state.index, 4);
+        // The rest are the same tracks, very probably not in the same order.
+        let mut after: Vec<String> = state.queue.iter().map(|t| t.track_id.clone()).collect();
+        assert_ne!(after, before, "25 tracks shuffled into their own order is vanishingly unlikely");
+        after.sort();
+        let mut sorted = before.clone();
+        sorted.sort();
+        assert_eq!(after, sorted, "nothing lost, nothing doubled");
+    }
+
+    #[test]
+    fn tracks_added_while_shuffled_land_among_the_upcoming_ones() {
+        let mut state = room_of(3);
+        state.apply(Command::SetShuffle { on: true }, 1, 0).unwrap();
+        state
+            .apply(Command::Enqueue { tracks: (0..20).map(|i| track(&format!("n{i}"), 1)).collect() }, 1, 0)
+            .unwrap();
+        assert_eq!(state.queue.len(), 23);
+        assert_eq!(state.queue[0].track_id, "1", "the playing track is not moved");
+        // Not all twenty lined up at the end, as an ordinary enqueue would.
+        let tail: Vec<&str> = ids(&state)[3..].to_vec();
+        assert!(tail.iter().any(|id| !id.starts_with('n')) || ids(&state)[1..3].iter().any(|id| id.starts_with('n')));
+    }
+
     #[test]
     fn next_at_the_end_is_refused_rather_than_silently_ignored() {
         let mut state = room_with_two_tracks(0);
@@ -1474,6 +1760,7 @@ mod tests {
                 endpoint: format!("http://10.0.0.{id}:8788"),
                 tracks: tracks.iter().map(|t| t.to_string()).collect(),
             }),
+            name: String::new(),
         }
     }
 
@@ -1482,7 +1769,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut room = Room::default();
         room.peers.insert(1, peer_offering(1, &["10", "11"]));
-        room.peers.insert(2, Peer { tx, share: None });
+        room.peers.insert(2, Peer { tx, share: None, name: String::new() });
 
         let shares = room.shares();
         assert_eq!(shares.len(), 1, "a peer with no cache offers nothing");
@@ -1529,7 +1816,7 @@ mod tests {
             let room = guard.get_mut("home").unwrap();
             for id in 1..=3 {
                 let (tx, _rx) = mpsc::unbounded_channel();
-                room.peers.insert(id, Peer { tx, share: None });
+                room.peers.insert(id, Peer { tx, share: None, name: String::new() });
             }
         }
         let list = room_list(&rooms).await;

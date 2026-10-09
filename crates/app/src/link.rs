@@ -82,6 +82,8 @@ pub struct Link {
     out: mpsc::UnboundedSender<ClientMsg>,
     clock: Arc<Clock>,
     peers_at_join: usize,
+    /// The relay's id for this peer, for finding ourselves in the room's list.
+    you: u64,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -90,6 +92,7 @@ impl Link {
         relay: &str,
         room: &str,
         room_token: &str,
+        name: &str,
         probe_every: Duration,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let (ws, _response) = tokio_tungstenite::connect_async(relay)
@@ -110,6 +113,7 @@ impl Link {
                 room: room.to_string(),
                 token: room_token.to_string(),
                 client: client_name(),
+                name: name.to_string(),
             },
         )
         .await?;
@@ -122,16 +126,18 @@ impl Link {
         // feeder has left never changes it again.
         let mut replay: Vec<ServerMsg> = Vec::new();
 
-        let peers_at_join = loop {
+        let (peers_at_join, you) = loop {
             match next_server_msg(&mut read, HANDSHAKE_TIMEOUT).await? {
-                ServerMsg::Welcome { protocol, peers, .. } => {
+                ServerMsg::Welcome {
+                    protocol, peers, you, ..
+                } => {
                     if protocol != PROTOCOL_VERSION {
                         bail!(
                             "релей говорит на версии протокола {protocol}, эта сборка — \
                              на {PROTOCOL_VERSION}: обновите обе стороны"
                         );
                     }
-                    break peers;
+                    break (peers, you);
                 }
                 ServerMsg::Error { code, message } => {
                     bail!("релей отказал в подключении ({code}): {message}")
@@ -215,6 +221,7 @@ impl Link {
                 out: out_tx,
                 clock,
                 peers_at_join,
+                you,
                 tasks: vec![writer, reader, prober],
             },
             event_rx,
@@ -227,6 +234,21 @@ impl Link {
 
     pub fn peers_at_join(&self) -> usize {
         self.peers_at_join
+    }
+
+    /// The relay's id for this peer.
+    pub fn you(&self) -> u64 {
+        self.you
+    }
+
+    /// Changes the name the room shows for this peer, without reconnecting.
+    #[must_use]
+    pub fn set_name(&self, name: &str) -> bool {
+        self.out
+            .send(ClientMsg::SetName {
+                name: name.to_string(),
+            })
+            .is_ok()
     }
 
     /// Asks the relay to mutate the room. `false` means the connection is gone.
@@ -316,6 +338,7 @@ fn as_event(msg: ServerMsg) -> Option<Event> {
         ServerMsg::Peer { joined, peers } => Some(Event::Peer { joined, peers }),
         ServerMsg::Station { id, yours } => Some(Event::Station { id, yours }),
         ServerMsg::Shares { peers } => Some(Event::Shares { peers }),
+        ServerMsg::Roster { peers } => Some(Event::Roster { peers }),
         ServerMsg::Error { code, message } => Some(Event::Error { code, message }),
         // Handled where the connection is set up, and meaningless afterwards.
         ServerMsg::Welcome { .. } | ServerMsg::TimeRes { .. } => None,

@@ -26,8 +26,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use ymsync_proto::{
-    Correction, Event, PeerShare, PlaybackState, SyncParams, TrackRef, decide, target_position_ms,
-    trust_clock,
+    Correction, Event, PeerShare, PlaybackState, RepeatMode, RosterEntry, SyncParams, TrackRef,
+    decide, target_position_ms, trust_clock,
 };
 
 use crate::albums;
@@ -143,6 +143,14 @@ pub enum Command {
     /// Re-reads «Мне нравится» from Yandex. Done once on connecting; a front end
     /// asks for it again when the listener wants to see changes made elsewhere.
     RefreshLikes,
+    /// Puts tracks right after the current one, for the whole room.
+    PlayNext { tracks: Vec<TrackRef> },
+    /// What happens when a track ends, for the whole room.
+    SetRepeat(RepeatMode),
+    /// Shuffles the upcoming tracks, for the whole room.
+    SetShuffle(bool),
+    /// Changes the name the room shows for this listener.
+    SetName(String),
     Shutdown,
 }
 
@@ -206,8 +214,22 @@ pub struct Snapshot {
     /// Set when this app is running the room's relay itself; the address others
     /// should connect to.
     pub hosting: Option<String>,
+    /// Everybody in the room, this listener included, in the order they came.
+    pub listeners: Vec<Listener>,
+    /// What happens when a track ends — the room's setting, not this peer's.
+    pub repeat: RepeatMode,
+    /// Whether the room's upcoming tracks are shuffled.
+    pub shuffle: bool,
     /// Last thing worth telling the user about.
     pub notice: Option<String>,
+}
+
+/// One person in the room, as a front end lists them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Listener {
+    pub name: String,
+    /// This is the listener looking at the list.
+    pub you: bool,
 }
 
 /// Handle to a running engine. Dropping every clone of the command sender ends
@@ -299,6 +321,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         &relay_url,
         &cfg.room,
         &room_token,
+        &cfg.display_name(),
         Duration::from_secs(cfg.sync.clock_probe_secs),
     )
     .await?;
@@ -334,6 +357,9 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         on_lan: Arc::new(Vec::new()),
         share_port,
         hosting: hosting.clone(),
+        listeners: Vec::new(),
+        repeat: RepeatMode::Off,
+        shuffle: false,
         notice: None,
     });
 
@@ -363,6 +389,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         downloading: None,
         streaming: None,
         shares: Vec::new(),
+        roster: Vec::new(),
         share_port,
         // True from the start: the room has not been told anything yet, and even
         // an empty cache is worth stating so a peer knows where it stands.
@@ -633,6 +660,8 @@ struct Engine {
 
     /// Who in the room is offering cached tracks, as the relay last described it.
     shares: Vec<PeerShare>,
+    /// Who is in the room, as the relay last listed them.
+    roster: Vec<RosterEntry>,
     /// The port this machine serves its own cache on.
     share_port: Option<u16>,
     /// The cache has changed and the room has not been told yet.
@@ -774,6 +803,20 @@ impl Engine {
 
             Command::PlayIndex(index) => self.ask(ymsync_proto::Command::PlayIndex { index }),
             Command::Next => self.ask(ymsync_proto::Command::Next),
+            Command::PlayNext { tracks } => {
+                if tracks.is_empty() {
+                    self.notice = Some("нечего добавить в очередь".to_string());
+                    return;
+                }
+                self.ask(ymsync_proto::Command::PlayNext { tracks });
+            }
+            Command::SetRepeat(mode) => self.ask(ymsync_proto::Command::SetRepeat { mode }),
+            Command::SetShuffle(on) => self.ask(ymsync_proto::Command::SetShuffle { on }),
+            Command::SetName(name) => {
+                if !self.link.set_name(&name) {
+                    self.connected = false;
+                }
+            }
             Command::Prev => self.ask(ymsync_proto::Command::Prev),
 
             Command::TogglePause => {
@@ -1677,6 +1720,10 @@ impl Engine {
                 }
             }
 
+            Event::Roster { peers } => {
+                self.roster = peers;
+            }
+
             Event::Shares { peers } => {
                 // A track that was being sat out because this account cannot play
                 // it may now be reachable from somebody who can: a neighbour's
@@ -1886,6 +1933,16 @@ impl Engine {
             on_lan: Arc::new(self.lan_ids()),
             share_port: self.share_port,
             hosting: self.hosting.clone(),
+            listeners: self
+                .roster
+                .iter()
+                .map(|entry| Listener {
+                    name: entry.name.clone(),
+                    you: entry.peer == self.link.you(),
+                })
+                .collect(),
+            repeat: self.remote.as_ref().map_or(RepeatMode::Off, |state| state.repeat),
+            shuffle: self.remote.as_ref().is_some_and(|state| state.shuffle),
             notice: self.notice.clone(),
         });
     }

@@ -20,7 +20,40 @@ use serde::{Deserialize, Serialize};
 ///   any peer may take that over. Before this, the wave ended for good when
 ///   whoever started it left the room. [`TrackRef::album`] also arrives with this
 ///   version, so a downloaded library can be grouped by album with no network.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// * 6 — the room grows the habits of a music player: [`Command::PlayNext`]
+///   puts tracks right after the current one, [`Command::SetRepeat`] and
+///   [`Command::SetShuffle`] are room-wide modes carried in [`PlaybackState`],
+///   and every peer has a name — given in the hello, changed with
+///   [`ClientMsg::SetName`] — that the relay lists in [`ServerMsg::Roster`].
+pub const PROTOCOL_VERSION: u16 = 6;
+
+/// What happens when a track ends. A room-wide setting, like the queue itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    /// On to the next track; the room stops after the last one.
+    #[default]
+    Off,
+    /// After the last track, back to the first.
+    All,
+    /// The same track again, until somebody skips it.
+    One,
+}
+
+impl RepeatMode {
+    fn is_off(&self) -> bool {
+        *self == RepeatMode::Off
+    }
+}
+
+/// One listener, as the room's list of them shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterEntry {
+    /// The relay's id for the peer; matches [`PeerShare::peer`].
+    pub peer: u64,
+    /// The name the listener chose; empty when they have not chosen one.
+    pub name: String,
+}
 
 /// Identifies a track well enough for another account to resolve it.
 ///
@@ -119,6 +152,13 @@ pub struct PlaybackState {
     /// Now the room remembers, and any peer that sees this picks the wave up.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub station_unfed: bool,
+    /// What happens when the current track ends.
+    #[serde(default, skip_serializing_if = "RepeatMode::is_off")]
+    pub repeat: RepeatMode,
+    /// The upcoming tracks are in random order, and tracks added later land at
+    /// random among them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shuffle: bool,
 }
 
 /// A mutation any peer may ask the relay to make.
@@ -137,6 +177,12 @@ pub enum Command {
     SetQueue { tracks: Vec<TrackRef>, start: usize },
     /// Adds to the end of the queue, leaving what is playing alone.
     Enqueue { tracks: Vec<TrackRef> },
+    /// Puts tracks right after the current one, leaving what is playing alone.
+    PlayNext { tracks: Vec<TrackRef> },
+    /// Sets what happens when a track ends, for the whole room.
+    SetRepeat { mode: RepeatMode },
+    /// Turns shuffling of the upcoming tracks on or off, for the whole room.
+    SetShuffle { on: bool },
     PlayIndex { index: usize },
     Next,
     Prev,
@@ -157,6 +203,13 @@ pub enum ClientMsg {
         room: String,
         token: String,
         client: String,
+        /// The listener's chosen name, shown to the rest of the room.
+        #[serde(default)]
+        name: String,
+    },
+    /// Changes this peer's name without reconnecting.
+    SetName {
+        name: String,
     },
     /// Clock probe. `c0` is the client's wall clock at send time and is echoed
     /// back untouched.
@@ -184,6 +237,15 @@ pub enum ServerMsg {
         protocol: u16,
         server_ms: i64,
         peers: usize,
+        /// The relay's id for the peer being welcomed, so it can find itself in
+        /// [`ServerMsg::Roster`].
+        #[serde(default)]
+        you: u64,
+    },
+    /// Everybody in the room, by name. Broadcast whenever somebody joins, leaves
+    /// or renames themselves.
+    Roster {
+        peers: Vec<RosterEntry>,
     },
     /// Reply to [`ClientMsg::TimeReq`]: `c0` echoed, `s` is the relay's wall
     /// clock when it handled the probe.
@@ -242,6 +304,10 @@ pub enum Event {
     Shares {
         peers: Vec<PeerShare>,
     },
+    /// Who is in the room.
+    Roster {
+        peers: Vec<RosterEntry>,
+    },
     Error {
         code: String,
         message: String,
@@ -275,6 +341,8 @@ mod tests {
             at_server_ms: 1_700_000_000_000,
             station: None,
             station_unfed: false,
+            repeat: RepeatMode::All,
+            shuffle: true,
         }
     }
 

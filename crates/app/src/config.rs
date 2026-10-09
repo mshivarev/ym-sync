@@ -23,6 +23,9 @@ pub struct Config {
     pub yandex_token: String,
     /// 0.0 to 1.0 (values above 1.0 amplify and may clip).
     pub volume: f32,
+    /// What the rest of the room calls this listener. Empty means the device's
+    /// own name — see [`Config::display_name`].
+    pub name: String,
     pub sync: SyncConfig,
     pub cache: CacheConfig,
     pub share: ShareConfig,
@@ -37,6 +40,7 @@ impl Default for Config {
             room_token: String::new(),
             yandex_token: String::new(),
             volume: 0.8,
+            name: String::new(),
             sync: SyncConfig::default(),
             cache: CacheConfig::default(),
             share: ShareConfig::default(),
@@ -286,6 +290,21 @@ impl Config {
         );
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// The name the room is told: the one chosen, or failing that the computer's
+    /// own — a list of three blank lines would say nothing about who is who.
+    pub fn display_name(&self) -> String {
+        let chosen = self.name.trim();
+        if !chosen.is_empty() {
+            return chosen.to_string();
+        }
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "без имени".to_string())
     }
 
     pub fn require_yandex_token(&self) -> Result<&str> {

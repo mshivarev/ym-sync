@@ -38,7 +38,7 @@ fn track(id: &str) -> TrackRef {
 }
 
 async fn connect(relay: &str) -> (Link, UnboundedReceiver<Event>) {
-    Link::connect(relay, ROOM, TOKEN, PROBE_EVERY)
+    Link::connect(relay, ROOM, TOKEN, "test", PROBE_EVERY)
         .await
         .expect("connect to the relay")
 }

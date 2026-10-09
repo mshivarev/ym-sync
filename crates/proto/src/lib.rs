@@ -13,7 +13,8 @@ pub mod sync;
 pub use clock::{ClockSample, ClockSampler, sample_from_roundtrip};
 pub use discovery::{DISCOVERY_PORT, Discovery, RoomBrief};
 pub use message::{
-    ClientMsg, Command, Event, PROTOCOL_VERSION, PeerShare, PlaybackState, ServerMsg, TrackRef,
+    ClientMsg, Command, Event, PROTOCOL_VERSION, PeerShare, PlaybackState, RepeatMode,
+    RosterEntry, ServerMsg, TrackRef,
 };
 pub use sync::{Correction, SyncParams, decide, target_position_ms, trust_clock};
 

@@ -117,6 +117,8 @@ mod tests {
             at_server_ms,
             station: None,
             station_unfed: false,
+            repeat: Default::default(),
+            shuffle: false,
         }
     }
 

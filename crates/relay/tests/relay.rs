@@ -68,6 +68,10 @@ impl Relay {
     }
 
     async fn join_with(&self, token: &str) -> Ws {
+        self.join_as(token, "").await
+    }
+
+    async fn join_as(&self, token: &str, name: &str) -> Ws {
         let (mut ws, _) = tokio_tungstenite::connect_async(&self.url)
             .await
             .expect("connect to the relay");
@@ -78,6 +82,7 @@ impl Relay {
                 room: "test-room".to_string(),
                 token: token.to_string(),
                 client: "integration".to_string(),
+                name: name.to_string(),
             },
         )
         .await;
@@ -109,8 +114,20 @@ async fn command(ws: &mut Ws, command: Command) {
     send(ws, &ClientMsg::Do { command }).await;
 }
 
-/// Next decodable server message, ignoring frames the tests do not care about.
+/// Next decodable server message, ignoring frames the tests do not care about —
+/// the room's list of names among them, which goes out whenever anybody joins
+/// or leaves and has tests of its own.
 async fn recv(ws: &mut Ws) -> ServerMsg {
+    loop {
+        match recv_any(ws).await {
+            ServerMsg::Roster { .. } => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Next decodable server message, whatever it is.
+async fn recv_any(ws: &mut Ws) -> ServerMsg {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     loop {
         let frame = tokio::time::timeout_at(deadline, ws.next())
@@ -187,6 +204,45 @@ async fn a_valid_client_is_welcomed() {
     }
 }
 
+/// The next list of names this socket is told, skipping everything else.
+async fn recv_roster(ws: &mut Ws) -> Vec<(u64, String)> {
+    loop {
+        if let ServerMsg::Roster { peers } = recv_any(ws).await {
+            return peers.into_iter().map(|entry| (entry.peer, entry.name)).collect();
+        }
+    }
+}
+
+#[tokio::test]
+async fn everybody_sees_who_is_in_the_room_and_a_rename() {
+    let relay = Relay::start().await;
+
+    let mut anna = relay.join_as(TOKEN, "Аня").await;
+    let anna_id = match recv_any(&mut anna).await {
+        ServerMsg::Welcome { you, .. } => you,
+        other => panic!("expected a welcome, got {other:?}"),
+    };
+    assert_eq!(recv_roster(&mut anna).await, vec![(anna_id, "Аня".to_string())]);
+
+    // A name is trimmed and stripped of control characters on the way in.
+    let mut boris = relay.join_as(TOKEN, "  Боря\n ").await;
+    let boris_id = match recv_any(&mut boris).await {
+        ServerMsg::Welcome { you, .. } => you,
+        other => panic!("expected a welcome, got {other:?}"),
+    };
+    let both = vec![(anna_id, "Аня".to_string()), (boris_id, "Боря".to_string())];
+    assert_eq!(recv_roster(&mut boris).await, both, "the newcomer sees everybody");
+    assert_eq!(recv_roster(&mut anna).await, both, "and everybody sees the newcomer");
+
+    send(&mut boris, &ClientMsg::SetName { name: "Борис".to_string() }).await;
+    let renamed = vec![(anna_id, "Аня".to_string()), (boris_id, "Борис".to_string())];
+    assert_eq!(recv_roster(&mut anna).await, renamed);
+
+    // Leaving takes you off everybody else's list.
+    drop(boris);
+    assert_eq!(recv_roster(&mut anna).await, vec![(anna_id, "Аня".to_string())]);
+}
+
 #[tokio::test]
 async fn a_wrong_token_is_rejected() {
     let relay = Relay::start().await;
@@ -211,6 +267,7 @@ async fn a_protocol_mismatch_is_reported() {
             room: "test-room".to_string(),
             token: TOKEN.to_string(),
             client: "integration".to_string(),
+            name: String::new(),
         },
     )
     .await;
@@ -737,6 +794,7 @@ async fn an_embedded_relay_serves_an_ordinary_client() {
             room: "embedded".to_string(),
             token: TOKEN.to_string(),
             client: "integration".to_string(),
+            name: String::new(),
         },
     )
     .await;
