@@ -111,6 +111,12 @@ pub enum Command {
     /// Stops feeding a station. What is already queued still plays.
     StopStation,
     PlayIndex(usize),
+    /// Moves a queued track, for the whole room.
+    MoveTrack { from: usize, to: usize },
+    /// Takes a track out of the room's queue.
+    RemoveTrack(usize),
+    /// The equaliser's bands, in decibels. This device only.
+    SetEqualizer(Vec<f32>),
     TogglePause,
     SeekTo(u64),
     SeekBy(i64),
@@ -224,6 +230,9 @@ pub struct Snapshot {
     pub shuffle: bool,
     /// The room is holding the track at its start until everyone has it loaded.
     pub waiting: bool,
+    /// Bumped whenever a track is added to this device's history, so a front
+    /// end knows to re-read it.
+    pub history_revision: u64,
     /// Last thing worth telling the user about.
     pub notice: Option<String>,
 }
@@ -323,6 +332,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         hosting,
     } = wiring;
 
+    player.set_equalizer(&cfg.equalizer);
     let room_token = cfg.require_room_token()?.to_string();
     let (link, events) = Link::connect(
         &relay_url,
@@ -368,6 +378,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         repeat: RepeatMode::Off,
         shuffle: false,
         waiting: false,
+        history_revision: 0,
         notice: None,
     });
 
@@ -400,6 +411,8 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         hot,
         roster: Vec::new(),
         reported_barrier: None,
+        last_recorded: None,
+        history_revision: 0,
         share_port,
         // True from the start: the room has not been told anything yet, and even
         // an empty cache is worth stating so a peer knows where it stands.
@@ -681,6 +694,9 @@ struct Engine {
     roster: Vec<RosterEntry>,
     /// The last wait this peer said it was ready for, so it says so once.
     reported_barrier: Option<u64>,
+    /// The last track written to the history, so it is written once per play.
+    last_recorded: Option<String>,
+    history_revision: u64,
     /// The port this machine serves its own cache on.
     share_port: Option<u16>,
     /// The cache has changed and the room has not been told yet.
@@ -821,6 +837,9 @@ impl Engine {
             }
 
             Command::PlayIndex(index) => self.ask(ymsync_proto::Command::PlayIndex { index }),
+            Command::MoveTrack { from, to } => self.ask(ymsync_proto::Command::Move { from, to }),
+            Command::RemoveTrack(index) => self.ask(ymsync_proto::Command::Remove { index }),
+            Command::SetEqualizer(gains) => self.player.set_equalizer(&gains),
             Command::Next => self.ask(ymsync_proto::Command::Next),
             Command::PlayNext { tracks } => {
                 if tracks.is_empty() {
@@ -1668,6 +1687,15 @@ impl Engine {
                     return;
                 }
 
+                // A new track in the room is a play for this device's history.
+                if let Some(track) = state.track.as_ref()
+                    && self.last_recorded.as_deref() != Some(track.track_id.as_str())
+                {
+                    self.last_recorded = Some(track.track_id.clone());
+                    crate::history::record(self.cache.directory(), track, ymsync_proto::unix_ms());
+                    self.history_revision += 1;
+                }
+
                 // A room with no station means someone replaced the queue
                 // outright, which ends the wave — but only once our own claim
                 // has been confirmed. Switching the wave on sends `SetQueue`
@@ -2042,6 +2070,7 @@ impl Engine {
             repeat: self.remote.as_ref().map_or(RepeatMode::Off, |state| state.repeat),
             shuffle: self.remote.as_ref().is_some_and(|state| state.shuffle),
             waiting: self.remote.as_ref().is_some_and(|state| state.waiting.is_some()),
+            history_revision: self.history_revision,
             notice: self.notice.clone(),
         });
     }

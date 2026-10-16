@@ -38,6 +38,8 @@ pub struct Player {
     /// track it was meant for is still the one playing.
     generation: Arc<AtomicU64>,
     seeker: mpsc::Sender<SeekJob>,
+    /// Shared with every source this player decodes, so a change is heard at once.
+    equalizer: Arc<crate::eq::Equalizer>,
 }
 
 /// A seek into a part of the track that has not downloaded yet.
@@ -91,6 +93,7 @@ impl Player {
             stream: Mutex::new(None),
             generation,
             seeker,
+            equalizer: crate::eq::Equalizer::new(),
         })
     }
 
@@ -186,7 +189,8 @@ impl Playback for Player {
         // `clear` drops the previous source and leaves the sink paused, so the
         // new track cannot start before we have positioned it.
         self.sink.clear();
-        self.sink.append(decoder);
+        self.sink
+            .append(crate::eq::EqSource::new(decoder, Arc::clone(&self.equalizer)));
         // The position counter is not reset until the audio thread notices the
         // new source, so force it: otherwise the previous track's playhead is
         // briefly reported against the new track's duration.
@@ -251,6 +255,10 @@ impl Playback for Player {
             .expect("player mutex")
             .as_ref()
             .map(|t| t.track_id.clone())
+    }
+
+    fn set_equalizer(&self, gains: &[f32]) {
+        self.equalizer.set(gains);
     }
 
     fn set_volume(&self, volume: f32) {

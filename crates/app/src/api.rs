@@ -161,6 +161,28 @@ impl YandexMusic {
         Ok(albums)
     }
 
+    /// Tracks like this one, as Yandex picks them.
+    pub async fn similar_tracks(&self, track_id: &str) -> Result<Vec<Track>> {
+        let id = track_id.split(':').next().unwrap_or(track_id);
+        let found: RawSimilar = self
+            .get_result(&format!("/tracks/{id}/similar"), &[])
+            .await
+            .context("запрос похожих треков")?;
+        Ok(found.similar_tracks.into_iter().filter(|track| track.available).collect())
+    }
+
+    /// An artist's own albums, newest first.
+    pub async fn artist_albums(&self, artist_id: &str) -> Result<Vec<AlbumInfo>> {
+        let found: RawArtistAlbums = self
+            .get_result(
+                &format!("/artists/{artist_id}/direct-albums"),
+                &[("page", "0"), ("page-size", "50"), ("sort-by", "year")],
+            )
+            .await
+            .context("запрос альбомов исполнителя")?;
+        Ok(found.albums.into_iter().map(RawAlbum::into_info).collect())
+    }
+
     /// Every track of an album, in disc order.
     pub async fn album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
         let album: AlbumWithTracks = self
@@ -836,6 +858,19 @@ pub struct AlbumInfo {
     pub track_count: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSimilar {
+    #[serde(default)]
+    similar_tracks: Vec<Track>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawArtistAlbums {
+    #[serde(default)]
+    albums: Vec<RawAlbum>,
+}
+
 impl RawAlbum {
     fn into_info(self) -> AlbumInfo {
         AlbumInfo {
@@ -1480,6 +1515,33 @@ mod tests {
         let ranked: RawTrackIds = serde_json::from_str(r#"{"tracks": ["3", 1, "2"]}"#).unwrap();
         let ids: Vec<String> = ranked.tracks.into_iter().map(|id| id.0).collect();
         assert_eq!(ids, ["3", "1", "2"]);
+    }
+
+    #[test]
+    fn similar_tracks_and_artist_albums_read_their_lists() {
+        let similar: RawSimilar = serde_json::from_str(
+            r#"{"track": {"id": 1, "title": "x"},
+                "similarTracks": [{"id": 2, "title": "Похожий", "durationMs": 1000}, {"id": 3, "title": "Нет", "available": false}]}"#,
+        )
+        .unwrap();
+        let ids: Vec<String> = similar
+            .similar_tracks
+            .into_iter()
+            .filter(|track| track.available)
+            .map(|track| track.id.0)
+            .collect();
+        assert_eq!(ids, ["2"]);
+
+        let albums: RawArtistAlbums = serde_json::from_str(
+            r#"{"albums": [{"id": 77, "title": "Группа крови", "year": 1988, "trackCount": 11,
+                 "artists": [{"name": "Кино"}], "coverUri": "avatars.yandex.net/get-music-content/1/b/%%"}],
+                "pager": {"total": 1}}"#,
+        )
+        .unwrap();
+        let cards: Vec<AlbumInfo> = albums.albums.into_iter().map(RawAlbum::into_info).collect();
+        assert_eq!(cards[0].id, "77");
+        assert_eq!(cards[0].title, "Группа крови");
+        assert_eq!(cards[0].year, Some(1988));
     }
 
     #[test]

@@ -52,5 +52,8 @@ pub trait Playback: Send + Sync + 'static {
     fn current_track_id(&self) -> Option<String>;
 
     fn set_volume(&self, volume: f32);
+    /// The equaliser's bands, in decibels; see [`crate::eq`]. A backend that
+    /// cannot filter ignores it.
+    fn set_equalizer(&self, _gains: &[f32]) {}
     fn volume(&self) -> f32;
 }

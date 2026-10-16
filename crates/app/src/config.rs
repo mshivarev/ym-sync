@@ -26,6 +26,9 @@ pub struct Config {
     /// What the rest of the room calls this listener. Empty means the device's
     /// own name — see [`Config::display_name`].
     pub name: String,
+    /// The equaliser's five bands, in decibels from −12 to +12; see `eq`.
+    /// Empty means flat.
+    pub equalizer: Vec<f32>,
     pub sync: SyncConfig,
     pub cache: CacheConfig,
     pub share: ShareConfig,
@@ -41,6 +44,7 @@ impl Default for Config {
             yandex_token: String::new(),
             volume: 0.8,
             name: String::new(),
+            equalizer: Vec::new(),
             sync: SyncConfig::default(),
             cache: CacheConfig::default(),
             share: ShareConfig::default(),
