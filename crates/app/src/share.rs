@@ -566,6 +566,7 @@ mod tests {
             artist: "Artist".to_string(),
             duration_ms: 1_000,
             cover_uri: None,
+            added_by: None,
         }
     }
 

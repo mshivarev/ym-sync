@@ -81,6 +81,7 @@ pub fn from_bytes(cache: &Cache, name: &str, data: Vec<u8>) -> Result<Imported> 
         // Embedded art would have to be served from this device to be of use to
         // the room, which is more than a picture is worth.
         cover_uri: None,
+        added_by: None,
     };
 
     let bytes = data.len() as u64;

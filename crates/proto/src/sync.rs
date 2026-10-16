@@ -109,6 +109,7 @@ mod tests {
                 artist: "a".into(),
                 duration_ms: 300_000,
                 cover_uri: None,
+                added_by: None,
             }),
             index: 0,
             queue_revision: 1,

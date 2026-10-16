@@ -84,6 +84,12 @@ pub struct TrackRef {
     /// and purely cosmetic — nothing but the pictures depends on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_uri: Option<String>,
+    /// Who put the track in the room's queue, by the name they go by there.
+    /// Written by the relay from the sender's own connection, so nobody can
+    /// queue a track in somebody else's name; whatever a client sends is
+    /// overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
 }
 
 impl std::fmt::Display for TrackRef {
@@ -190,6 +196,11 @@ pub enum Command {
     /// Turns shuffling of the upcoming tracks on or off, for the whole room.
     SetShuffle { on: bool },
     PlayIndex { index: usize },
+    /// Moves a queued track from one place to another. The track playing keeps
+    /// playing, wherever it ends up.
+    Move { from: usize, to: usize },
+    /// Takes a track out of the queue. Not the one playing: skip it first.
+    Remove { index: usize },
     Next,
     Prev,
     Pause,
@@ -347,6 +358,7 @@ mod tests {
             artist: "Artist".into(),
             duration_ms: 210_000,
             cover_uri: None,
+            added_by: None,
         }
     }
 

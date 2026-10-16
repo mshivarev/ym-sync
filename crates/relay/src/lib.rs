@@ -381,6 +381,17 @@ struct Peer {
     name: String,
 }
 
+/// Writes who queued them onto the tracks a command brings.
+fn stamp(command: &mut Command, by: Option<String>) {
+    let tracks = match command {
+        Command::SetQueue { tracks, .. } | Command::Enqueue { tracks } | Command::PlayNext { tracks } => tracks,
+        _ => return,
+    };
+    for track in tracks {
+        track.added_by = by.clone();
+    }
+}
+
 /// Longest name kept, in characters. A name is a label in a list, not a message.
 const MAX_NAME_CHARS: usize = 32;
 
@@ -742,6 +753,40 @@ impl RoomState {
                 self.start_at(index, now);
                 Changed::STATE
             }
+            Command::Move { from, to } => {
+                if from >= self.queue.len() || to >= self.queue.len() {
+                    return Err("no_such_index");
+                }
+                if from == to {
+                    return Ok(Changed::NOTHING);
+                }
+                let track = self.queue.remove(from);
+                self.queue.insert(to, track);
+                // The playing track keeps playing: `index` follows it.
+                if from == self.index {
+                    self.index = to;
+                } else if from < self.index && to >= self.index {
+                    self.index -= 1;
+                } else if from > self.index && to <= self.index {
+                    self.index += 1;
+                }
+                self.queue_revision += 1;
+                Changed::BOTH
+            }
+            Command::Remove { index } => {
+                if index >= self.queue.len() {
+                    return Err("no_such_index");
+                }
+                if index == self.index {
+                    return Err("playing_now");
+                }
+                self.queue.remove(index);
+                if index < self.index {
+                    self.index -= 1;
+                }
+                self.queue_revision += 1;
+                Changed::BOTH
+            }
             Command::Next => {
                 if self.queue.is_empty() {
                     return Err("empty_queue");
@@ -930,6 +975,7 @@ fn error_message(code: &str) -> &'static str {
         "empty_queue" => "в комнате нечего играть",
         "queue_too_long" => "очередь не может быть такой длинной",
         "no_such_index" => "в очереди нет такого номера",
+        "playing_now" => "этот трек сейчас играет — сначала переключите его",
         "end_of_queue" => "это последний трек в очереди",
         "station_taken" => "волну в этой комнате уже ведёт другой участник",
         "too_many_shares" => "слишком много треков в одном объявлении о раздаче",
@@ -1227,6 +1273,15 @@ async fn pump(
                 let Some(room) = guard.get_mut(room_name) else {
                     continue;
                 };
+                // Every queued track says who queued it, by the name this
+                // connection goes by — never by what the client claims.
+                let mut command = command;
+                let by = room
+                    .peers
+                    .get(&id)
+                    .map(|peer| peer.name.clone())
+                    .filter(|name| !name.is_empty());
+                stamp(&mut command, by);
                 match room.state.apply(command, id, unix_ms()) {
                     Ok(changed) => {
                         room.publish(changed);
@@ -1381,6 +1436,7 @@ mod tests {
             artist: "a".into(),
             duration_ms,
             cover_uri: None,
+            added_by: None,
         }
     }
 
@@ -1747,6 +1803,47 @@ mod tests {
         let state = room_with_two_tracks(0);
         assert!(state.playing);
         assert_eq!(state.snapshot().waiting, None);
+    }
+
+    #[test]
+    fn moving_a_track_keeps_the_playing_one_playing() {
+        let mut state = room_of(5);
+        state.apply(Command::PlayIndex { index: 2 }, 1, 0).unwrap(); // «3» plays
+        // Something from before the playing track to after it.
+        state.apply(Command::Move { from: 0, to: 4 }, 1, 1_000).unwrap();
+        assert_eq!(ids(&state), ["2", "3", "4", "5", "1"]);
+        assert_eq!(state.queue[state.index].track_id, "3");
+        // And from after it to before it.
+        state.apply(Command::Move { from: 3, to: 0 }, 1, 1_000).unwrap();
+        assert_eq!(ids(&state), ["5", "2", "3", "4", "1"]);
+        assert_eq!(state.queue[state.index].track_id, "3");
+        // The playing track itself, dragged elsewhere.
+        state.apply(Command::Move { from: state.index, to: 4 }, 1, 1_000).unwrap();
+        assert_eq!(state.queue[state.index].track_id, "3");
+        assert_eq!(state.index, 4);
+        assert_eq!(state.apply(Command::Move { from: 0, to: 9 }, 1, 0), Err("no_such_index"));
+    }
+
+    #[test]
+    fn removing_a_track_leaves_the_playing_one_alone() {
+        let mut state = room_of(4);
+        state.apply(Command::PlayIndex { index: 2 }, 1, 0).unwrap();
+        assert_eq!(state.apply(Command::Remove { index: 2 }, 1, 0), Err("playing_now"));
+        state.apply(Command::Remove { index: 0 }, 1, 0).unwrap();
+        assert_eq!(ids(&state), ["2", "3", "4"]);
+        assert_eq!(state.queue[state.index].track_id, "3");
+        state.apply(Command::Remove { index: 2 }, 1, 0).unwrap();
+        assert_eq!(ids(&state), ["2", "3"]);
+    }
+
+    #[test]
+    fn queued_tracks_carry_who_queued_them_whatever_the_client_said() {
+        let mut command = Command::Enqueue {
+            tracks: vec![TrackRef { added_by: Some("кто-то другой".into()), ..track("1", 1) }],
+        };
+        stamp(&mut command, Some("Аня".into()));
+        let Command::Enqueue { tracks } = command else { unreachable!() };
+        assert_eq!(tracks[0].added_by.as_deref(), Some("Аня"));
     }
 
     #[test]

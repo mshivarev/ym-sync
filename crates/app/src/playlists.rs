@@ -182,6 +182,7 @@ mod tests {
             artist: "a".into(),
             duration_ms: 1_000,
             cover_uri: None,
+            added_by: None,
         }
     }
 

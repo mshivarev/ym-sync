@@ -34,6 +34,7 @@ fn track(id: &str) -> TrackRef {
         artist: "Исполнитель".to_string(),
         duration_ms: 180_000,
         cover_uri: None,
+        added_by: None,
     }
 }
 

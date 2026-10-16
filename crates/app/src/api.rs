@@ -1205,6 +1205,7 @@ impl Track {
             artist: self.artist_names(),
             duration_ms: self.duration_ms,
             cover_uri: self.cover_uri(),
+            added_by: None,
         }
     }
 }
