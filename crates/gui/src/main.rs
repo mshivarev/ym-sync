@@ -158,6 +158,8 @@ struct Settings {
     name: String,
     /// What the room will actually be told — the chosen name or the computer's.
     display_name: String,
+    /// The equaliser's five bands, in decibels.
+    equalizer: Vec<f32>,
 }
 
 #[tauri::command]
@@ -184,7 +186,57 @@ fn settings(state: State<'_, AppState>) -> Settings {
         auto_cache: cfg.cache.auto,
         name: cfg.name.clone(),
         display_name: cfg.display_name(),
+        equalizer: cfg.equalizer.clone(),
     }
+}
+
+/// Moves the equaliser's bands. Heard at once while a room plays, and kept for
+/// the next one.
+#[tauri::command]
+async fn set_equalizer(gains: Vec<f32>, state: State<'_, AppState>) -> Result<(), String> {
+    let gains: Vec<f32> = gains
+        .into_iter()
+        .take(ymsync::eq::BANDS)
+        .map(|gain| if gain.is_finite() { gain.clamp(-ymsync::eq::MAX_GAIN_DB, ymsync::eq::MAX_GAIN_DB) } else { 0.0 })
+        .collect();
+    if let Some(session) = state.session.lock().await.as_ref() {
+        session.handle().send(Command::SetEqualizer(gains.clone()));
+    }
+    let mut cfg = state.config();
+    cfg.equalizer = gains;
+    state.remember(cfg)
+}
+
+/// What this device has played, newest first.
+#[tauri::command]
+async fn history(state: State<'_, AppState>) -> Result<Vec<ymsync::history::Played>, String> {
+    let cache = state.cache().await?;
+    Ok(tokio::task::spawn_blocking(move || ymsync::history::read(cache.directory()))
+        .await
+        .map_err(fail)?)
+}
+
+#[tauri::command]
+async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    let cache = state.cache().await?;
+    ymsync::history::clear(cache.directory()).map_err(fail)
+}
+
+/// Tracks like `track_id`, for the «Похожие» page.
+#[tauri::command]
+async fn similar(track_id: String, state: State<'_, AppState>) -> Result<Vec<TrackRef>, String> {
+    if playlists::is_own_file(&track_id) {
+        return Err("это свой файл — похожие Яндекс подбирает только для своих треков".to_string());
+    }
+    let api = state.api().await?;
+    let tracks = api.similar_tracks(track_id.trim()).await.map_err(fail)?;
+    Ok(tracks.iter().map(Track::to_track_ref).collect())
+}
+
+/// Moves a queued track, for the whole room.
+#[tauri::command]
+async fn move_track(from: usize, to: usize, state: State<'_, AppState>) -> Result<(), String> {
+    send(&state, Command::MoveTrack { from, to }).await
 }
 
 /// Saves the settings page. Everything takes effect at once: a running room
@@ -430,6 +482,22 @@ async fn play_source(
     replace: bool,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
+    // A station of tracks like this one: the same machinery as the wave.
+    if kind == "radio" {
+        if playlists::is_own_file(&value) {
+            return Err("радио подбирается только по трекам Яндекса".to_string());
+        }
+        send(
+            &state,
+            Command::PlayStation {
+                id: format!("track:{}", value.trim()),
+                replace,
+            },
+        )
+        .await?;
+        return Ok(0);
+    }
+
     // The wave has no list to resolve: the engine follows the station itself.
     if kind == "wave" {
         send(
@@ -547,6 +615,8 @@ struct ArtistPage {
     artist: api::ArtistInfo,
     /// Most popular first.
     tracks: Vec<TrackRef>,
+    /// Their own albums, newest first. Empty if Yandex would not say.
+    albums: Vec<api::AlbumInfo>,
 }
 
 /// The page of whoever sings `track_id`.
@@ -561,10 +631,13 @@ async fn artist_page(track_id: String, state: State<'_, AppState>) -> Result<Art
         .await
         .map_err(fail)?
         .ok_or_else(|| "Яндекс не знает исполнителя этого трека".to_string())?;
-    let (artist, tracks) = api.artist_page(&artist_id).await.map_err(fail)?;
+    let (page, albums) = tokio::join!(api.artist_page(&artist_id), api.artist_albums(&artist_id));
+    let (artist, tracks) = page.map_err(fail)?;
     Ok(ArtistPage {
         artist,
         tracks: tracks.iter().map(Track::to_track_ref).collect(),
+        // A page without its albums row is still the page.
+        albums: albums.unwrap_or_default(),
     })
 }
 
@@ -737,6 +810,7 @@ async fn control(
         "volume" => Command::SetVolume(number as f32),
         "index" => Command::PlayIndex(number.max(0.0) as usize),
         "stop_wave" => Command::StopStation,
+        "remove" => Command::RemoveTrack(number.max(0.0) as usize),
         "repeat" => Command::SetRepeat(match number as i64 {
             1 => RepeatMode::All,
             2 => RepeatMode::One,
@@ -996,6 +1070,42 @@ fn fail<E: std::fmt::Display>(err: E) -> String {
     format!("{err:#}")
 }
 
+/// The keyboard's media keys — play/pause, next, previous — anywhere in the
+/// system, not only while this window has the focus. The volume keys are left
+/// to Windows: they are the system's volume, and taking them would be rude.
+fn media_keys() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_global_shortcut::{Code, Shortcut, ShortcutState};
+    tauri_plugin_global_shortcut::Builder::new()
+        .with_shortcuts([
+            Shortcut::new(None, Code::MediaPlayPause),
+            Shortcut::new(None, Code::MediaTrackNext),
+            Shortcut::new(None, Code::MediaTrackPrevious),
+        ])
+        .unwrap_or_else(|err| {
+            tracing::warn!("медиаклавиши не подключились: {err}");
+            tauri_plugin_global_shortcut::Builder::new()
+        })
+        .with_handler(|app, shortcut, event| {
+            if event.state() != ShortcutState::Pressed {
+                return;
+            }
+            let command = match shortcut.key {
+                Code::MediaPlayPause => Command::TogglePause,
+                Code::MediaTrackNext => Command::Next,
+                Code::MediaTrackPrevious => Command::Prev,
+                _ => return,
+            };
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                if let Some(session) = state.session.lock().await.as_ref() {
+                    session.handle().send(command);
+                }
+            });
+        })
+        .build()
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -1017,6 +1127,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(media_keys())
         .setup(move |app| {
             app.manage(AppState {
                 config: std::sync::Mutex::new(config),
@@ -1063,7 +1174,12 @@ fn main() {
             create_playlist,
             delete_playlist,
             remove_from_playlist,
-            artist_page
+            artist_page,
+            set_equalizer,
+            history,
+            clear_history,
+            similar,
+            move_track
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно");

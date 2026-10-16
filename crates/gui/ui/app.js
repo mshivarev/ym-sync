@@ -125,6 +125,22 @@ const ui = {
   artistQueue: el("artist-queue"),
   artistTracks: el("artist-tracks"),
   artistCount: el("artist-count"),
+  albumRadio: el("album-radio"),
+  libClear: el("lib-clear"),
+  artistAlbumsBlock: el("artist-albums-block"),
+  artistAlbums: el("artist-albums"),
+  similarBtn: el("similar-btn"),
+  eq: el("eq"),
+  eqPresets: el("eq-presets"),
+};
+
+/// The equaliser's bands, as the sliders label them.
+const EQ_BANDS = ["60 Гц", "230 Гц", "910 Гц", "3,6 кГц", "14 кГц"];
+const EQ_PRESETS = {
+  flat: [0, 0, 0, 0, 0],
+  bass: [6, 4, 0, -1, -1],
+  vocal: [-2, 0, 3, 3, 0],
+  treble: [-1, -1, 0, 3, 5],
 };
 
 /// The owner a playlist on this device reports; see `playlists.rs`.
@@ -162,6 +178,7 @@ const TAB_HEADS = {
   likes: { title: "Мне нравится", art: "likes", icon: "i-heart" },
   albums: { title: "По альбомам", art: "albums", icon: "i-library" },
   playlists: { title: "Плейлисты", art: "albums", icon: "i-queue" },
+  history: { title: "История", art: "", icon: "i-history" },
 };
 
 /// The order the repeat button steps through, and how it says each.
@@ -227,6 +244,14 @@ let openPlaylistCard = null;
 let artistTracks = [];
 let artistToken = 0;
 let beforeArtist = "home";
+/// What this device has played, newest first, and the revision it was read at.
+let played = [];
+let historyRevision = -1;
+/// The track whose «Похожие» page is open, for the radio button there.
+let similarTo = null;
+/// The queue row being dragged, by index.
+let dragFrom = null;
+let eqTimer = null;
 /// The words on the lyrics page: whose they are, and the timed lines if any.
 let lyricsFor = null;
 let lyricsLines = [];
@@ -540,9 +565,12 @@ function renderAlbumCards() {
 /// knows; the tracks follow from Yandex.
 async function openAlbum(album) {
   hideSuggest();
-  albumReturn = "home";
+  const from = document.querySelector(".view:not(.hidden)")?.dataset.view;
+  albumReturn = from && from !== "album" ? from : "home";
   openPlaylistCard = null;
+  similarTo = null;
   ui.albumDelete.classList.add("hidden");
+  ui.albumRadio.classList.add("hidden");
   ui.albumEyebrow.textContent = "Альбом";
   const mine = ++albumToken;
   albumTracks = [];
@@ -568,6 +596,8 @@ async function openAlbum(album) {
 async function openPlaylist(playlist) {
   albumReturn = "library";
   openPlaylistCard = playlist;
+  similarTo = null;
+  ui.albumRadio.classList.add("hidden");
   const local = playlist.owner === LOCAL_OWNER;
   ui.albumDelete.classList.toggle("hidden", !local);
   ui.albumEyebrow.textContent = local ? "Плейлист на устройстве" : "Плейлист";
@@ -869,7 +899,7 @@ function equaliser() {
 /// Every row carries a heart, because the track you want to keep is as likely to
 /// be one you are queueing as the one already playing. It sits outside the row's
 /// own button: a button inside a button is not valid, and not clickable either.
-function trackItem(track, index, { current, onClick, trailing, extra, queueable = true }) {
+function trackItem(track, index, { current, onClick, trailing, extra, queueable = true, showAdder = false }) {
   const item = document.createElement("li");
   if (current) item.className = "current";
 
@@ -904,6 +934,13 @@ function trackItem(track, index, { current, onClick, trailing, extra, queueable 
     by.append(badge);
   }
   by.append(track.artist);
+  // In the room's queue, who put it there.
+  if (showAdder && track.added_by) {
+    const adder = document.createElement("span");
+    adder.className = "adder";
+    adder.textContent = ` · поставил(а) ${track.added_by}`;
+    by.append(adder);
+  }
   meta.append(name, by);
 
   const flag = origin(track.track_id);
@@ -1001,16 +1038,63 @@ function renderQueue(snapshot) {
     return;
   }
   ui.queue.replaceChildren(
-    ...snapshot.queue.map((track, index) =>
-      trackItem(track, index, {
-        current: index === snapshot.index,
+    ...snapshot.queue.map((track, index) => {
+      const current = index === snapshot.index;
+      const item = trackItem(track, index, {
+        current,
         onClick: () => call("control", { action: "index", value: index }),
         queueable: false,
-      }),
-    ),
+        showAdder: true,
+        // The playing track is skipped, not removed.
+        extra: current ? undefined : removeFromQueueButton(index),
+      });
+      makeDraggable(item, index);
+      return item;
+    }),
   );
   const current = ui.queue.children[snapshot.index];
   if (current) current.scrollIntoView({ block: "nearest" });
+}
+
+function removeFromQueueButton(index) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "drop";
+  button.append(icon("i-close"));
+  button.title = "убрать из очереди";
+  button.addEventListener("click", () => call("control", { action: "remove", value: index }));
+  return button;
+}
+
+/// Reordering by dragging: the row says where it came from, the row it lands on
+/// where it goes. The relay keeps the playing track playing either way.
+function makeDraggable(item, index) {
+  item.draggable = true;
+  item.addEventListener("dragstart", (event) => {
+    dragFrom = index;
+    item.classList.add("dragging");
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", String(index));
+  });
+  item.addEventListener("dragend", () => {
+    dragFrom = null;
+    item.classList.remove("dragging");
+    for (const row of ui.queue.querySelectorAll(".drop-target")) row.classList.remove("drop-target");
+  });
+  item.addEventListener("dragover", (event) => {
+    if (dragFrom === null) return;
+    event.preventDefault();
+    item.classList.add("drop-target");
+  });
+  item.addEventListener("dragleave", () => item.classList.remove("drop-target"));
+  item.addEventListener("drop", (event) => {
+    event.preventDefault();
+    item.classList.remove("drop-target");
+    const from = dragFrom;
+    dragFrom = null;
+    if (from === null || from === index) return;
+    call("move_track", { from, to: index });
+  });
 }
 
 function renderResults() {
@@ -1035,13 +1119,18 @@ function renderLibrary() {
   ui.libArt.className = `playlist-art ${head.art}`;
   setIcon(ui.libArt, head.icon);
 
+  const onHistory = tab === "history";
+  ui.libClear.classList.toggle("hidden", !onHistory);
+  ui.libImport.classList.toggle("hidden", onHistory || tab === "playlists");
   const onPlaylists = tab === "playlists";
   ui.playlists.classList.toggle("hidden", !onPlaylists);
   ui.library.classList.toggle("hidden", onPlaylists);
-  for (const node of [ui.libPlay, ui.libQueue, ui.libImport]) node.classList.toggle("hidden", onPlaylists);
+  for (const node of [ui.libPlay, ui.libQueue]) node.classList.toggle("hidden", onPlaylists);
 
   if (onPlaylists) {
     renderPlaylists();
+  } else if (onHistory) {
+    renderHistory();
   } else if (tab === "likes") {
     renderLikes();
   } else if (tab === "albums") {
@@ -1089,6 +1178,50 @@ function renderLikes() {
     ),
   );
 }
+
+/// What this device played, newest first, with when.
+function renderHistory() {
+  if (!played.length) {
+    ui.library.replaceChildren(emptyRow("Здесь появится всё, что играло"));
+    return;
+  }
+  const tracks = played.map((played) => played.track);
+  ui.library.replaceChildren(
+    ...played.map((played, index) =>
+      trackItem(played.track, index, {
+        current: false,
+        trailing: whenPlayed(played.at_ms),
+        onClick: () => playFrom(tracks, index),
+      }),
+    ),
+  );
+}
+
+/// «14:05» today, «вчера», or the date.
+function whenPlayed(ms) {
+  const then = new Date(ms);
+  const now = new Date();
+  const day = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const days = Math.round((day(now) - day(then)) / 86_400_000);
+  if (days === 0) return then.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  if (days === 1) return "вчера";
+  return then.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+}
+
+async function refreshHistory() {
+  const found = await call("history");
+  if (!found) return;
+  played = found;
+  if (tab === "history") renderLibrary();
+}
+
+ui.libClear.addEventListener("click", async () => {
+  if (!confirm("Очистить историю на этом устройстве?")) return;
+  if (await attempt("clear_history")) {
+    played = [];
+    renderLibrary();
+  }
+});
 
 /// The account's playlists as cards; a card opens the playlist's page. Fetched
 /// the first time the tab is opened, since unlike the rest this needs Yandex.
@@ -1235,12 +1368,18 @@ function dropButton(entry) {
 /// What «Играть» and «В очередь» act on: whatever the open tab is showing.
 function visibleTracks() {
   if (tab === "playlists") return [];
+  if (tab === "history") return played.map((played) => played.track);
   if (tab === "likes") return likes;
   if (tab === "albums") return albumGroups().flatMap((group) => group.tracks);
   return library;
 }
 
 function updateLibraryHint() {
+  if (tab === "history") {
+    ui.libCount.textContent = played.length ? tracksWord(played.length) : "";
+    ui.libHint.textContent = "что играло на этом устройстве, последнее сверху";
+    return;
+  }
   if (tab === "playlists") {
     ui.libCount.textContent = playlists?.length ? `${playlists.length} шт.` : "";
     ui.libHint.textContent = "свои плейлисты аккаунта Яндекса";
@@ -1426,6 +1565,11 @@ function render(snapshot) {
     renderResults();
   }
 
+  if (snapshot.history_revision !== historyRevision) {
+    historyRevision = snapshot.history_revision;
+    refreshHistory();
+  }
+
   // A download that finished changed the disk, so the library page is stale.
   if (snapshot.cache_revision !== libraryRevision) {
     libraryRevision = snapshot.cache_revision;
@@ -1594,6 +1738,7 @@ function fillSettings(settings) {
     : `Пусто — будет «${settings.display_name}».`;
   ui.setLimit.value = settings.cache_limit_bytes ? +(settings.cache_limit_bytes / 1024 ** 3).toFixed(2) : 0;
   ui.setAuto.checked = settings.auto_cache;
+  renderEqualizer(settings.equalizer ?? []);
   ui.setDir.textContent = settings.cache_dir ? `папка: ${settings.cache_dir}` : "";
   ui.setPath.textContent = settings.config_path ? `файл настроек: ${settings.config_path}` : "";
   setAccount(settings.has_yandex_token);
@@ -1749,6 +1894,7 @@ async function openArtist(track) {
   ui.artistName.textContent = track.artist;
   ui.artistMeta.textContent = "";
   ui.artistCount.textContent = "";
+  ui.artistAlbumsBlock.classList.add("hidden");
   ui.artistPhoto.replaceChildren(icon("i-user"));
   for (const node of [ui.artistPlay, ui.artistNext, ui.artistQueue]) node.disabled = true;
   ui.artistTracks.replaceChildren(emptyRow("загружаю…"));
@@ -1770,6 +1916,28 @@ async function openArtist(track) {
   ]
     .filter(Boolean)
     .join(" · ");
+  const albums = page.albums ?? [];
+  ui.artistAlbumsBlock.classList.toggle("hidden", albums.length === 0);
+  ui.artistAlbums.replaceChildren(
+    ...albums.map((album) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "album-card";
+      card.title = `открыть альбом «${album.title}»`;
+      const art = document.createElement("span");
+      art.className = "art";
+      fillCover(art, album, 200);
+      const name = document.createElement("span");
+      name.className = "album-name";
+      name.textContent = album.title;
+      const by = document.createElement("span");
+      by.className = "album-by";
+      by.textContent = [album.year, album.track_count ? tracksWord(album.track_count) : null].filter(Boolean).join(" · ");
+      card.append(art, name, by);
+      card.addEventListener("click", () => openAlbum(album));
+      return card;
+    }),
+  );
   artistTracks = tracks;
   ui.artistCount.textContent = tracks.length ? `· ${tracks.length}` : "";
   for (const node of [ui.artistPlay, ui.artistNext, ui.artistQueue]) node.disabled = !tracks.length;
@@ -1793,6 +1961,119 @@ ui.artistNext.addEventListener("click", async () => {
 ui.artistQueue.addEventListener("click", async () => {
   const done = await withRoom(() => attempt("queue_tracks", { tracks: artistTracks, start: 0, replace: false }));
   if (done) toast(`в очереди: ${ui.artistName.textContent}`);
+});
+
+// ---------- similar ----------
+
+/// Tracks like the one playing, on the album page — with «Радио по треку» for an
+/// endless stream of them.
+async function openSimilar(track) {
+  if (!track || isOwn(track)) return;
+  const from = document.querySelector(".view:not(.hidden)")?.dataset.view;
+  albumReturn = from && from !== "album" ? from : "home";
+  openPlaylistCard = null;
+  similarTo = track;
+  ui.albumDelete.classList.add("hidden");
+  ui.albumRadio.classList.remove("hidden");
+  ui.albumEyebrow.textContent = "Похожие";
+  const mine = ++albumToken;
+  albumTracks = [];
+  ui.albumTitle.textContent = track.title;
+  ui.albumMeta.textContent = track.artist;
+  fillCover(ui.albumCover, track, 400);
+  setAlbumButtons(false);
+  ui.albumTracks.replaceChildren(emptyRow("подбираю похожие…"));
+  showView("album");
+
+  const tracks = await call("similar", { trackId: track.track_id });
+  if (mine !== albumToken) return;
+  if (!tracks) {
+    ui.albumTracks.replaceChildren(emptyRow("не удалось подобрать похожие"));
+    return;
+  }
+  albumTracks = tracks;
+  ui.albumMeta.textContent = `${track.artist} · ${tracksWord(tracks.length)}`;
+  renderAlbumTracks();
+}
+
+ui.similarBtn.addEventListener("click", () => openSimilar(latest?.track));
+ui.albumRadio.addEventListener("click", async () => {
+  const track = similarTo;
+  if (!track) return;
+  const length = await withRoom(() => call("play_source", { kind: "radio", value: track.track_id, replace: true }));
+  if (typeof length === "number") toast(`радио по треку «${track.title}» включено`);
+});
+
+// ---------- equalizer ----------
+
+function renderEqualizer(gains) {
+  ui.eq.replaceChildren(
+    ...EQ_BANDS.map((label, index) => {
+      const band = document.createElement("label");
+      band.className = "eq-band";
+      const value = document.createElement("span");
+      value.className = "eq-value";
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = "-12";
+      slider.max = "12";
+      slider.step = "1";
+      slider.value = String(Math.round(gains[index] ?? 0));
+      slider.dataset.band = String(index);
+      const show = () => {
+        const db = Number(slider.value);
+        value.textContent = `${db > 0 ? "+" : ""}${db} дБ`;
+        paintRange(slider);
+      };
+      show();
+      slider.addEventListener("input", () => {
+        show();
+        sendEqualizer();
+      });
+      const name = document.createElement("span");
+      name.className = "eq-label";
+      name.textContent = label;
+      band.append(value, slider, name);
+      return band;
+    }),
+  );
+}
+
+function equalizerGains() {
+  return [...ui.eq.querySelectorAll("input")].map((slider) => Number(slider.value));
+}
+
+/// Sliders fire continuously; only a settled position is sent and saved.
+function sendEqualizer() {
+  clearTimeout(eqTimer);
+  eqTimer = setTimeout(() => call("set_equalizer", { gains: equalizerGains() }), 150);
+}
+
+ui.eqPresets.addEventListener("click", (event) => {
+  const preset = EQ_PRESETS[event.target.closest("[data-preset]")?.dataset.preset];
+  if (!preset) return;
+  renderEqualizer(preset);
+  sendEqualizer();
+});
+
+// ---------- keys ----------
+
+// In the window: ↑/↓ the volume, Ctrl+→/← the next and previous track. The
+// media keys work everywhere — the backend listens for them system-wide.
+document.addEventListener("keydown", (event) => {
+  if (typingInto(event.target) || event.altKey || event.metaKey) return;
+  if (!event.ctrlKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    event.preventDefault();
+    const step = event.key === "ArrowUp" ? 5 : -5;
+    ui.volume.value = String(Math.max(0, Math.min(100, Number(ui.volume.value) + step)));
+    ui.volume.dispatchEvent(new Event("input"));
+    toast(`громкость ${ui.volume.value}%`);
+    return;
+  }
+  if (event.ctrlKey && connected && (event.key === "ArrowRight" || event.key === "ArrowLeft")) {
+    event.preventDefault();
+    call("control", { action: event.key === "ArrowRight" ? "next" : "prev" });
+  }
 });
 
 /// Joins a room, or holds it here. The two buttons differ only in `host`.
