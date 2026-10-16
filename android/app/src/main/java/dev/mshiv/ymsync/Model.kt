@@ -15,6 +15,8 @@ data class TrackInfo(
     val album: String? = null,
     /** Yandex's cover template, `avatars.yandex.net/…/%%`; see [coverUrl]. */
     val coverUri: String? = null,
+    /** Who put it in the room's queue, as the relay stamped it. */
+    val addedBy: String? = null,
 ) {
     /**
      * The cover at [size]×[size] pixels, or null when the core has none — a track
@@ -301,6 +303,8 @@ data class Snapshot(
     val listeners: List<Listener> = emptyList(),
     /** The room holds the track at its start until every device has it loaded. */
     val waiting: Boolean = false,
+    /** Bumped whenever a track is added to this phone's history. */
+    val historyRevision: Long = 0,
 )
 
 /** Either the `ok` payload or the `error` text from a native call. */
@@ -331,7 +335,11 @@ fun JSONObject.toTrackInfo() =
         albumId = if (isNull("album_id")) null else optString("album_id"),
         album = if (isNull("album")) null else optString("album"),
         coverUri = if (isNull("cover_uri")) null else optString("cover_uri"),
+        addedBy = if (isNull("added_by")) null else optString("added_by").ifBlank { null },
     )
+
+/** One play in this phone's history. */
+data class Played(val track: TrackInfo, val atMs: Long)
 
 fun JSONArray.toTrackList(): List<TrackInfo> =
     (0 until length()).mapNotNull { optJSONObject(it)?.toTrackInfo() }
@@ -406,6 +414,7 @@ fun JSONObject.toSnapshot(previous: Snapshot? = null) =
         hosting = if (isNull("hosting")) null else optString("hosting"),
         repeat = optString("repeat", "off"),
         waiting = optBoolean("waiting"),
+        historyRevision = optLong("history_revision"),
         shuffle = optBoolean("shuffle"),
         listeners = optJSONArray("listeners")?.let { array ->
             (0 until array.length()).mapNotNull { index ->
@@ -470,6 +479,12 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_NAME, "")!!
         set(value) = prefs.edit().putString(KEY_NAME, value.trim()).apply()
 
+    /** The equaliser's five bands, in decibels. */
+    var equalizer: List<Float>
+        get() = prefs.getString(KEY_EQ, "")!!.split(',').mapNotNull { it.trim().toFloatOrNull() }
+            .let { it + List((5 - it.size).coerceAtLeast(0)) { 0f } }.take(5)
+        set(value) = prefs.edit().putString(KEY_EQ, value.joinToString(",")).apply()
+
     /** What the room will actually be told. */
     val displayName: String
         get() = name.ifBlank { android.os.Build.MODEL ?: "телефон" }
@@ -521,6 +536,7 @@ class Settings(context: Context) {
             .put("yandex_token", yandexToken)
             .put("volume", volume.toDouble())
             .put("name", displayName)
+            .put("equalizer", JSONArray().apply { equalizer.forEach { put(it.toDouble()) } })
             .put(
                 "cache",
                 JSONObject()
@@ -549,5 +565,6 @@ class Settings(context: Context) {
         const val KEY_AUTO_CACHE = "auto_cache"
         const val KEY_CACHE_LIMIT = "cache_limit_gb"
         const val KEY_NAME = "name"
+        const val KEY_EQ = "equalizer"
     }
 }

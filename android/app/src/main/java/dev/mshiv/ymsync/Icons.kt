@@ -42,6 +42,9 @@ object AppIcons {
     val More = icon("More", "M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm0 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z")
     val File = icon("File", "M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 14h-3v3a2 2 0 1 1-2-2c.37 0 .7.11 1 .28V11h4v2h-3v3h3zM13 9V3.5L18.5 9H13z")
     val PlaylistAdd = icon("PlaylistAdd", "M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z")
+    val Similar = icon("Similar", "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14.5v-9l6 4.5-6 4.5zM4.5 12c0-1.1.24-2.15.68-3.09l1.5.87A5.5 5.5 0 0 0 6.5 12H4.5z")
+    val History = icon("History", "M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z")
+    val Wave = icon("Wave", "M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z")
     val ChevronDown = icon("ChevronDown", "M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z")
 }
 

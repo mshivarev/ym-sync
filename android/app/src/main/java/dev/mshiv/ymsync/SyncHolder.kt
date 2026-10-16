@@ -210,7 +210,7 @@ object Commands {
     }
 
     /** The page of whoever sings `trackId`. */
-    suspend fun artistPage(trackId: String): Result<Pair<ArtistInfo, List<TrackInfo>>> {
+    suspend fun artistPage(trackId: String): Result<Triple<ArtistInfo, List<TrackInfo>, List<AlbumInfo>>> {
         val handle = SyncHolder.handle
         if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
         return when (val reply = withContext(Dispatchers.IO) { parseReply(Native.artistPage(handle, trackId)) }) {
@@ -218,8 +218,39 @@ object Commands {
             is NativeResult.Ok -> {
                 val artist = reply.value.optJSONObject("artist")?.toArtistInfo()
                     ?: return Result.failure(IllegalStateException("пустой ответ"))
-                Result.success(artist to (reply.value.optJSONArray("tracks")?.toTrackList() ?: emptyList()))
+                val albums = reply.value.optJSONArray("albums")?.let { array ->
+                    (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toAlbumInfo() }
+                } ?: emptyList()
+                Result.success(Triple(artist, reply.value.optJSONArray("tracks")?.toTrackList() ?: emptyList(), albums))
             }
+        }
+    }
+
+    /** What this phone has played, newest first. */
+    suspend fun history(): Result<List<Played>> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        return when (val reply = withContext(Dispatchers.IO) { parseReply(Native.history(handle)) }) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(
+                reply.value.optJSONArray("played")?.let { array ->
+                    (0 until array.length()).mapNotNull { index ->
+                        array.optJSONObject(index)?.let { entry ->
+                            entry.optJSONObject("track")?.toTrackInfo()?.let { Played(it, entry.optLong("at_ms")) }
+                        }
+                    }
+                } ?: emptyList(),
+            )
+        }
+    }
+
+    /** Tracks like `trackId`. */
+    suspend fun similar(trackId: String): Result<List<TrackInfo>> {
+        val handle = SyncHolder.handle
+        if (handle == 0L) return Result.failure(IllegalStateException("нет подключения"))
+        return when (val reply = withContext(Dispatchers.IO) { parseReply(Native.similar(handle, trackId)) }) {
+            is NativeResult.Failed -> Result.failure(IllegalStateException(reply.message))
+            is NativeResult.Ok -> Result.success(reply.value.optJSONArray("tracks")?.toTrackList() ?: emptyList())
         }
     }
 

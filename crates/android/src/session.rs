@@ -52,6 +52,16 @@ pub enum Request {
     Shuffle { on: bool },
     /// The name the room shows for this phone.
     Name { name: String },
+    /// Moves a queued track, for the whole room.
+    Move { from: usize, to: usize },
+    /// Takes a track out of the room's queue.
+    Remove { index: usize },
+    /// The equaliser's bands, in decibels. This phone only.
+    Equalizer { gains: Vec<f32> },
+    /// An endless stream of tracks like this one, for the whole room.
+    Radio { track_id: String },
+    /// Forgets what this phone has played.
+    ClearHistory,
 }
 
 impl Request {
@@ -80,6 +90,14 @@ impl Request {
             Request::Repeat { mode } => Command::SetRepeat(mode),
             Request::Shuffle { on } => Command::SetShuffle(on),
             Request::Name { name } => Command::SetName(name),
+            Request::Move { from, to } => Command::MoveTrack { from, to },
+            Request::Remove { index } => Command::RemoveTrack(index),
+            Request::Equalizer { gains } => Command::SetEqualizer(gains),
+            Request::Radio { track_id } => Command::PlayStation {
+                id: format!("track:{track_id}"),
+                replace: true,
+            },
+            Request::ClearHistory => return None,
             Request::Download { .. } => return None,
         })
     }
@@ -185,6 +203,10 @@ impl Session {
     }
 
     pub fn send(&self, request: Request) {
+        if let Request::ClearHistory = request {
+            let _ = ymsync::history::clear(self.engine().cache().directory());
+            return;
+        }
         if let Request::Download { queue } = request {
             let snapshot = self.engine().snapshot();
             let tracks = if queue {
@@ -331,7 +353,24 @@ impl Session {
             .context("Яндекс не знает исполнителя этого трека")?;
         let (artist, tracks) = self.runtime.block_on(api.artist_page(&artist_id))?;
         let tracks: Vec<TrackRef> = tracks.iter().map(Track::to_track_ref).collect();
-        Ok(serde_json::json!({ "artist": artist, "tracks": tracks }))
+        // A page without its albums row is still the page.
+        let albums = self.runtime.block_on(api.artist_albums(&artist_id)).unwrap_or_default();
+        Ok(serde_json::json!({ "artist": artist, "tracks": tracks, "albums": albums }))
+    }
+
+    /// What this phone has played, newest first. Off the disk; no network.
+    pub fn history(&self) -> serde_json::Value {
+        serde_json::json!({ "played": ymsync::history::read(self.engine().cache().directory()) })
+    }
+
+    /// Tracks like `track_id`.
+    pub fn similar(&self, track_id: &str) -> Result<Vec<TrackRef>> {
+        if playlists::is_own_file(track_id) {
+            bail!("это свой файл — похожие Яндекс подбирает только для своих треков");
+        }
+        let api = self.api()?;
+        let tracks = self.runtime.block_on(api.similar_tracks(track_id.trim()))?;
+        Ok(tracks.iter().map(Track::to_track_ref).collect())
     }
 
     /// A playlist's tracks, for its page. Nothing is queued.

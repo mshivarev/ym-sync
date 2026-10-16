@@ -52,6 +52,12 @@ object Native {
     /** The page of a track's artist: the artist and their tracks, most popular first. */
     external fun artistPage(handle: Long, trackId: String): String
 
+    /** What this phone has played, newest first. Off the disk. */
+    external fun history(handle: Long): String
+
+    /** Tracks like this one. */
+    external fun similar(handle: Long, trackId: String): String
+
     /** A track's words; `lyrics` is null when Yandex has none. */
     external fun lyrics(handle: Long, trackId: String): String
 

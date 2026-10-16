@@ -297,6 +297,8 @@ private fun App(settings: Settings) {
     var openPlaylist by remember { mutableStateOf<PlaylistInfo?>(null) }
     // The artist of a track, opened from the player.
     var openArtist by remember { mutableStateOf<TrackInfo?>(null) }
+    // Tracks like one, opened from the player.
+    var openSimilar by remember { mutableStateOf<TrackInfo?>(null) }
     // The lyrics, over everything like the full player.
     var lyricsOpen by rememberSaveable { mutableStateOf(false) }
     // Yandex's sign-in page, over everything.
@@ -401,7 +403,8 @@ private fun App(settings: Settings) {
     // An open album sits on top of the home page; back returns to it.
     BackHandler(enabled = openAlbum != null && !playerOpen) { openAlbum = null }
     BackHandler(enabled = openPlaylist != null && openAlbum == null && !playerOpen) { openPlaylist = null }
-    BackHandler(enabled = openArtist != null && !playerOpen) { openArtist = null }
+    BackHandler(enabled = openArtist != null && openAlbum == null && !playerOpen) { openArtist = null }
+    BackHandler(enabled = openSimilar != null && openAlbum == null && !playerOpen) { openSimilar = null }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -417,6 +420,7 @@ private fun App(settings: Settings) {
                         openAlbum = null
                         openPlaylist = null
                         openArtist = null
+                        openSimilar = null
                     }
                 }
             },
@@ -429,10 +433,14 @@ private fun App(settings: Settings) {
                 val album = openAlbum
                 val playlist = openPlaylist
                 val artistOf = openArtist
-                if (artistOf != null) {
-                    ArtistScreen(artistOf, room, onBack = { openArtist = null })
-                } else if (album != null) {
+                val similarTo = openSimilar
+                // An album opened from an artist's page sits on top of it.
+                if (album != null) {
                     AlbumScreen(album, room, onBack = { openAlbum = null })
+                } else if (similarTo != null) {
+                    SimilarScreen(similarTo, room, onBack = { openSimilar = null })
+                } else if (artistOf != null) {
+                    ArtistScreen(artistOf, room, onBack = { openArtist = null }, onOpenAlbum = { openAlbum = it })
                 } else if (playlist != null) {
                     PlaylistScreen(playlist, room, onBack = { openPlaylist = null })
                 } else when (screen) {
@@ -501,6 +509,10 @@ private fun App(settings: Settings) {
                 onArtist = { track ->
                     playerOpen = false
                     openArtist = track
+                },
+                onSimilar = { track ->
+                    playerOpen = false
+                    openSimilar = track
                 },
             )
         }
@@ -1063,8 +1075,9 @@ private fun PlaylistScreen(playlist: PlaylistInfo, room: Room, onBack: () -> Uni
 /// An artist's page: the portrait, how many listen, and their tracks most
 /// popular first. Opened by pressing the artist in the player.
 @Composable
-private fun ArtistScreen(track: TrackInfo, room: Room, onBack: () -> Unit) {
+private fun ArtistScreen(track: TrackInfo, room: Room, onBack: () -> Unit, onOpenAlbum: (AlbumInfo) -> Unit) {
     var artist by remember(track.trackId) { mutableStateOf<ArtistInfo?>(null) }
+    var albums by remember(track.trackId) { mutableStateOf<List<AlbumInfo>>(emptyList()) }
     TrackListPage(
         key = "artist:${track.trackId}",
         eyebrow = "ИСПОЛНИТЕЛЬ",
@@ -1079,13 +1092,57 @@ private fun ArtistScreen(track: TrackInfo, room: Room, onBack: () -> Unit) {
         room = room,
         onBack = onBack,
         load = {
-            Commands.artistPage(track.trackId).map { (found, tracks) ->
+            Commands.artistPage(track.trackId).map { (found, tracks, foundAlbums) ->
                 artist = found
+                albums = foundAlbums
                 tracks
             }
         },
         onLoaded = {},
         round = true,
+        header = {
+            if (albums.isNotEmpty()) {
+                item {
+                    Column {
+                        Box(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) { SectionTitle("Альбомы") }
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp),
+                        ) {
+                            items(albums, key = { it.id }) { album -> AlbumCard(album) { onOpenAlbum(album) } }
+                        }
+                        Box(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) { SectionTitle("Популярные треки") }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// Tracks like the one playing, with an endless radio of them.
+@Composable
+private fun SimilarScreen(track: TrackInfo, room: Room, onBack: () -> Unit) {
+    var count by remember(track.trackId) { mutableStateOf<Int?>(null) }
+    TrackListPage(
+        key = "similar:${track.trackId}",
+        eyebrow = "ПОХОЖИЕ",
+        title = track.title,
+        facts = listOfNotNull(track.artist, count?.let { tracksWord(it) }).joinToString(" · "),
+        coverUrl = track.coverUrl(400),
+        room = room,
+        onBack = onBack,
+        load = { Commands.similar(track.trackId) },
+        onLoaded = { count = it.size },
+        extraActions = {
+            GhostButton("Радио", AppIcons.Wave) {
+                room.inRoom {
+                    room.scope.launch {
+                        val problem = Commands.send("radio") { put("track_id", track.trackId) }
+                        SyncHolder.say(problem ?: "радио по треку «${track.title}» включено")
+                    }
+                }
+            }
+        },
     )
 }
 
@@ -1110,6 +1167,10 @@ private fun TrackListPage(
     onRemove: (suspend (TrackInfo) -> Boolean)? = null,
     /// A round picture: an artist's portrait rather than a cover.
     round: Boolean = false,
+    /// More buttons beside play and queue.
+    extraActions: (@Composable () -> Unit)? = null,
+    /// Rows between the head and the tracks.
+    header: (LazyListScope.() -> Unit)? = null,
 ) {
     var tracks by remember(key) { mutableStateOf<List<TrackInfo>?>(null) }
     var problem by remember(key) { mutableStateOf<String?>(null) }
@@ -1187,8 +1248,11 @@ private fun TrackListPage(
                 onDelete?.let { delete ->
                     IconButton(onClick = delete) { Icon(AppIcons.Close, "удалить плейлист", tint = Bad) }
                 }
+                extraActions?.invoke()
             }
         }
+
+        header?.invoke(this)
 
         when {
             problem != null -> item { Empty(problem ?: "") }
@@ -1328,13 +1392,16 @@ private fun QueueScreen(room: Room) {
 
         items(queue.size, key = { "q${queue[it].trackId}$it" }) { index ->
             Box(Modifier.padding(horizontal = 8.dp)) {
+                val current = index == (snapshot?.index ?: -1)
                 TrackRow(
                     track = queue[index],
                     room = room,
-                    current = index == (snapshot?.index ?: -1),
+                    current = current,
                     // Already in the queue: no button to add it again.
                     queueable = false,
+                    showAdder = true,
                     onClick = { room.scope.launch { Commands.send("index") { put("index", index) } } },
+                    extra = { QueueRowMenu(room, index, queue.size, current) },
                 )
             }
         }
@@ -1362,6 +1429,7 @@ private enum class LibraryTab(val label: String, val title: String) {
     LIKES("мне нравится", "Мне нравится"),
     ALBUMS("по альбомам", "По альбомам"),
     PLAYLISTS("плейлисты", "Плейлисты"),
+    HISTORY("история", "История"),
 }
 
 @Composable
@@ -1381,6 +1449,12 @@ private fun LibraryScreen(
     var playlists by remember { mutableStateOf<List<PlaylistInfo>?>(null) }
     var playlistsProblem by remember { mutableStateOf<String?>(null) }
     var playlistsAsked by remember { mutableStateOf(0) }
+    var played by remember { mutableStateOf<List<Played>>(emptyList()) }
+    LaunchedEffect(tab, room.running, room.snapshot?.historyRevision) {
+        if (tab == LibraryTab.HISTORY && room.running) {
+            Commands.history().onSuccess { played = it }
+        }
+    }
     LaunchedEffect(tab, room.running, playlistsAsked) {
         if (tab == LibraryTab.PLAYLISTS && room.running && playlists == null) {
             Commands.myPlaylists()
@@ -1392,6 +1466,7 @@ private fun LibraryScreen(
     val shown: List<TrackInfo> = when (tab) {
         LibraryTab.LIKES -> likedTracks
         LibraryTab.PLAYLISTS -> emptyList()
+        LibraryTab.HISTORY -> played.map { it.track }
         else -> downloaded.map { it.track }
     }
 
@@ -1415,6 +1490,7 @@ private fun LibraryScreen(
                                 LibraryTab.ALL -> OfflineGradient
                                 LibraryTab.LIKES -> LikesGradient
                                 LibraryTab.ALBUMS, LibraryTab.PLAYLISTS -> AlbumsGradient
+                                LibraryTab.HISTORY -> OfflineGradient
                             },
                         ),
                     contentAlignment = Alignment.Center,
@@ -1425,6 +1501,7 @@ private fun LibraryScreen(
                             LibraryTab.LIKES -> AppIcons.Heart
                             LibraryTab.ALBUMS -> AppIcons.Library
                             LibraryTab.PLAYLISTS -> AppIcons.Queue
+                            LibraryTab.HISTORY -> AppIcons.History
                         },
                         null,
                         tint = Color.White,
@@ -1439,6 +1516,7 @@ private fun LibraryScreen(
                         when (tab) {
                             LibraryTab.LIKES -> tracksWord(likedTracks.size)
                             LibraryTab.PLAYLISTS -> playlists?.let { "${it.size} шт." } ?: ""
+                            LibraryTab.HISTORY -> tracksWord(played.size)
                             else -> "${tracksWord(downloaded.size)} · ${librarySize(library)}"
                         },
                         color = Dim,
@@ -1474,7 +1552,17 @@ private fun LibraryScreen(
                             }
                         }
                     }
-                    ImportButton(room, onChanged)
+                    if (tab == LibraryTab.HISTORY) {
+                        IconButton(onClick = {
+                            room.scope.launch {
+                                Commands.send("clear_history")?.let { SyncHolder.say(it) } ?: run { played = emptyList() }
+                            }
+                        }, enabled = room.canDrive && played.isNotEmpty()) {
+                            Icon(AppIcons.Close, "очистить историю", tint = Color.White)
+                        }
+                    } else {
+                        ImportButton(room, onChanged)
+                    }
                 } else {
                     IconButton(onClick = { playlists = null; playlistsAsked++ }, enabled = room.canDrive) {
                         Icon(AppIcons.Refresh, "перечитать с Яндекса", tint = Color.White)
@@ -1541,6 +1629,19 @@ private fun LibraryScreen(
 
             LibraryTab.ALBUMS -> albums(downloaded, room, onChanged)
 
+            LibraryTab.HISTORY -> {
+                if (played.isEmpty()) item { Empty("Здесь появится всё, что играло") }
+                val tracks = played.map { it.track }
+                itemsIndexed(played, key = { index, entry -> "h${entry.track.trackId}$index" }) { index, entry ->
+                    TrackRow(
+                        track = entry.track,
+                        room = room,
+                        trailing = whenPlayed(entry.atMs),
+                        onClick = { room.playFrom(tracks, index) },
+                    )
+                }
+            }
+
             LibraryTab.PLAYLISTS -> {
                 val found = playlists
                 when {
@@ -1583,6 +1684,19 @@ private fun PlaylistCard(playlist: PlaylistInfo, modifier: Modifier, onClick: ()
             color = Dim,
             fontSize = 12.sp,
         )
+    }
+}
+
+/// «14:05» today, «вчера», or the date.
+private fun whenPlayed(ms: Long): String {
+    val zone = java.time.ZoneId.systemDefault()
+    val then = java.time.Instant.ofEpochMilli(ms).atZone(zone)
+    val days = java.time.temporal.ChronoUnit.DAYS.between(then.toLocalDate(), java.time.LocalDate.now(zone))
+    val ru = java.util.Locale.forLanguageTag("ru")
+    return when (days) {
+        0L -> then.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+        1L -> "вчера"
+        else -> then.format(java.time.format.DateTimeFormatter.ofPattern("d MMM", ru))
     }
 }
 
@@ -2108,6 +2222,10 @@ private fun SettingsCard(settings: Settings, running: Boolean, onLogin: () -> Un
 
         HorizontalDivider(color = Surface3)
 
+        EqualizerSettings(settings, running)
+
+        HorizontalDivider(color = Surface3)
+
         Text(
             if (settings.yandexToken.isBlank()) "Вход в Яндекс не выполнен" else "Вход в Яндекс выполнен",
             color = if (settings.yandexToken.isBlank()) Dim else Good,
@@ -2142,6 +2260,58 @@ private fun SettingsCard(settings: Settings, running: Boolean, onLogin: () -> Un
             "Эти два применятся при следующем подключении: ядро читает настройки при " +
                 "старте. Файлы лежат в ${settings.cacheDir} и удаляются вместе с приложением.",
         )
+    }
+}
+
+/// The equaliser's five bands, with a few presets. This phone only; heard at
+/// once while a room plays.
+@Composable
+private fun EqualizerSettings(settings: Settings, running: Boolean) {
+    val scope = rememberCoroutineScope()
+    var gains by remember { mutableStateOf(settings.equalizer) }
+    val labels = listOf("60 Гц", "230 Гц", "910 Гц", "3,6 кГц", "14 кГц")
+    val presets = listOf(
+        "Ровно" to listOf(0f, 0f, 0f, 0f, 0f),
+        "Бас" to listOf(6f, 4f, 0f, -1f, -1f),
+        "Голос" to listOf(-2f, 0f, 3f, 3f, 0f),
+        "Высокие" to listOf(-1f, -1f, 0f, 3f, 5f),
+    )
+    fun apply(next: List<Float>) {
+        gains = next
+        settings.equalizer = next
+        if (running) {
+            scope.launch {
+                Commands.send("equalizer") { put("gains", org.json.JSONArray().apply { next.forEach { put(it.toDouble()) } }) }
+            }
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Эквалайзер", fontWeight = FontWeight.Bold)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            for ((name, preset) in presets) Chip(name, selected = gains == preset) { apply(preset) }
+        }
+        labels.forEachIndexed { index, label ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(label, color = Dim, fontSize = 12.sp, modifier = Modifier.width(56.dp))
+                Slider(
+                    value = gains[index],
+                    onValueChange = { value ->
+                        apply(gains.toMutableList().also { it[index] = kotlin.math.round(value) })
+                    },
+                    valueRange = -12f..12f,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "${if (gains[index] > 0) "+" else ""}${gains[index].toInt()} дБ",
+                    fontSize = 12.sp,
+                    modifier = Modifier.width(48.dp),
+                    textAlign = TextAlign.End,
+                )
+            }
+        }
     }
 }
 
@@ -2244,6 +2414,7 @@ private fun FullPlayer(
     onQueue: () -> Unit,
     onLyrics: () -> Unit,
     onArtist: (TrackInfo) -> Unit,
+    onSimilar: (TrackInfo) -> Unit,
 ) {
     var choosing by remember { mutableStateOf(false) }
     room.snapshot?.track?.let { playing ->
@@ -2454,6 +2625,9 @@ private fun FullPlayer(
                     tint = if (track != null && track.trackId in snapshot.cached) Good else Color.White.copy(alpha = 0.8f),
                 )
             }
+            IconButton(onClick = { track?.let(onSimilar) }, enabled = track != null && !track.isOwn) {
+                Icon(AppIcons.Similar, "похожие", tint = Color.White.copy(alpha = 0.8f))
+            }
             IconButton(onClick = onLyrics, enabled = track != null) {
                 Icon(AppIcons.Lyrics, "текст песни", tint = Color.White.copy(alpha = 0.8f))
             }
@@ -2501,6 +2675,37 @@ private fun Color.compositeOn(background: Color): Color {
         green = green * a + background.green * (1 - a),
         blue = blue * a + background.blue * (1 - a),
     )
+}
+
+// ---------------------------------------------------------------- queue
+
+/// Up, down and out, for one row of the room's queue. A phone has no mouse to
+/// drag with, so the row's menu does the moving.
+@Composable
+private fun QueueRowMenu(room: Room, index: Int, size: Int, current: Boolean) {
+    var open by remember { mutableStateOf(false) }
+    fun send(action: String, build: org.json.JSONObject.() -> Unit) {
+        open = false
+        room.scope.launch { Commands.send(action, build)?.let { SyncHolder.say(it) } }
+    }
+    Box {
+        IconButton(onClick = { open = true }) { Icon(AppIcons.More, "ещё", tint = Dim, modifier = Modifier.size(22.dp)) }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = Surface2) {
+            if (index > 0) {
+                DropdownMenuItem(text = { Text("Выше") }, onClick = { send("move") { put("from", index); put("to", index - 1) } })
+            }
+            if (index < size - 1) {
+                DropdownMenuItem(text = { Text("Ниже") }, onClick = { send("move") { put("from", index); put("to", index + 1) } })
+            }
+            if (!current) {
+                DropdownMenuItem(
+                    text = { Text("Убрать из очереди") },
+                    leadingIcon = { Icon(AppIcons.Close, null, tint = Color.White) },
+                    onClick = { send("remove") { put("index", index) } },
+                )
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- playlists
@@ -2741,6 +2946,8 @@ private fun TrackRow(
     trailing: String? = null,
     /// Offers «в очередь». Off on the queue's own rows, which are queued already.
     queueable: Boolean = true,
+    /// Says who queued it — on the room's queue.
+    showAdder: Boolean = false,
     extra: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
 ) {
@@ -2786,7 +2993,7 @@ private fun TrackRow(
                     Mark.NONE -> {}
                 }
                 Text(
-                    track.artist,
+                    if (showAdder && track.addedBy != null) "${track.artist} · поставил(а) ${track.addedBy}" else track.artist,
                     color = Dim,
                     fontSize = 13.sp,
                     maxLines = 1,

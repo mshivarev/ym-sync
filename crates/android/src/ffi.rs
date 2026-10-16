@@ -17,6 +17,8 @@
 //!     external fun lyrics(handle: Long, trackId: String): String
 //!     external fun playlistOp(handle: Long, requestJson: String): String
 //!     external fun artistPage(handle: Long, trackId: String): String
+//!     external fun history(handle: Long): String
+//!     external fun similar(handle: Long, trackId: String): String
 //!     external fun queueTracks(handle: Long, tracksJson: String, replace: Boolean, start: Int): String
 //!     external fun queueFrom(handle: Long, kind: String, value: String, replace: Boolean): String
 //!     external fun importTrack(handle: Long, name: String, data: ByteArray): String
@@ -264,6 +266,41 @@ pub extern "system" fn Java_dev_mshiv_ymsync_Native_playlistOp(
             None => failed("сессия не запущена"),
             Some(session) => match session.playlist_op(&json) {
                 Ok(value) => ok(value),
+                Err(err) => failed(err),
+            },
+        },
+    };
+    reply(&mut env, &text)
+}
+
+/// What this phone has played.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_history(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let text = match unsafe { borrow(handle) } {
+        None => failed("сессия не запущена"),
+        Some(session) => ok(session.history()),
+    };
+    reply(&mut env, &text)
+}
+
+/// Tracks like a track.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mshiv_ymsync_Native_similar(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    track_id: JString,
+) -> jstring {
+    let text = match read(&mut env, &track_id) {
+        Err(err) => failed(err),
+        Ok(id) => match unsafe { borrow(handle) } {
+            None => failed("сессия не запущена"),
+            Some(session) => match session.similar(&id) {
+                Ok(tracks) => ok(serde_json::json!({ "tracks": tracks })),
                 Err(err) => failed(err),
             },
         },
