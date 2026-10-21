@@ -24,8 +24,8 @@ android {
         applicationId = "dev.mshiv.ymsync"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.3.1"
+        versionCode = 6
+        versionName = "0.4.0"
 
         // Only the ABIs the Rust core is built for. Without this the APK would
         // claim x86 support and then fail at System.loadLibrary.

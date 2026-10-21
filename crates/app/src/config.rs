@@ -8,6 +8,9 @@ use ymsync_proto::SyncParams;
 
 pub const DEFAULT_RELAY: &str = "ws://127.0.0.1:8787";
 
+/// The current meaning of [`Config::volume`]: a slider whose cube is the gain.
+pub const VOLUME_CURVE: &str = "cubic";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -21,8 +24,14 @@ pub struct Config {
     pub room_token: String,
     /// Yandex OAuth token for *this machine's* account. See the README.
     pub yandex_token: String,
-    /// 0.0 to 1.0 (values above 1.0 amplify and may clip).
+    /// The volume slider's position, 0.0 to 1.0. The gain is its cube; see
+    /// `player::loudness`.
     pub volume: f32,
+    /// How `volume` is to be read. Empty is the old linear meaning, which
+    /// [`Config::upgrade_volume`] converts once. Its own default, not the
+    /// struct's: a file from before this field must read as empty.
+    #[serde(default)]
+    pub volume_curve: String,
     /// What the rest of the room calls this listener. Empty means the device's
     /// own name — see [`Config::display_name`].
     pub name: String,
@@ -42,7 +51,9 @@ impl Default for Config {
             room: "home".to_string(),
             room_token: String::new(),
             yandex_token: String::new(),
-            volume: 0.8,
+            // About the loudness 0.8 used to mean, before the slider was cubed.
+            volume: 0.93,
+            volume_curve: VOLUME_CURVE.to_string(),
             name: String::new(),
             equalizer: Vec::new(),
             sync: SyncConfig::default(),
@@ -237,7 +248,11 @@ impl Config {
         let mut config = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+            let mut parsed: Config =
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            // Written back with the next save, which every connect makes.
+            parsed.upgrade_volume();
+            parsed
         } else {
             Self::default()
         };
@@ -311,6 +326,17 @@ impl Config {
             .unwrap_or_else(|| "без имени".to_string())
     }
 
+    /// Converts a volume saved as a plain gain into a slider position, so an
+    /// update does not suddenly play quieter. Answers whether anything changed.
+    pub fn upgrade_volume(&mut self) -> bool {
+        if self.volume_curve == VOLUME_CURVE {
+            return false;
+        }
+        self.volume = self.volume.clamp(0.0, 1.0).cbrt();
+        self.volume_curve = VOLUME_CURVE.to_string();
+        true
+    }
+
     pub fn require_yandex_token(&self) -> Result<&str> {
         if self.yandex_token.trim().is_empty() {
             bail!(
@@ -336,6 +362,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_saved_as_a_gain_becomes_a_slider_once() {
+        let mut old: Config = toml::from_str("volume = 0.512
+").unwrap();
+        assert_eq!(old.volume_curve, "", "an old file has no curve");
+        assert!(old.upgrade_volume());
+        assert!((old.volume - 0.8).abs() < 1e-4, "{}", old.volume);
+        assert!(!old.upgrade_volume(), "only once");
+        assert!((old.volume - 0.8).abs() < 1e-4);
+
+        let fresh = Config::default();
+        let reread: Config = toml::from_str(&toml::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(reread.volume_curve, VOLUME_CURVE);
+        assert_eq!(reread.volume, fresh.volume, "a saved new config is not converted again");
+    }
 
     #[test]
     fn defaults_survive_a_toml_roundtrip() {

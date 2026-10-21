@@ -465,9 +465,23 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_YANDEX_TOKEN, "")!!
         set(value) = prefs.edit().putString(KEY_YANDEX_TOKEN, value).apply()
 
+    /**
+     * The volume slider's position; the core cubes it for the gain. A value
+     * saved when it was the gain itself is converted once, so the update does
+     * not play quieter.
+     */
     var volume: Float
-        get() = prefs.getFloat(KEY_VOLUME, 0.8f)
-        set(value) = prefs.edit().putFloat(KEY_VOLUME, value).apply()
+        get() {
+            if (!prefs.getBoolean(KEY_VOLUME_CUBIC, false)) {
+                val old = prefs.getFloat(KEY_VOLUME, 0.8f).coerceIn(0f, 1f)
+                prefs.edit()
+                    .putFloat(KEY_VOLUME, Math.cbrt(old.toDouble()).toFloat())
+                    .putBoolean(KEY_VOLUME_CUBIC, true)
+                    .apply()
+            }
+            return prefs.getFloat(KEY_VOLUME, 0.93f)
+        }
+        set(value) = prefs.edit().putFloat(KEY_VOLUME, value).putBoolean(KEY_VOLUME_CUBIC, true).apply()
 
     /** Keep every track that plays, not only the ones downloaded on purpose. */
     var autoCache: Boolean
@@ -535,6 +549,7 @@ class Settings(context: Context) {
             .put("room_token", password)
             .put("yandex_token", yandexToken)
             .put("volume", volume.toDouble())
+            .put("volume_curve", "cubic")
             .put("name", displayName)
             .put("equalizer", JSONArray().apply { equalizer.forEach { put(it.toDouble()) } })
             .put(
@@ -562,6 +577,7 @@ class Settings(context: Context) {
         const val KEY_ROOM_TOKEN = "room_token"
         const val KEY_YANDEX_TOKEN = "yandex_token"
         const val KEY_VOLUME = "volume"
+        const val KEY_VOLUME_CUBIC = "volume_cubic"
         const val KEY_AUTO_CACHE = "auto_cache"
         const val KEY_CACHE_LIMIT = "cache_limit_gb"
         const val KEY_NAME = "name"

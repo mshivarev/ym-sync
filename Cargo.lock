@@ -5942,7 +5942,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "ymsync"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5973,7 +5973,7 @@ dependencies = [
 
 [[package]]
 name = "ymsync-android"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5988,7 +5988,7 @@ dependencies = [
 
 [[package]]
 name = "ymsync-gui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rfd",
@@ -6007,7 +6007,7 @@ dependencies = [
 
 [[package]]
 name = "ymsync-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6015,7 +6015,7 @@ dependencies = [
 
 [[package]]
 name = "ymsync-relay"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
