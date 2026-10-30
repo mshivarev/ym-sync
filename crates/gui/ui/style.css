@@ -1572,8 +1572,21 @@ body:not(.playing) .eq span {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 140px;
+  width: 176px;
   color: var(--dim);
+}
+
+.volume input {
+  flex: 1;
+  min-width: 0;
+}
+
+.volume-level {
+  flex: none;
+  width: 4ch;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .drift {
@@ -1991,7 +2004,7 @@ body:not(.playing) .eq span {
   }
 
   .volume {
-    width: 90px;
+    width: 126px;
   }
 
   .now-cover {

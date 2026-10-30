@@ -466,9 +466,10 @@ class Settings(context: Context) {
         set(value) = prefs.edit().putString(KEY_YANDEX_TOKEN, value).apply()
 
     /**
-     * The volume slider's position; the core cubes it for the gain. A value
-     * saved when it was the gain itself is converted once, so the update does
-     * not play quieter.
+     * The volume slider's position on the 0.4.0 cubic curve, sent as
+     * `volume_curve = "cubic"`; the core converts it to its current curve. A
+     * value saved when it was the gain itself is converted once, so the update
+     * does not play quieter.
      */
     var volume: Float
         get() {

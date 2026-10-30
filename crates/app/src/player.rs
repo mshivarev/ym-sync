@@ -19,7 +19,7 @@ use rodio::decoder::DecoderBuilder;
 use rodio::{OutputStreamBuilder, Sink, Source};
 use ymsync_proto::TrackRef;
 
-use crate::playback::{AudioSource, Playback};
+use crate::playback::{AudioSource, Playback, loudness, slider_for};
 use crate::stream::Progressive;
 
 /// How long a seek into a part still downloading may wait for it.
@@ -267,19 +267,8 @@ impl Playback for Player {
 
     /// The slider's position, not the gain: the inverse of [`loudness`].
     fn volume(&self) -> f32 {
-        self.sink.volume().cbrt()
+        slider_for(self.sink.volume())
     }
-}
-
-/// The gain for a volume slider at `slider` (0.0 to 1.0).
-///
-/// Cubed, because hearing is logarithmic: with the slider taken as the gain
-/// itself, half-way sounded barely quieter than full and every quiet setting
-/// was crammed into the bottom few percent. Cubed, half-way is about −18 dB,
-/// a fifth is −42 dB and the bottom of the slider fades out properly.
-pub fn loudness(slider: f32) -> f32 {
-    let slider = if slider.is_finite() { slider.clamp(0.0, 1.0) } else { 0.0 };
-    slider * slider * slider
 }
 
 fn build_decoder<R>(data: R, byte_len: Option<u64>) -> Result<rodio::Decoder<R>>
@@ -313,17 +302,6 @@ mod tests {
 
     /// A decoder must be buildable over a download that has only begun: that is
     /// what lets a track start before it is all here.
-    #[test]
-    fn the_volume_slider_follows_hearing() {
-        assert_eq!(loudness(0.0), 0.0);
-        assert_eq!(loudness(1.0), 1.0);
-        let db = |slider: f32| 20.0 * loudness(slider).log10();
-        assert!((db(0.5) + 18.06).abs() < 0.1, "{}", db(0.5));
-        assert!(db(0.05) < -75.0, "{}", db(0.05));
-        assert_eq!(loudness(7.0), 1.0, "no amplifying past full");
-        assert!((loudness(0.8).cbrt() - 0.8).abs() < 1e-6);
-    }
-
     #[test]
     fn a_decoder_opens_on_a_partial_download() {
         let frame = [&[0xFF, 0xFB, 0x10, 0xC4][..], &[0u8; 100][..]].concat();

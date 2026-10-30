@@ -121,7 +121,10 @@ pub struct Session {
 
 impl Session {
     pub fn start(config_json: &str) -> Result<Self> {
-        let cfg: Config = serde_json::from_str(config_json).context("разбор настроек")?;
+        let mut cfg: Config = serde_json::from_str(config_json).context("разбор настроек")?;
+        // Kotlin keeps the slider as it was saved and names its curve; the
+        // conversion to the current one lives here, beside the desktop's.
+        cfg.upgrade_volume();
 
         // `rustls` has no default provider in this build, and the WebSocket
         // client picks one from the process, so this has to happen first.

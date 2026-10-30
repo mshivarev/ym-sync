@@ -8,8 +8,9 @@ use ymsync_proto::SyncParams;
 
 pub const DEFAULT_RELAY: &str = "ws://127.0.0.1:8787";
 
-/// The current meaning of [`Config::volume`]: a slider whose cube is the gain.
-pub const VOLUME_CURVE: &str = "cubic";
+/// The current meaning of [`Config::volume`]: a slider stepping evenly in
+/// decibels over 40 dB; see `playback::loudness`.
+pub const VOLUME_CURVE: &str = "db40";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -24,12 +25,13 @@ pub struct Config {
     pub room_token: String,
     /// Yandex OAuth token for *this machine's* account. See the README.
     pub yandex_token: String,
-    /// The volume slider's position, 0.0 to 1.0. The gain is its cube; see
-    /// `player::loudness`.
+    /// The volume slider's position, 0.0 to 1.0; the gain is
+    /// `playback::loudness` of it.
     pub volume: f32,
-    /// How `volume` is to be read. Empty is the old linear meaning, which
-    /// [`Config::upgrade_volume`] converts once. Its own default, not the
-    /// struct's: a file from before this field must read as empty.
+    /// How `volume` is to be read. Empty is the old linear meaning and `cubic`
+    /// the 0.4.0 one; [`Config::upgrade_volume`] converts both once. Its own
+    /// default, not the struct's: a file from before this field must read as
+    /// empty.
     #[serde(default)]
     pub volume_curve: String,
     /// What the rest of the room calls this listener. Empty means the device's
@@ -51,8 +53,8 @@ impl Default for Config {
             room: "home".to_string(),
             room_token: String::new(),
             yandex_token: String::new(),
-            // About the loudness 0.8 used to mean, before the slider was cubed.
-            volume: 0.93,
+            // About the loudness 0.8 meant when the slider was the gain itself.
+            volume: 0.95,
             volume_curve: VOLUME_CURVE.to_string(),
             name: String::new(),
             equalizer: Vec::new(),
@@ -326,13 +328,17 @@ impl Config {
             .unwrap_or_else(|| "без имени".to_string())
     }
 
-    /// Converts a volume saved as a plain gain into a slider position, so an
-    /// update does not suddenly play quieter. Answers whether anything changed.
+    /// Converts a volume saved under an older curve into a slider position
+    /// giving the same gain, so an update does not suddenly play louder or
+    /// quieter. Answers whether anything changed.
     pub fn upgrade_volume(&mut self) -> bool {
-        if self.volume_curve == VOLUME_CURVE {
-            return false;
-        }
-        self.volume = self.volume.clamp(0.0, 1.0).cbrt();
+        let old = self.volume.clamp(0.0, 1.0);
+        let gain = match self.volume_curve.as_str() {
+            VOLUME_CURVE => return false,
+            "cubic" => old * old * old,
+            _ => old,
+        };
+        self.volume = crate::playback::slider_for(gain);
         self.volume_curve = VOLUME_CURVE.to_string();
         true
     }
@@ -369,9 +375,17 @@ mod tests {
 ").unwrap();
         assert_eq!(old.volume_curve, "", "an old file has no curve");
         assert!(old.upgrade_volume());
-        assert!((old.volume - 0.8).abs() < 1e-4, "{}", old.volume);
+        let gain = crate::playback::loudness(old.volume);
+        assert!((gain - 0.512).abs() < 1e-4, "{gain}");
+        let slider = old.volume;
         assert!(!old.upgrade_volume(), "only once");
-        assert!((old.volume - 0.8).abs() < 1e-4);
+        assert_eq!(old.volume, slider);
+
+        let mut cubic: Config = toml::from_str("volume = 0.3\nvolume_curve = \"cubic\"\n").unwrap();
+        assert!(cubic.upgrade_volume());
+        let gain = crate::playback::loudness(cubic.volume);
+        assert!((gain - 0.027).abs() < 1e-4, "the 0.4.0 slider keeps its loudness: {gain}");
+        assert!(cubic.volume < 0.3, "and sits lower on the new one: {}", cubic.volume);
 
         let fresh = Config::default();
         let reread: Config = toml::from_str(&toml::to_string(&fresh).unwrap()).unwrap();

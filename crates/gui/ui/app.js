@@ -81,6 +81,7 @@ const ui = {
   position: el("position"),
   duration: el("duration"),
   volume: el("volume"),
+  volumeLevel: el("volume-level"),
   drift: el("drift"),
   toast: el("toast"),
   albumEyebrow: el("album-eyebrow"),
@@ -2412,14 +2413,20 @@ ui.seek.addEventListener("change", async () => {
   dragging = false;
 });
 
-ui.volume.addEventListener("input", () => {
+function paintVolume() {
   paintRange(ui.volume);
-  // The slider fires continuously; only the settled value is worth sending.
-  clearTimeout(volumeTimer);
-  volumeTimer = setTimeout(
-    () => call("control", { action: "volume", value: ui.volume.value / 100 }),
-    120,
-  );
+  ui.volumeLevel.textContent = `${ui.volume.value}%`;
+}
+
+ui.volume.addEventListener("input", () => {
+  paintVolume();
+  // Heard while dragging, not only on letting go: at most every 40 ms, and the
+  // timer reads the slider when it fires, so the last position always lands.
+  if (volumeTimer) return;
+  volumeTimer = setTimeout(() => {
+    volumeTimer = null;
+    call("control", { action: "volume", value: ui.volume.value / 100 });
+  }, 40);
 });
 
 // `listen` is a core-plugin command and therefore permission-gated: report a
@@ -2475,13 +2482,13 @@ ui.update.addEventListener("click", async () => {
   setConnected(false);
   // The home page works without a room now — pressing anything there raises one.
   showView("home");
-  paintRange(ui.volume);
+  paintVolume();
 
   const settings = await call("settings");
   if (!settings) return;
 
   ui.volume.value = Math.round(settings.volume * 100);
-  paintRange(ui.volume);
+  paintVolume();
   // The file supplies the defaults; both buttons then act on what is on screen,
   // and whatever connects is written back.
   ui.room.value = settings.room;
