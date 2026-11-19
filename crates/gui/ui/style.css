@@ -1909,16 +1909,26 @@ body:not(.playing) .eq span {
   color: var(--faint);
 }
 
-#queue li[draggable="true"] {
+#queue li .entry {
   cursor: grab;
 }
 
-#queue li.dragging {
-  opacity: 0.4;
+#queue.reordering li {
+  transition: transform 0.15s ease, background 0.12s;
 }
 
-#queue li.drop-target {
-  box-shadow: inset 0 2px 0 var(--accent);
+#queue.reordering li.dragging {
+  position: relative;
+  z-index: 5;
+  transition: none;
+  background: var(--surface-3);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 50%);
+}
+
+body.queue-dragging,
+body.queue-dragging * {
+  cursor: grabbing !important;
+  user-select: none;
 }
 
 .chip-btn.small {

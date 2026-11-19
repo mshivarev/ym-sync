@@ -32,6 +32,7 @@ const ui = {
   find: el("find"),
   results: el("results"),
   queue: el("queue"),
+  main: document.querySelector(".main"),
   queueCount: el("queue-count"),
   navQueue: el("nav-queue"),
   dlTrack: el("dl-track"),
@@ -254,8 +255,8 @@ let played = [];
 let historyRevision = -1;
 /// The track whose «Похожие» page is open, for the radio button there.
 let similarTo = null;
-/// The queue row being dragged, by index.
-let dragFrom = null;
+/// The queue row being moved with the mouse, while it is.
+let queueDrag = null;
 let eqTimer = null;
 /// The words on the lyrics page: whose they are, and the timed lines if any.
 let lyricsFor = null;
@@ -1037,6 +1038,11 @@ function heartButton(track) {
 }
 
 function renderQueue(snapshot) {
+  // Not under a row being dragged; drawn once it is let go.
+  if (queueDrag?.active) {
+    queueKey = null;
+    return;
+  }
   const count = snapshot.queue.length;
   ui.queueCount.textContent = count ? `· ${tracksWord(count)}` : "";
   ui.navQueue.textContent = count ? String(count) : "";
@@ -1073,36 +1079,141 @@ function removeFromQueueButton(index) {
   return button;
 }
 
-/// Reordering by dragging: the row says where it came from, the row it lands on
-/// where it goes. The relay keeps the playing track playing either way.
+/// Reordering the queue with the mouse.
+///
+/// Pointer events rather than HTML drag and drop: in the Windows webview the
+/// window's own file drop swallows the HTML kind, so rows marked `draggable`
+/// never moved. Here the row follows the cursor, the others make room, and
+/// letting go asks the relay to move the track — the playing one keeps playing
+/// wherever it lands.
 function makeDraggable(item, index) {
-  item.draggable = true;
-  item.addEventListener("dragstart", (event) => {
-    dragFrom = index;
-    item.classList.add("dragging");
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", String(index));
-  });
-  item.addEventListener("dragend", () => {
-    dragFrom = null;
-    item.classList.remove("dragging");
-    for (const row of ui.queue.querySelectorAll(".drop-target")) row.classList.remove("drop-target");
-  });
-  item.addEventListener("dragover", (event) => {
-    if (dragFrom === null) return;
-    event.preventDefault();
-    item.classList.add("drop-target");
-  });
-  item.addEventListener("dragleave", () => item.classList.remove("drop-target"));
-  item.addEventListener("drop", (event) => {
-    event.preventDefault();
-    item.classList.remove("drop-target");
-    const from = dragFrom;
-    dragFrom = null;
-    if (from === null || from === index) return;
-    call("move_track", { from, to: index });
+  item.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || queueDrag) return;
+    // The heart and the cross are buttons of their own; the row itself is not.
+    const button = event.target.closest("button");
+    if (button && !button.classList.contains("entry")) return;
+    queueDrag = {
+      item,
+      from: index,
+      to: index,
+      pointer: event.pointerId,
+      startY: event.clientY,
+      clientY: event.clientY,
+      startScroll: ui.main.scrollTop,
+      active: false,
+      rows: [],
+      height: 0,
+      scrollTimer: null,
+    };
   });
 }
+
+/// Starts moving once the pointer has gone a few pixels: a plain click on a row
+/// still plays it.
+function beginQueueDrag(drag) {
+  drag.active = true;
+  drag.item.setPointerCapture?.(drag.pointer);
+  const rows = [...ui.queue.children];
+  // Positions are taken once, before anything moves, and corrected for
+  // scrolling afterwards: transformed rows would report where they are drawn.
+  drag.rows = rows.map((row) => {
+    const rect = row.getBoundingClientRect();
+    return { row, mid: rect.top + rect.height / 2 };
+  });
+  const rect = drag.item.getBoundingClientRect();
+  const next = rows[drag.from + 1] ?? rows[drag.from - 1];
+  drag.height = next ? Math.abs(next.getBoundingClientRect().top - rect.top) : rect.height;
+  ui.queue.classList.add("reordering");
+  drag.item.classList.add("dragging");
+  document.body.classList.add("queue-dragging");
+  drag.scrollTimer = setInterval(() => autoScrollQueue(drag), 16);
+}
+
+/// Where the dragged row would land, and the rows around it moved to show it.
+function layoutQueueDrag(drag) {
+  const scrolled = ui.main.scrollTop - drag.startScroll;
+  const y = drag.clientY + scrolled;
+  drag.item.style.transform = `translateY(${y - drag.startY}px)`;
+
+  let to = 0;
+  for (const { row, mid } of drag.rows) {
+    if (row !== drag.item && mid < y) to += 1;
+  }
+  drag.to = to;
+
+  drag.rows.forEach(({ row }, i) => {
+    if (row === drag.item) return;
+    let shift = 0;
+    if (drag.from < to && i > drag.from && i <= to) shift = -drag.height;
+    if (drag.from > to && i >= to && i < drag.from) shift = drag.height;
+    row.style.transform = shift ? `translateY(${shift}px)` : "";
+  });
+}
+
+/// Near the top or bottom edge, the list scrolls by itself, faster the closer
+/// the cursor is, so a long queue can be crossed in one drag.
+function autoScrollQueue(drag) {
+  const box = ui.main.getBoundingClientRect();
+  const edge = 56;
+  let step = 0;
+  if (drag.clientY < box.top + edge) step = -Math.ceil((box.top + edge - drag.clientY) / 4);
+  else if (drag.clientY > box.bottom - edge) step = Math.ceil((drag.clientY - (box.bottom - edge)) / 4);
+  if (!step) return;
+  const before = ui.main.scrollTop;
+  ui.main.scrollTop += step;
+  if (ui.main.scrollTop !== before) layoutQueueDrag(drag);
+}
+
+function endQueueDrag(commit) {
+  const drag = queueDrag;
+  queueDrag = null;
+  if (!drag?.active) return;
+  clearInterval(drag.scrollTimer);
+  drag.item.releasePointerCapture?.(drag.pointer);
+  ui.queue.classList.remove("reordering");
+  drag.item.classList.remove("dragging");
+  document.body.classList.remove("queue-dragging");
+  for (const { row } of drag.rows) row.style.transform = "";
+
+  // The click that ends a drag is not a request to play the row.
+  const swallow = (event) => {
+    event.stopPropagation();
+    event.preventDefault();
+  };
+  window.addEventListener("click", swallow, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 0);
+
+  if (commit && drag.to !== drag.from) {
+    // Shown at once; the room's answer redraws the list with fresh numbers.
+    const rows = [...ui.queue.children].filter((row) => row !== drag.item);
+    ui.queue.insertBefore(drag.item, rows[drag.to] ?? null);
+    call("move_track", { from: drag.from, to: drag.to });
+  }
+  // Anything that arrived meanwhile was held back; draw it now.
+  queueKey = null;
+  if (latest && !(commit && drag.to !== drag.from)) renderQueue(latest);
+}
+
+window.addEventListener("pointermove", (event) => {
+  const drag = queueDrag;
+  if (!drag || event.pointerId !== drag.pointer) return;
+  drag.clientY = event.clientY;
+  if (!drag.active) {
+    if (Math.abs(event.clientY - drag.startY) < 6) return;
+    beginQueueDrag(drag);
+  }
+  event.preventDefault();
+  layoutQueueDrag(drag);
+});
+window.addEventListener("pointerup", (event) => {
+  if (queueDrag && event.pointerId === queueDrag.pointer) endQueueDrag(true);
+});
+window.addEventListener("pointercancel", () => endQueueDrag(false));
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && queueDrag?.active) endQueueDrag(false);
+});
+// Covers are images, and the webview would start dragging them as files.
+ui.queue.addEventListener("dragstart", (event) => event.preventDefault());
 
 function renderResults() {
   ui.results.replaceChildren(
@@ -1561,6 +1672,7 @@ function render(snapshot) {
   // on rows that have not otherwise moved.
   const key = [
     snapshot.queue.length,
+    snapshot.queue_revision,
     snapshot.index,
     snapshot.queue[0]?.track_id ?? "",
     snapshot.cache_revision,
