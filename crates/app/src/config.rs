@@ -40,6 +40,9 @@ pub struct Config {
     /// The equaliser's five bands, in decibels from −12 to +12; see `eq`.
     /// Empty means flat.
     pub equalizer: Vec<f32>,
+    /// The sound card to play to, by its name in Windows. Empty follows
+    /// whatever Windows plays to.
+    pub output_device: String,
     pub sync: SyncConfig,
     pub cache: CacheConfig,
     pub share: ShareConfig,
@@ -58,6 +61,7 @@ impl Default for Config {
             volume_curve: VOLUME_CURVE.to_string(),
             name: String::new(),
             equalizer: Vec::new(),
+            output_device: String::new(),
             sync: SyncConfig::default(),
             cache: CacheConfig::default(),
             share: ShareConfig::default(),

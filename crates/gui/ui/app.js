@@ -107,6 +107,7 @@ const ui = {
   setSaveToken: el("set-save-token"),
   setLimit: el("set-limit"),
   setAuto: el("set-auto"),
+  setOutput: el("set-output"),
   setDir: el("set-dir"),
   setSave: el("set-save"),
   setPath: el("set-path"),
@@ -205,6 +206,9 @@ let queueKey = "";
 let dragging = false;
 let toastTimer = null;
 let volumeTimer = null;
+let volumeSaveTimer = null;
+/// The sound card saved in the settings; empty follows Windows.
+let outputDevice = "";
 let typingTimer = null;
 /// The room being raised right now, if any; see [`withRoom`].
 let raising = null;
@@ -750,6 +754,8 @@ function showView(name) {
     item.classList.toggle("current", item.dataset.view === section);
   }
   document.querySelector(".main").scrollTop = 0;
+  // Headphones come and go: the list is read again each time the page opens.
+  if (name === "settings") refreshOutputs();
 }
 
 ui.nav.addEventListener("click", (event) => {
@@ -1519,7 +1525,7 @@ function render(snapshot) {
   ui.sideRoomName.textContent = roomName || "комната";
   ui.sideRoomMeta.textContent = snapshot.connected
     ? `участников ${snapshot.peers}${snapshot.hosting ? " · здесь" : ""}`
-    : "связь потеряна";
+    : "связь потеряна · переподключаюсь…";
 
   // The address others must type in, and the reason this app has no `relay` of
   // its own to show while hosting.
@@ -1740,10 +1746,35 @@ function fillSettings(settings) {
   ui.setLimit.value = settings.cache_limit_bytes ? +(settings.cache_limit_bytes / 1024 ** 3).toFixed(2) : 0;
   ui.setAuto.checked = settings.auto_cache;
   renderEqualizer(settings.equalizer ?? []);
+  outputDevice = settings.output_device ?? "";
+  refreshOutputs();
   ui.setDir.textContent = settings.cache_dir ? `папка: ${settings.cache_dir}` : "";
   ui.setPath.textContent = settings.config_path ? `файл настроек: ${settings.config_path}` : "";
   setAccount(settings.has_yandex_token);
 }
+
+/// Fills the output list: Windows' choice first, then every device there is,
+/// and the saved one even while it is unplugged, so the choice stays visible.
+async function refreshOutputs() {
+  const devices = (await call("audio_outputs")) ?? [];
+  const options = [new Option("Как в Windows", "")];
+  for (const name of devices) options.push(new Option(name, name));
+  if (outputDevice && !devices.includes(outputDevice)) {
+    options.push(new Option(`${outputDevice} — не подключено`, outputDevice));
+  }
+  ui.setOutput.replaceChildren(...options);
+  ui.setOutput.value = outputDevice;
+}
+
+ui.setOutput.addEventListener("change", async () => {
+  const name = ui.setOutput.value;
+  if (!(await attempt("set_audio_output", { name }))) {
+    ui.setOutput.value = outputDevice;
+    return;
+  }
+  outputDevice = name;
+  toast(name ? `звук идёт в «${name}»` : "звук идёт туда же, куда у Windows");
+});
 
 function setAccount(signedIn) {
   ui.setAccount.textContent = signedIn ? "вход выполнен" : "вход не выполнен — поиск, волна и «Мне нравится» недоступны";
@@ -2422,10 +2453,16 @@ ui.volume.addEventListener("input", () => {
   paintVolume();
   // Heard while dragging, not only on letting go: at most every 40 ms, and the
   // timer reads the slider when it fires, so the last position always lands.
+  // Kept in config.toml once the slider stops, so the next room and the next
+  // launch start where it was left, connected or not.
+  clearTimeout(volumeSaveTimer);
+  volumeSaveTimer = setTimeout(() => {
+    call("set_volume", { volume: ui.volume.value / 100, save: true });
+  }, 400);
   if (volumeTimer) return;
   volumeTimer = setTimeout(() => {
     volumeTimer = null;
-    call("control", { action: "volume", value: ui.volume.value / 100 });
+    call("set_volume", { volume: ui.volume.value / 100, save: false });
   }, 40);
 });
 

@@ -8,15 +8,17 @@
 //! bend the pitch as well.
 
 use std::io::{Cursor, Read, Seek};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use rodio::decoder::DecoderBuilder;
-use rodio::{OutputStreamBuilder, Sink, Source};
+use rodio::cpal::traits::HostTrait;
+use rodio::queue::SourcesQueueOutput;
+use rodio::{DeviceTrait, OutputStream, OutputStreamBuilder, Sink, Source};
 use ymsync_proto::TrackRef;
 
 use crate::playback::{AudioSource, Playback, loudness, slider_for};
@@ -28,6 +30,12 @@ const SEEK_WAIT: Duration = Duration::from_secs(120);
 /// Slack on top of the estimated byte offset of a seek target: the estimate
 /// assumes a constant bitrate, and the decoder reads a little ahead.
 const SEEK_MARGIN_BYTES: usize = 128 * 1024;
+
+/// How often the audio thread checks which device Windows plays to.
+const DEVICE_POLL: Duration = Duration::from_millis(500);
+
+/// While there is no output at all, the queue is drained in steps this long.
+const SILENT_STEP: Duration = Duration::from_millis(10);
 
 pub struct Player {
     sink: Arc<Sink>,
@@ -42,6 +50,213 @@ pub struct Player {
     equalizer: Arc<crate::eq::Equalizer>,
 }
 
+/// The sink's queue as seen by one output stream.
+///
+/// Every stream that is opened gets its own, and the generation tells an old
+/// one to end: by the time a stream is dropped it may still be inside its
+/// callback, and two streams reading one queue would play it at double speed.
+struct Detachable {
+    queue: Arc<Mutex<SourcesQueueOutput>>,
+    current: Arc<AtomicU64>,
+    mine: u64,
+}
+
+impl Detachable {
+    fn attached(&self) -> bool {
+        self.current.load(Ordering::Acquire) == self.mine
+    }
+}
+
+impl Iterator for Detachable {
+    type Item = rodio::Sample;
+
+    fn next(&mut self) -> Option<rodio::Sample> {
+        if !self.attached() {
+            return None;
+        }
+        self.queue.lock().ok()?.next()
+    }
+}
+
+impl Source for Detachable {
+    fn current_span_len(&self) -> Option<usize> {
+        self.queue.lock().ok()?.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.queue.lock().map_or(2, |queue| queue.channels())
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.queue.lock().map_or(44_100, |queue| queue.sample_rate())
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// The output chosen in the settings, by name. Empty follows Windows.
+static CHOSEN_OUTPUT: Mutex<String> = Mutex::new(String::new());
+
+/// Picks the device to play to, by the name [`output_devices`] lists; empty
+/// means whatever Windows plays to. Heard at once, and kept for players opened
+/// later. A device that is not plugged in is waited for, playing to the
+/// default meanwhile.
+pub fn set_output_device(name: &str) {
+    if let Ok(mut chosen) = CHOSEN_OUTPUT.lock() {
+        *chosen = name.trim().to_string();
+    }
+}
+
+fn chosen_output() -> String {
+    CHOSEN_OUTPUT.lock().map(|chosen| chosen.clone()).unwrap_or_default()
+}
+
+/// Names of the outputs that can be played to right now.
+pub fn output_devices() -> Vec<String> {
+    let mut names: Vec<String> = rodio::cpal::default_host()
+        .output_devices()
+        .map(|devices| devices.filter_map(|device| device.name().ok()).collect())
+        .unwrap_or_default();
+    names.dedup();
+    names
+}
+
+fn output_named(name: &str) -> Option<rodio::Device> {
+    rodio::cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|device| device.name().is_ok_and(|found| found == name))
+}
+
+/// Name of the device Windows currently plays to, if there is one.
+fn default_output_name() -> Option<String> {
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.name().ok())
+}
+
+/// Opens the chosen output, or the default one, raising `failed` when the
+/// stream later dies. Says whether it is the chosen device that opened.
+fn open_output(chosen: &str, failed: &Arc<AtomicBool>) -> Result<(OutputStream, bool), String> {
+    let flag = Arc::clone(failed);
+    let on_error = move |err: rodio::cpal::StreamError| {
+        tracing::warn!("audio output failed: {err}");
+        flag.store(true, Ordering::Release);
+    };
+    if !chosen.is_empty()
+        && let Some(device) = output_named(chosen)
+    {
+        match OutputStreamBuilder::from_device(device)
+            .and_then(|builder| builder.with_error_callback(on_error.clone()).open_stream())
+        {
+            Ok(mut stream) => {
+                stream.log_on_drop(false);
+                return Ok((stream, true));
+            }
+            Err(err) => tracing::warn!(device = chosen, "cannot open the chosen output: {err}"),
+        }
+    }
+    let mut stream = match OutputStreamBuilder::from_default_device() {
+        Ok(builder) => builder.with_error_callback(on_error).open_stream(),
+        Err(err) => Err(err),
+    }
+    // Something odd about the default device: let rodio try the others.
+    .or_else(|_| OutputStreamBuilder::open_default_stream())
+    .map_err(|err| err.to_string())?;
+    stream.log_on_drop(false);
+    Ok((stream, false))
+}
+
+/// The audio thread: keeps the sink's queue playing on whatever output is
+/// current, for the life of the process.
+///
+/// A stream is replaced when cpal reports it dead (the device was unplugged),
+/// when another output is chosen in the settings, when the chosen one comes
+/// back, and, while following Windows, when Windows switches its default
+/// output, so that plugging headphones in moves the music to them as any other
+/// player does. With no device at all
+/// the queue is still read, silently and in real time: the sink's controls are
+/// carried out by whoever reads it, so pause and seek keep working, and the
+/// track keeps its place in the room.
+fn run_output(queue: Arc<Mutex<SourcesQueueOutput>>, ready: mpsc::Sender<Result<(), String>>) {
+    let generation = Arc::new(AtomicU64::new(0));
+    let mut ready = Some(ready);
+    loop {
+        let default_at_open = default_output_name();
+        let chosen = chosen_output();
+        let failed = Arc::new(AtomicBool::new(false));
+        match open_output(&chosen, &failed) {
+            Ok((stream, on_chosen)) => {
+                let mine = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                stream.mixer().add(Detachable {
+                    queue: Arc::clone(&queue),
+                    current: Arc::clone(&generation),
+                    mine,
+                });
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(Ok(()));
+                }
+                loop {
+                    std::thread::sleep(DEVICE_POLL);
+                    if failed.load(Ordering::Acquire) {
+                        tracing::info!("audio output lost; reopening");
+                        break;
+                    }
+                    if chosen_output() != chosen {
+                        tracing::info!(device = %chosen_output(), "audio output chosen");
+                        break;
+                    }
+                    if on_chosen {
+                        continue;
+                    }
+                    if !chosen.is_empty() && output_named(&chosen).is_some() {
+                        tracing::info!(device = %chosen, "the chosen audio output is back");
+                        break;
+                    }
+                    let now = default_output_name();
+                    if now.is_some() && now != default_at_open {
+                        tracing::info!(device = ?now, "default audio output changed");
+                        break;
+                    }
+                }
+                // Detach before dropping, so the old stream lets go of the queue.
+                generation.fetch_add(1, Ordering::AcqRel);
+                drop(stream);
+            }
+            Err(err) => {
+                if let Some(tx) = ready.take() {
+                    // Nothing to play to at start: say so, as before.
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+                play_silently(&queue, DEVICE_POLL);
+            }
+        }
+    }
+}
+
+/// Reads the queue at the speed it would be heard, without a device.
+fn play_silently(queue: &Mutex<SourcesQueueOutput>, for_: Duration) {
+    let until = Instant::now() + for_;
+    let mut last = Instant::now();
+    while Instant::now() < until {
+        std::thread::sleep(SILENT_STEP);
+        let now = Instant::now();
+        let elapsed = now - last;
+        last = now;
+        let Ok(mut queue) = queue.lock() else { return };
+        let per_second = u128::from(queue.sample_rate()) * u128::from(queue.channels());
+        let samples = (per_second * elapsed.as_micros() / 1_000_000) as usize;
+        for _ in 0..samples {
+            if queue.next().is_none() {
+                break;
+            }
+        }
+    }
+}
+
 /// A seek into a part of the track that has not downloaded yet.
 struct SeekJob {
     generation: u64,
@@ -52,32 +267,22 @@ struct SeekJob {
 
 impl Player {
     pub fn new(volume: f32) -> Result<Self> {
-        // cpal's stream is not `Send` on every platform, so the output device is
-        // opened on its own thread that then parks, keeping the device open for
-        // the life of the process. Only the `Sink` handle crosses threads.
-        let (tx, rx) = mpsc::channel::<Result<Sink, String>>();
+        // The sink is not tied to a device: its queue is fed to whichever output
+        // is current, by a thread of its own (see [`run_output`]). Pulling the
+        // headphones out or switching the output in Windows kills a cpal stream,
+        // and a sink built straight on that stream's mixer is then never read
+        // again: `try_seek` waits for the dead audio thread for ever, and every
+        // button behind it hangs. Here the queue just moves to the new device.
+        let (sink, queue) = Sink::new();
+        let queue = Arc::new(Mutex::new(queue));
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("ymsync-audio".to_string())
-            .spawn(move || match OutputStreamBuilder::open_default_stream() {
-                Err(err) => {
-                    let _ = tx.send(Err(err.to_string()));
-                }
-                Ok(mut stream) => {
-                    stream.log_on_drop(false);
-                    if tx.send(Ok(Sink::connect_new(stream.mixer()))).is_err() {
-                        return;
-                    }
-                    drop(tx);
-                    loop {
-                        std::thread::park();
-                    }
-                }
-            })
+            .spawn(move || run_output(queue, tx))
             .context("spawning the audio thread")?;
 
-        let sink = rx
-            .recv()
-            .context("the audio thread stopped before handing back a sink")?
+        rx.recv()
+            .context("the audio thread stopped before opening the output")?
             .map_err(|err| anyhow!("cannot open the default audio output: {err}"))?;
 
         sink.set_volume(loudness(volume));
@@ -319,6 +524,52 @@ mod tests {
         let decoder = build_decoder(stream.reader(), stream.total());
         rest.join().unwrap();
         assert!(decoder.is_ok(), "decoder failed: {:?}", decoder.err());
+    }
+
+    /// Needs a sound card, so it runs only when asked: `cargo test -p ymsync
+    /// switching_outputs -- --ignored`. Moving between outputs must neither
+    /// stop the track nor leave a seek waiting for a stream that is gone,
+    /// which is what used to hang every button after headphones were pulled.
+    #[test]
+    #[ignore]
+    fn switching_outputs_keeps_playing_and_answering() {
+        let frame = [&[0xFF, 0xFB, 0x10, 0xC4][..], &[0u8; 100][..]].concat();
+        let data = Bytes::from(frame.repeat(20_000));
+        let player = Player::new(0.0).expect("an audio output");
+        let track = TrackRef {
+            track_id: "1".to_string(),
+            album_id: None,
+            album: None,
+            title: String::new(),
+            artist: String::new(),
+            duration_ms: 500_000,
+            cover_uri: None,
+            added_by: None,
+        };
+        player.load(track, AudioSource::Bytes(data)).expect("load");
+        player.play();
+
+        let mut outputs = output_devices();
+        outputs.push("нет такого устройства".to_string());
+        outputs.push(String::new());
+        for name in outputs {
+            set_output_device(&name);
+            std::thread::sleep(DEVICE_POLL * 3);
+            let before = player.position_ms();
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(player.position_ms() > before, "stalled on «{name}»");
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let to = before + 5_000;
+            let sink = Arc::clone(&player.sink);
+            std::thread::spawn(move || {
+                let _ = done_tx.send(sink.try_seek(Duration::from_millis(to)));
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap_or_else(|_| panic!("a seek hung on «{name}»"))
+                .expect("seek");
+        }
     }
 
     /// The point of it all: sound comes out while the file is still arriving.

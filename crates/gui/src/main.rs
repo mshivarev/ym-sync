@@ -160,6 +160,8 @@ struct Settings {
     display_name: String,
     /// The equaliser's five bands, in decibels.
     equalizer: Vec<f32>,
+    /// The chosen sound card; empty follows Windows.
+    output_device: String,
 }
 
 #[tauri::command]
@@ -187,6 +189,46 @@ fn settings(state: State<'_, AppState>) -> Settings {
         name: cfg.name.clone(),
         display_name: cfg.display_name(),
         equalizer: cfg.equalizer.clone(),
+        output_device: cfg.output_device.clone(),
+    }
+}
+
+/// The sound cards that can be played to right now.
+#[tauri::command]
+async fn audio_outputs() -> Result<Vec<String>, String> {
+    // Off the window's thread: listing devices goes through COM.
+    tokio::task::spawn_blocking(ymsync::player::output_devices)
+        .await
+        .map_err(fail)
+}
+
+/// Chooses the sound card. Heard at once, and kept for the next launch.
+#[tauri::command]
+fn set_audio_output(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let name = name.trim().to_string();
+    ymsync::player::set_output_device(&name);
+    let mut cfg = state.config();
+    cfg.output_device = name;
+    state.remember(cfg)
+}
+
+/// Moves the volume, connected or not. `save` writes it to `config.toml`: the
+/// page asks for that once the slider stops, not on every step of a drag.
+#[tauri::command]
+async fn set_volume(volume: f32, save: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let volume = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { return Ok(()) };
+    if let Some(session) = state.session.lock().await.as_ref() {
+        session.handle().send(Command::SetVolume(volume));
+    }
+    let mut cfg = state.config();
+    if save {
+        cfg.volume = volume;
+        state.remember(cfg)
+    } else {
+        // Kept in memory at once, so a connect made mid-drag starts here.
+        cfg.volume = volume;
+        *state.config.lock().expect("config mutex") = cfg;
+        Ok(())
     }
 }
 
@@ -1125,6 +1167,8 @@ fn main() {
         }
     };
 
+    ymsync::player::set_output_device(&config.output_device);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(media_keys())
@@ -1176,6 +1220,9 @@ fn main() {
             remove_from_playlist,
             artist_page,
             set_equalizer,
+            audio_outputs,
+            set_audio_output,
+            set_volume,
             history,
             clear_history,
             similar,

@@ -48,6 +48,17 @@ const NO_TOKEN: &str = "нет токена Яндекса: без него иг
 
 const SEQ_RESTART_GAP: u64 = 64;
 
+/// How long a lost relay is dialled again before the room is given up on.
+/// A VPN switching on or off takes a few seconds; a host that closed its room
+/// is gone for good, and the window should say so rather than spin.
+const RELINK_GIVE_UP: Duration = Duration::from_secs(180);
+/// The longest pause between two attempts to reach the relay again.
+const RELINK_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// Where to dial when the relay connection is lost, worked out afresh on every
+/// attempt: a hosting machine's own address may be different by then.
+pub type RelinkUrls = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// A load can fail for transient reasons — Yandex rate-limits concurrent stream
 /// requests per account, and networks blip — so a track is only written off
 /// after this many attempts.
@@ -311,6 +322,8 @@ pub struct Wiring {
     pub likes: Arc<Likes>,
     /// Where to connect. Not `cfg.relay` when this app hosts the room itself.
     pub relay_url: String,
+    /// Where to dial again when the connection drops. `None` means `relay_url`.
+    pub relink_urls: Option<RelinkUrls>,
     /// Port the local file server listens on, to be announced to the room.
     pub share_port: Option<u16>,
     /// Tracks held in memory that the file server offers too.
@@ -327,10 +340,16 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         cache,
         likes,
         relay_url,
+        relink_urls,
         share_port,
         hot,
         hosting,
     } = wiring;
+    let relink_urls = relink_urls.unwrap_or_else(|| {
+        let url = relay_url.clone();
+        Arc::new(move || vec![url.clone()])
+    });
+    let probe_every = Duration::from_secs(cfg.sync.clock_probe_secs);
 
     player.set_equalizer(&cfg.equalizer);
     let room_token = cfg.require_room_token()?.to_string();
@@ -339,7 +358,7 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         &cfg.room,
         &room_token,
         &cfg.display_name(),
-        Duration::from_secs(cfg.sync.clock_probe_secs),
+        probe_every,
     )
     .await?;
 
@@ -429,6 +448,15 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
         notice_since: None,
         peers,
         connected: true,
+        relink: RelinkParams {
+            urls: relink_urls,
+            room: cfg.room.clone(),
+            name: cfg.display_name(),
+            probe_every,
+        },
+        relinking: None,
+        fresh_link: false,
+        resume_after_relink: false,
         snapshots,
     };
 
@@ -447,6 +475,13 @@ pub async fn spawn(cfg: &Config, wiring: Wiring) -> Result<Handle> {
 
 /// Result of a background track fetch.
 enum Internal {
+    /// The relay is reachable again, over this new connection.
+    Relinked {
+        link: Link,
+        events: mpsc::UnboundedReceiver<Event>,
+    },
+    /// The relay stayed out of reach for [`RELINK_GIVE_UP`].
+    RelinkFailed(String),
     Loaded {
         track_id: String,
         error: Option<LoadFailure>,
@@ -719,17 +754,44 @@ struct Engine {
     notice_since: Option<std::time::Instant>,
     peers: usize,
     connected: bool,
+    /// What it takes to dial the relay again.
+    relink: RelinkParams,
+    /// The task dialling the relay while the connection is down.
+    relinking: Option<JoinHandle<()>>,
+    /// The next room state comes over a new connection and is taken as it is:
+    /// a relay that restarted meanwhile counts its states from scratch.
+    fresh_link: bool,
+    /// The room was playing when the connection dropped. A relay left with
+    /// nobody in the room freezes it, and that pause is not anyone's wish.
+    resume_after_relink: bool,
 
     snapshots: watch::Sender<Snapshot>,
+}
+
+/// What [`Link::connect`] needs, kept for connecting again.
+struct RelinkParams {
+    urls: RelinkUrls,
+    room: String,
+    name: String,
+    probe_every: Duration,
+}
+
+/// The next event, or never while there is no connection.
+async fn next_event(events: &mut Option<mpsc::UnboundedReceiver<Event>>) -> Option<Event> {
+    match events {
+        Some(events) => events.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl Engine {
     async fn run(
         mut self,
         mut commands: mpsc::UnboundedReceiver<Command>,
-        mut events: mpsc::UnboundedReceiver<Event>,
+        events: mpsc::UnboundedReceiver<Event>,
         tick: Duration,
     ) -> Result<()> {
+        let mut events = Some(events);
         let (internal, mut internal_rx) = mpsc::unbounded_channel::<Internal>();
 
         // Two things the network is needed for that nobody should have to press a
@@ -752,18 +814,25 @@ impl Engine {
                     Some(command) => self.handle_command(command, &internal),
                 },
 
-                message = internal_rx.recv() => {
-                    if let Some(message) = message {
-                        self.handle_internal(message, &internal);
+                message = internal_rx.recv() => match message {
+                    Some(Internal::Relinked { link, events: fresh }) => {
+                        events = Some(fresh);
+                        self.relinked(link);
                     }
-                }
-
-                event = events.recv() => match event {
-                    None => {
+                    Some(Internal::RelinkFailed(err)) => {
                         self.connected = false;
                         self.notice = Some("соединение с релеем потеряно".to_string());
                         self.publish();
-                        bail!("соединение с релеем потеряно");
+                        bail!("соединение с релеем потеряно: {err}");
+                    }
+                    Some(message) => self.handle_internal(message, &internal),
+                    None => {}
+                },
+
+                event = next_event(&mut events) => match event {
+                    None => {
+                        events = None;
+                        self.lose_link(&internal);
                     }
                     Some(event) => self.handle_event(event, &internal),
                 },
@@ -774,11 +843,80 @@ impl Engine {
             self.publish();
         }
 
+        if let Some(task) = self.relinking.take() {
+            task.abort();
+        }
         self.player.pause();
         self.link.say_goodbye();
         self.connected = false;
         self.publish();
         Ok(())
+    }
+
+    /// The relay connection died: keep playing what is loaded and dial again in
+    /// the background. A VPN switching on or off drops the socket, and the room
+    /// is still there a moment later.
+    fn lose_link(&mut self, internal: &mpsc::UnboundedSender<Internal>) {
+        self.connected = false;
+        self.resume_after_relink = self.remote.as_ref().is_some_and(|state| state.playing);
+        self.notice = Some("связь с релеем потеряна — переподключаюсь".to_string());
+        warn!("relay connection lost; reconnecting");
+
+        let urls = Arc::clone(&self.relink.urls);
+        let room = self.relink.room.clone();
+        let name = self.relink.name.clone();
+        let probe_every = self.relink.probe_every;
+        let token = self.room_token.clone();
+        let tx = internal.clone();
+        if let Some(task) = self.relinking.take() {
+            task.abort();
+        }
+        self.relinking = Some(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut delay = Duration::from_millis(500);
+            let mut last_error = String::new();
+            loop {
+                tokio::time::sleep(delay).await;
+                for url in urls() {
+                    match Link::connect(&url, &room, &token, &name, probe_every).await {
+                        Ok((link, events)) => {
+                            tracing::info!(%url, "reconnected to the relay");
+                            let _ = tx.send(Internal::Relinked { link, events });
+                            return;
+                        }
+                        Err(err) => {
+                            debug!(%url, "reconnect failed: {err:#}");
+                            last_error = format!("{err:#}");
+                        }
+                    }
+                }
+                if started.elapsed() >= RELINK_GIVE_UP {
+                    let _ = tx.send(Internal::RelinkFailed(last_error));
+                    return;
+                }
+                delay = (delay * 2).min(RELINK_MAX_DELAY);
+            }
+        }));
+    }
+
+    /// Back on the relay: everything the relay learns from a peer only once —
+    /// the shared tracks, readiness, the wave's feeder — is said again.
+    fn relinked(&mut self, link: Link) {
+        self.relinking = None;
+        self.peers = link.peers_at_join();
+        self.link = link;
+        self.connected = true;
+        self.fresh_link = true;
+        self.reported_barrier = None;
+        self.share_dirty = true;
+        self.last_announce = None;
+        // The relay let the wave go when we left; it is picked up again from the
+        // room's state, as from any peer's.
+        if self.station.as_ref().is_some_and(|station| station.claimed) {
+            self.station = None;
+            self.refilling = false;
+        }
+        self.notice = Some("снова на связи с релеем".to_string());
     }
 
     /// Sends a request to the relay, noting a dead link.
@@ -852,6 +990,7 @@ impl Engine {
             Command::SetShuffle(on) => self.ask(ymsync_proto::Command::SetShuffle { on }),
             Command::SetAutoCache(on) => self.auto_cache = on,
             Command::SetName(name) => {
+                self.relink.name = name.clone();
                 if !self.link.set_name(&name) {
                     self.connected = false;
                 }
@@ -1371,6 +1510,8 @@ impl Engine {
 
     fn handle_internal(&mut self, message: Internal, internal: &mpsc::UnboundedSender<Internal>) {
         match message {
+            // Taken by the loop itself, which owns the event receiver.
+            Internal::Relinked { .. } | Internal::RelinkFailed(_) => {}
             Internal::Station { tracks, error } => {
                 self.refilling = false;
                 // The wave was switched off while the request was out.
@@ -1683,8 +1824,15 @@ impl Engine {
     fn handle_event(&mut self, event: Event, internal: &mpsc::UnboundedSender<Internal>) {
         match event {
             Event::State(state) => {
-                if !accept_seq(self.remote.as_ref().map(|s| s.seq), state.seq) {
+                let fresh = std::mem::take(&mut self.fresh_link);
+                if !fresh && !accept_seq(self.remote.as_ref().map(|s| s.seq), state.seq) {
                     return;
+                }
+                if std::mem::take(&mut self.resume_after_relink)
+                    && !state.playing
+                    && state.track.is_some()
+                {
+                    self.ask(ymsync_proto::Command::Resume);
                 }
 
                 // A new track in the room is a play for this device's history.

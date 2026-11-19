@@ -107,7 +107,7 @@ pub async fn start(
 
     // 1. Host the room, if asked. This has to come first: the engine connects
     //    below, and there has to be something listening by then.
-    let (relay, relay_url, join_url) = if cfg.host.enabled {
+    let (relay, relay_url, join_url, relink_urls) = if cfg.host.enabled {
         let bind = format!("{}:{}", cfg.host.bind, cfg.host.port);
         let server = ymsync_relay::bind_with(&bind, room_token.clone(), cfg.host.discoverable)
             .await
@@ -122,9 +122,26 @@ pub async fn start(
         // socket that peer arrives on, so reaching our own relay over loopback
         // would advertise a loopback address for our cached tracks and nobody
         // else could fetch them.
-        (Some(server), url.clone(), Some(url))
+        //
+        // When that connection drops — a VPN switching on or off is the usual
+        // cause — the same address is tried first, then whatever the address
+        // is now, and loopback last: our cached tracks are then out of the
+        // others' reach, but the music goes on.
+        let first = url.clone();
+        let advertise = cfg.host.advertise.clone();
+        let relink: engine::RelinkUrls = Arc::new(move || {
+            let mut urls = vec![first.clone()];
+            for host in [net::advertise_host(&advertise), "127.0.0.1".to_string()] {
+                let url = net::relay_url(&host, port);
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+            urls
+        });
+        (Some(server), url.clone(), Some(url), Some(relink))
     } else {
-        (None, cfg.relay.clone(), None)
+        (None, cfg.relay.clone(), None, None)
     };
 
     // 2. Serve this machine's cached tracks. Before the engine, so the port is
@@ -156,6 +173,7 @@ pub async fn start(
             cache,
             likes,
             relay_url,
+            relink_urls,
             share_port,
             hot,
             hosting: join_url.clone(),

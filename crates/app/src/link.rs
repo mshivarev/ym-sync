@@ -29,6 +29,9 @@ type WsRead = futures_util::stream::SplitStream<Ws>;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The shortest silence from the relay that counts as a lost connection.
+const SILENCE_LIMIT: Duration = Duration::from_secs(15);
+
 /// Probes sent during startup, before the clock is needed for playback.
 const PRIMING_PROBES: usize = 5;
 const PRIMING_GAP: Duration = Duration::from_millis(50);
@@ -98,9 +101,11 @@ impl Link {
         name: &str,
         probe_every: Duration,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let (ws, _response) = tokio_tungstenite::connect_async(relay)
-            .await
-            .with_context(|| format!("connecting to the relay at {relay}"))?;
+        let (ws, _response) =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(relay))
+                .await
+                .map_err(|_| anyhow!("релей {relay} не ответил за {HANDSHAKE_TIMEOUT:?}"))?
+                .with_context(|| format!("connecting to the relay at {relay}"))?;
 
         // Small state and clock frames must not wait on Nagle's algorithm.
         if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
@@ -204,7 +209,8 @@ impl Link {
 
         let reader = {
             let clock = Arc::clone(&clock);
-            tokio::spawn(async move { read_loop(read, sampler, clock, event_tx).await })
+            let silence = SILENCE_LIMIT.max(probe_every * 3);
+            tokio::spawn(async move { read_loop(read, sampler, clock, event_tx, silence).await })
         };
 
         let prober = {
@@ -310,8 +316,21 @@ async fn read_loop(
     mut sampler: ClockSampler,
     clock: Arc<Clock>,
     events: mpsc::UnboundedSender<Event>,
+    silence: Duration,
 ) {
-    while let Some(frame) = read.next().await {
+    loop {
+        // The clock is probed every few seconds and every probe is answered, so a
+        // relay that has gone quiet this long is gone, even when no error says
+        // so: a VPN coming up or down tends to leave the socket hanging rather
+        // than closing it.
+        let frame = match tokio::time::timeout(silence, read.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                debug!(?silence, "relay went silent");
+                break;
+            }
+        };
         let msg = match frame {
             Ok(msg) => msg,
             Err(err) => {
