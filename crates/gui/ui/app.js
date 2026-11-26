@@ -109,6 +109,7 @@ const ui = {
   setLimit: el("set-limit"),
   setAuto: el("set-auto"),
   setOutput: el("set-output"),
+  setDrift: el("set-drift"),
   setDir: el("set-dir"),
   setSave: el("set-save"),
   setPath: el("set-path"),
@@ -210,6 +211,8 @@ let volumeTimer = null;
 let volumeSaveTimer = null;
 /// The sound card saved in the settings; empty follows Windows.
 let outputDevice = "";
+/// The drift badge in the player bar; off unless asked for in the settings.
+let showDrift = false;
 let typingTimer = null;
 /// The room being raised right now, if any; see [`withRoom`].
 let raising = null;
@@ -1658,7 +1661,7 @@ function render(snapshot) {
   }
 
   const drift = snapshot.drift_ms;
-  if (drift === null || drift === undefined) {
+  if (!showDrift || drift === null || drift === undefined) {
     ui.drift.classList.add("hidden");
   } else {
     const magnitude = Math.abs(drift);
@@ -1859,6 +1862,8 @@ function fillSettings(settings) {
   ui.setAuto.checked = settings.auto_cache;
   renderEqualizer(settings.equalizer ?? []);
   outputDevice = settings.output_device ?? "";
+  showDrift = Boolean(settings.show_drift);
+  ui.setDrift.checked = showDrift;
   refreshOutputs();
   ui.setDir.textContent = settings.cache_dir ? `папка: ${settings.cache_dir}` : "";
   ui.setPath.textContent = settings.config_path ? `файл настроек: ${settings.config_path}` : "";
@@ -1886,6 +1891,17 @@ ui.setOutput.addEventListener("change", async () => {
   }
   outputDevice = name;
   toast(name ? `звук идёт в «${name}»` : "звук идёт туда же, куда у Windows");
+});
+
+ui.setDrift.addEventListener("change", async () => {
+  const on = ui.setDrift.checked;
+  if (!(await attempt("set_show_drift", { on }))) {
+    ui.setDrift.checked = showDrift;
+    return;
+  }
+  showDrift = on;
+  if (latest) render(latest);
+  else ui.drift.classList.add("hidden");
 });
 
 function setAccount(signedIn) {

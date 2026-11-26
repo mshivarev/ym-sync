@@ -162,6 +162,8 @@ struct Settings {
     equalizer: Vec<f32>,
     /// The chosen sound card; empty follows Windows.
     output_device: String,
+    /// The drift from the room is shown in the player bar.
+    show_drift: bool,
 }
 
 #[tauri::command]
@@ -190,7 +192,16 @@ fn settings(state: State<'_, AppState>) -> Settings {
         display_name: cfg.display_name(),
         equalizer: cfg.equalizer.clone(),
         output_device: cfg.output_device.clone(),
+        show_drift: cfg.show_drift,
     }
+}
+
+/// Shows or hides the drift from the room in the player bar.
+#[tauri::command]
+fn set_show_drift(on: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut cfg = state.config();
+    cfg.show_drift = on;
+    state.remember(cfg)
 }
 
 /// The sound cards that can be played to right now.
@@ -1223,6 +1234,7 @@ fn main() {
             audio_outputs,
             set_audio_output,
             set_volume,
+            set_show_drift,
             history,
             clear_history,
             similar,

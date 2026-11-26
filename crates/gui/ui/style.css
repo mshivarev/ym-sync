@@ -2032,3 +2032,51 @@ body.queue-dragging * {
     height: 140px;
   }
 }
+
+/* ---------- portrait windows ---------- */
+
+/* A window taller than it is wide leaves the player bar short of width, so
+   the volume stands up: the slider vertical, the level under it. */
+@media (orientation: portrait) {
+  .volume {
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    width: auto;
+    height: calc(var(--player-h) - 12px);
+  }
+
+  .volume > .i {
+    display: none;
+  }
+
+  .volume input[type="range"] {
+    flex: 1;
+    width: 16px;
+    height: auto;
+    min-height: 0;
+    writing-mode: vertical-lr;
+    direction: rtl;
+  }
+
+  .volume input[type="range"]::-webkit-slider-runnable-track {
+    width: 4px;
+    height: 100%;
+    background: linear-gradient(to top, var(--text) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+  }
+
+  .volume input[type="range"]:hover::-webkit-slider-runnable-track {
+    background: linear-gradient(to top, var(--accent) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+  }
+
+  .volume input[type="range"]::-webkit-slider-thumb {
+    margin-top: 0;
+    margin-left: -4px;
+  }
+
+  .volume-level {
+    width: auto;
+    text-align: center;
+    font-size: 11px;
+  }
+}

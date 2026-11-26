@@ -43,6 +43,9 @@ pub struct Config {
     /// The sound card to play to, by its name in Windows. Empty follows
     /// whatever Windows plays to.
     pub output_device: String,
+    /// Show how far this device is from the room, in the player bar. Off by
+    /// default: it is a diagnostic, not something a listener needs to watch.
+    pub show_drift: bool,
     pub sync: SyncConfig,
     pub cache: CacheConfig,
     pub share: ShareConfig,
@@ -62,6 +65,7 @@ impl Default for Config {
             name: String::new(),
             equalizer: Vec::new(),
             output_device: String::new(),
+            show_drift: false,
             sync: SyncConfig::default(),
             cache: CacheConfig::default(),
             share: ShareConfig::default(),
